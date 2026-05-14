@@ -209,6 +209,8 @@ pub enum Feature {
     GuardianApproval,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
+    /// Enable Qunux native task-closure tools.
+    Qunux,
     /// Enable collaboration modes (Plan, Default).
     /// Kept for config backward compatibility; behavior is always collaboration-modes-enabled.
     CollaborationModes,
@@ -1077,6 +1079,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         stage: Stage::Experimental {
             name: "Goals",
             menu_description: "Set a persistent goal Codex can continue over time",
+            announcement: "",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Qunux,
+        key: "qunux",
+        stage: Stage::Experimental {
+            name: "Qunux",
+            menu_description: "Use native Qunux task-closure tools as an Agent OS substrate.",
             announcement: "",
         },
         default_enabled: false,

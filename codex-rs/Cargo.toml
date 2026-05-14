@@ -65,6 +65,7 @@ members = [
     "network-proxy",
     "ollama",
     "process-hardening",
+    "qunux",
     "protocol",
     "realtime-webrtc",
     "rollout",
@@ -192,6 +193,7 @@ codex-otel = { path = "otel" }
 codex-plugin = { path = "plugin" }
 codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
+codex-qunux = { path = "qunux" }
 codex-protocol = { path = "protocol" }
 codex-realtime-webrtc = { path = "realtime-webrtc" }
 codex-responses-api-proxy = { path = "responses-api-proxy" }

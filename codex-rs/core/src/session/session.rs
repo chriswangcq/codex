@@ -1,11 +1,19 @@
 use super::*;
 use crate::goals::GoalRuntimeState;
 use codex_protocol::SessionId;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_qunux::DEFAULT_THREAD_ID;
+use codex_qunux::QunuxRuntime;
+use codex_qunux::RuntimeContext;
+use codex_qunux::process_id_for_session_id;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::sync::Semaphore;
 
 /// Context for an initialized model agent
@@ -96,6 +104,7 @@ pub(crate) struct SessionConfiguration {
     pub(super) persist_extended_history: bool,
     pub(super) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(super) user_shell_override: Option<shell::Shell>,
+    pub(super) qunux_runtime_context: Option<RuntimeContext>,
 }
 
 impl SessionConfiguration {
@@ -331,6 +340,37 @@ pub(crate) struct SessionSettingsUpdate {
 pub(crate) struct AppServerClientMetadata {
     pub(crate) client_name: Option<String>,
     pub(crate) client_version: Option<String>,
+}
+
+fn qunux_runtime_context_for_session(
+    cwd: &AbsolutePathBuf,
+    session_id: SessionId,
+    thread_id: ThreadId,
+    session_source: &SessionSource,
+    provided_context: Option<RuntimeContext>,
+) -> anyhow::Result<Option<RuntimeContext>> {
+    if let Some(context) = provided_context {
+        let context = if context.actor_session_id.is_some() {
+            context
+        } else {
+            context.with_actor_session_id(thread_id.to_string())?
+        };
+        return Ok(Some(context));
+    }
+
+    if matches!(
+        session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+    ) {
+        return Ok(None);
+    }
+
+    let session_id = session_id.to_string();
+    let process_id = process_id_for_session_id(&session_id)?;
+    Ok(Some(
+        RuntimeContext::with_ids(cwd.to_path_buf(), process_id, DEFAULT_THREAD_ID)?
+            .with_actor_session_id(thread_id.to_string())?,
+    ))
 }
 
 impl Session {
@@ -811,6 +851,36 @@ impl Session {
                 SessionId::from(thread_id)
             };
             let agent_control = agent_control.with_session_id(session_id);
+            let qunux_runtime_context = if config.features.enabled(Feature::Qunux) {
+                let context = qunux_runtime_context_for_session(
+                    &session_configuration.cwd,
+                    session_id,
+                    thread_id,
+                    &session_configuration.session_source,
+                    session_configuration.qunux_runtime_context.clone(),
+                )?;
+                if let Some(context) = context.as_ref() {
+                    let mut runtime = QunuxRuntime::load_or_init(
+                        context.clone(),
+                        "Qunux root task",
+                        "# Qunux root task\n\nNative Codex Qunux process.",
+                    )?;
+                    if let Some(actor_session_id) = context.actor_session_id.as_ref() {
+                        let needs_bind = runtime
+                            .state()
+                            .threads
+                            .get(&context.thread_id)
+                            .and_then(|thread| thread.actor_session_id.as_deref())
+                            != Some(actor_session_id.as_str());
+                        if needs_bind {
+                            runtime.bind_thread_actor(&context.thread_id, actor_session_id.clone())?;
+                        }
+                    }
+                }
+                context
+            } else {
+                None
+            };
             let session_extension_data = codex_extension_api::ExtensionData::new();
             let thread_extension_data = codex_extension_api::ExtensionData::new();
             for contributor in extensions.thread_start_contributors() {
@@ -861,6 +931,7 @@ impl Session {
                 // TODO(jif): extract session to share between sub-agents
                 session_extension_data,
                 thread_extension_data,
+                qunux_runtime_context,
                 agent_control,
                 network_proxy,
                 network_approval: Arc::clone(&network_approval),

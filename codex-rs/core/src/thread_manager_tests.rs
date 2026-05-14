@@ -23,6 +23,9 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
+use codex_qunux::DEFAULT_THREAD_ID;
+use codex_qunux::QunuxRuntime;
+use codex_qunux::process_id_for_session_id;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
@@ -629,6 +632,71 @@ async fn explicit_installation_id_skips_codex_home_file() {
 
     assert!(!config.codex_home.join(INSTALLATION_ID_FILENAME).exists());
     assert_eq!(thread.thread.codex.session.installation_id, installation_id);
+
+    thread
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown thread");
+    let _ = manager.remove_thread(&thread.thread_id).await;
+}
+
+#[tokio::test]
+async fn qunux_feature_binds_runtime_context_when_thread_starts() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = temp_dir.path().join("workspace").abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    std::fs::create_dir_all(&config.cwd).expect("create workspace");
+    let _ = config.features.enable(Feature::Qunux);
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+
+    let thread = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start Qunux-enabled thread");
+    let actor_session_id = thread.thread_id.to_string();
+    let expected_process_id =
+        process_id_for_session_id(&actor_session_id).expect("derive process id");
+    let context = thread
+        .thread
+        .codex
+        .session
+        .services
+        .qunux_runtime_context
+        .clone()
+        .expect("Qunux runtime context");
+
+    assert_eq!(context.workspace_root, config.cwd.to_path_buf());
+    assert_eq!(context.process_id, expected_process_id);
+    assert_eq!(context.thread_id, DEFAULT_THREAD_ID);
+    assert_eq!(
+        context.actor_session_id.as_deref(),
+        Some(actor_session_id.as_str())
+    );
+    assert!(context.state_path().exists());
+
+    let runtime = QunuxRuntime::load(context).expect("load Qunux runtime");
+    assert_eq!(
+        runtime.state().process.root_actor_session_id.as_deref(),
+        Some(actor_session_id.as_str())
+    );
+    let main_thread = runtime
+        .state()
+        .threads
+        .get(DEFAULT_THREAD_ID)
+        .expect("main Qunux thread");
+    assert_eq!(
+        main_thread.actor_session_id.as_deref(),
+        Some(actor_session_id.as_str())
+    );
 
     thread
         .thread

@@ -31,6 +31,9 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
+use codex_qunux::QunuxRuntime;
+use codex_qunux::RuntimeContext;
+use codex_qunux::ThreadStatus;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_thread_store::ReadThreadParams;
 use serde::Serialize;
@@ -55,6 +58,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) qunux_runtime_context: Option<RuntimeContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +127,55 @@ fn keep_forked_rollout_item(item: &RolloutItem) -> bool {
         // instructions, so it must establish a fresh context diff baseline.
         RolloutItem::TurnContext(_) => false,
         RolloutItem::Compacted(_) | RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => true,
+    }
+}
+
+fn record_qunux_child_completion(
+    child_thread: &crate::codex_thread::CodexThread,
+    status: &AgentStatus,
+) {
+    let Some(context) = child_thread
+        .codex
+        .session
+        .services
+        .qunux_runtime_context
+        .clone()
+    else {
+        return;
+    };
+
+    let mut runtime = match QunuxRuntime::load(context) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            warn!("failed to load Qunux runtime for child completion: {err}");
+            return;
+        }
+    };
+    let thread_id = runtime.context().thread_id.clone();
+    let qthread_status = runtime
+        .state()
+        .threads
+        .get(&thread_id)
+        .map(|thread| thread.status);
+
+    let result = if qthread_status == Some(ThreadStatus::Done) {
+        runtime
+            .auto_join_child_thread(
+                &thread_id,
+                format!("auto-joined after Codex child actor completed with status {status:?}"),
+            )
+            .map(|_| ())
+    } else {
+        runtime
+            .record_actor_completed_without_thread_done(
+                &thread_id,
+                format!("Codex child actor completed with status {status:?}"),
+            )
+            .map(|_| ())
+    };
+
+    if let Err(err) = result {
+        warn!("failed to record Qunux child completion for {thread_id}: {err}");
     }
 }
 
@@ -254,6 +307,7 @@ impl AgentControl {
                     inherited_shell_snapshot,
                     inherited_exec_policy,
                     options.environments.clone(),
+                    options.qunux_runtime_context.clone(),
                 ))
                 .await?
             }
@@ -441,6 +495,7 @@ impl AgentControl {
                 inherited_shell_snapshot,
                 inherited_exec_policy,
                 options.environments.clone(),
+                options.qunux_runtime_context.clone(),
             )
             .await
     }
@@ -976,6 +1031,9 @@ impl AgentControl {
                 return;
             };
             let child_thread = state.get_thread(child_thread_id).await.ok();
+            if let Some(child_thread) = child_thread.as_ref() {
+                record_qunux_child_completion(child_thread.as_ref(), &status);
+            }
             let message = format_subagent_notification_message(child_reference.as_str(), &status);
             if child_agent_path.is_some()
                 && child_thread

@@ -417,6 +417,114 @@ fn goal_tools_require_goals_feature() {
 }
 
 #[test]
+fn qunux_tools_require_qunux_feature() {
+    let model_info = model_info();
+    let available_models = Vec::new();
+    let mut features = Features::with_defaults();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        permission_profile: &PermissionProfile::Disabled,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    );
+    assert_lacks_tool_name(&tools, "qunux");
+
+    features.enable(Feature::Qunux);
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        permission_profile: &PermissionProfile::Disabled,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, registry) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    );
+
+    assert_contains_tool_names(&tools, &["qunux"]);
+    assert_eq!(
+        namespace_function_names(&tools, "qunux"),
+        vec![
+            "check",
+            "classify_ticket",
+            "create_problem",
+            "create_ticket",
+            "current",
+            "join_thread",
+            "list_threads",
+            "next",
+            "render",
+            "result",
+            "set_status",
+            "spawn_thread",
+            "status",
+            "thread_status",
+            "validate",
+        ]
+    );
+    assert!(registry.has_handler(&ToolName::namespaced("qunux", "next")));
+    assert!(registry.has_handler(&ToolName::namespaced("qunux", "check")));
+}
+
+#[test]
+fn qunux_suppresses_model_visible_spawn_agent_tools() {
+    for multi_agent_v2 in [false, true] {
+        let model_info = model_info();
+        let available_models = Vec::new();
+        let mut features = Features::with_defaults();
+        features.enable(Feature::Qunux);
+        features.enable(Feature::Collab);
+        if multi_agent_v2 {
+            features.enable(Feature::MultiAgentV2);
+        }
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            available_models: &available_models,
+            features: &features,
+            image_generation_tool_auth_allowed: true,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+            permission_profile: &PermissionProfile::Disabled,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        });
+        let (tools, registry) = build_specs(
+            &tools_config,
+            /*mcp_tools*/ None,
+            /*deferred_mcp_tools*/ None,
+            &[],
+        );
+
+        assert_contains_tool_names(&tools, &["qunux"]);
+        assert_lacks_tool_name(&tools, "spawn_agent");
+        assert_lacks_tool_name(&tools, "send_input");
+        assert_lacks_tool_name(&tools, "send_message");
+        assert_lacks_tool_name(&tools, "followup_task");
+        assert_lacks_tool_name(&tools, "wait_agent");
+        assert_lacks_tool_name(&tools, "close_agent");
+        assert_lacks_tool_name(&tools, "resume_agent");
+        assert_lacks_tool_name(&tools, "list_agents");
+        assert!(registry.has_handler(&ToolName::namespaced("qunux", "spawn_thread")));
+        assert!(!registry.has_handler(&ToolName::plain("spawn_agent")));
+    }
+}
+
+#[test]
 fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
     let model_info = model_info();
     let mut features = Features::with_defaults();

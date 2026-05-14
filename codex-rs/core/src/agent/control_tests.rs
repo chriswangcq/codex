@@ -26,6 +26,16 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_qunux::CheckStatus;
+use codex_qunux::ContextForkPolicy;
+use codex_qunux::EntityKind;
+use codex_qunux::IoEventKind;
+use codex_qunux::IoHandleStatus;
+use codex_qunux::QunuxRuntime;
+use codex_qunux::RuntimeContext;
+use codex_qunux::ThreadStatus;
+use codex_qunux::TicketClassification;
+use codex_qunux::WaitStatus;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
@@ -597,6 +607,364 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
         .into_iter()
         .find(|entry| *entry == expected);
     assert_eq!(captured, Some(expected));
+}
+
+#[tokio::test]
+async fn spawn_agent_with_qunux_binding_prebinds_child_session() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let parent_actor_session_id = parent_thread_id.to_string();
+    let parent_context =
+        RuntimeContext::for_session(harness.config.cwd.to_path_buf(), parent_actor_session_id)
+            .expect("parent Qunux context");
+    let mut runtime = QunuxRuntime::load_or_init(
+        parent_context.clone(),
+        "Root task",
+        "# Root task\n\nParent Qunux process.",
+    )
+    .expect("init Qunux runtime");
+    let ticket_id = runtime
+        .create_ticket("P000", "Split work", "# Split work")
+        .expect("ticket");
+    runtime
+        .classify_ticket(&ticket_id, TicketClassification::Split, "spawn child")
+        .expect("classify");
+    runtime
+        .set_status(EntityKind::Ticket, &ticket_id, "splitting")
+        .expect("ticket splitting");
+    let child_problem_id = runtime
+        .create_problem_from_ticket("P000", &ticket_id, "Child work", "# Child work")
+        .expect("child problem");
+    let spawned = runtime
+        .spawn_thread(
+            &child_problem_id,
+            ContextForkPolicy::FullContext,
+            "bootstrap child".to_string(),
+            Some(harness.config.cwd.to_string_lossy().to_string()),
+            Some(
+                harness
+                    .config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "test-model".to_string()),
+            ),
+            vec!["qunux".to_string()],
+        )
+        .expect("spawn Qunux thread");
+    let child_qunux_context = RuntimeContext::with_ids(
+        harness.config.cwd.to_path_buf(),
+        parent_context.process_id.clone(),
+        spawned.thread_id.clone(),
+    )
+    .expect("child Qunux context")
+    .with_parent_actor_session_id(parent_thread_id.to_string())
+    .expect("parent actor binding");
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::Qunux);
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            child_config,
+            text_input("hello Qunux child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                qunux_runtime_context: Some(child_qunux_context),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("child spawn should succeed")
+        .thread_id;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_context = child_thread
+        .codex
+        .session
+        .services
+        .qunux_runtime_context
+        .clone()
+        .expect("child Qunux context");
+    let child_actor_session_id = child_thread_id.to_string();
+    let parent_actor_session_id = parent_thread_id.to_string();
+
+    assert_eq!(child_context.process_id, parent_context.process_id);
+    assert_eq!(child_context.thread_id, spawned.thread_id);
+    assert_eq!(
+        child_context.actor_session_id.as_deref(),
+        Some(child_actor_session_id.as_str())
+    );
+    assert_eq!(
+        child_context.parent_actor_session_id.as_deref(),
+        Some(parent_actor_session_id.as_str())
+    );
+
+    let runtime = QunuxRuntime::load(child_context).expect("load child-bound runtime");
+    let qunux_child = runtime
+        .state()
+        .threads
+        .get(&spawned.thread_id)
+        .expect("Qunux child thread");
+    assert_eq!(
+        qunux_child.actor_session_id.as_deref(),
+        Some(child_actor_session_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn qunux_child_completion_marks_unfinished_child_failed() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let parent_context = RuntimeContext::for_session(
+        harness.config.cwd.to_path_buf(),
+        parent_thread_id.to_string(),
+    )
+    .expect("parent Qunux context");
+    let mut runtime = QunuxRuntime::load_or_init(
+        parent_context.clone(),
+        "Root task",
+        "# Root task\n\nParent Qunux process.",
+    )
+    .expect("init Qunux runtime");
+    let ticket_id = runtime
+        .create_ticket("P000", "Split work", "# Split work")
+        .expect("ticket");
+    runtime
+        .classify_ticket(&ticket_id, TicketClassification::Split, "spawn child")
+        .expect("classify");
+    runtime
+        .set_status(EntityKind::Ticket, &ticket_id, "splitting")
+        .expect("ticket splitting");
+    let child_problem_id = runtime
+        .create_problem_from_ticket("P000", &ticket_id, "Child work", "# Child work")
+        .expect("child problem");
+    let spawned = runtime
+        .spawn_thread(
+            &child_problem_id,
+            ContextForkPolicy::FullContext,
+            "bootstrap child".to_string(),
+            Some(harness.config.cwd.to_string_lossy().to_string()),
+            None,
+            vec!["qunux".to_string()],
+        )
+        .expect("spawn Qunux thread");
+    let child_qunux_context = RuntimeContext::with_ids(
+        harness.config.cwd.to_path_buf(),
+        parent_context.process_id.clone(),
+        spawned.thread_id.clone(),
+    )
+    .expect("child Qunux context")
+    .with_parent_actor_session_id(parent_thread_id.to_string())
+    .expect("parent actor binding");
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::Qunux);
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            child_config,
+            text_input("hello Qunux child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                qunux_runtime_context: Some(child_qunux_context),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("child spawn should succeed")
+        .thread_id;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+
+    record_qunux_child_completion(
+        child_thread.as_ref(),
+        &AgentStatus::Completed(Some("done".to_string())),
+    );
+
+    let runtime = QunuxRuntime::load(parent_context).expect("load parent runtime");
+    assert_eq!(
+        runtime.state().threads[&spawned.thread_id].status,
+        ThreadStatus::Failed
+    );
+    assert_eq!(
+        runtime.state().handles[&spawned.handle_id].status,
+        IoHandleStatus::Failed
+    );
+    assert_eq!(
+        runtime.state().waits[&spawned.wait_id].status,
+        WaitStatus::Ready
+    );
+    assert!(runtime.state().io_events.iter().any(|event| {
+        event.kind == IoEventKind::ActorCompletedWithoutThreadDone
+            && event.thread_id.as_deref() == Some(spawned.thread_id.as_str())
+    }));
+    assert!(runtime.state().io_events.iter().any(|event| {
+        event.kind == IoEventKind::ChildThreadFailed
+            && event.handle_id.as_deref() == Some(spawned.handle_id.as_str())
+            && event.thread_id.as_deref() == Some(spawned.thread_id.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn qunux_child_completion_auto_joins_done_child() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let parent_context = RuntimeContext::for_session(
+        harness.config.cwd.to_path_buf(),
+        parent_thread_id.to_string(),
+    )
+    .expect("parent Qunux context");
+    let mut runtime = QunuxRuntime::load_or_init(
+        parent_context.clone(),
+        "Root task",
+        "# Root task\n\nParent Qunux process.",
+    )
+    .expect("init Qunux runtime");
+    let parent_ticket_id = runtime
+        .create_ticket("P000", "Split work", "# Split work")
+        .expect("ticket");
+    runtime
+        .classify_ticket(
+            &parent_ticket_id,
+            TicketClassification::Split,
+            "spawn child",
+        )
+        .expect("classify");
+    runtime
+        .set_status(EntityKind::Ticket, &parent_ticket_id, "splitting")
+        .expect("ticket splitting");
+    let child_problem_id = runtime
+        .create_problem_from_ticket("P000", &parent_ticket_id, "Child work", "# Child work")
+        .expect("child problem");
+    let spawned = runtime
+        .spawn_thread(
+            &child_problem_id,
+            ContextForkPolicy::FullContext,
+            "bootstrap child".to_string(),
+            Some(harness.config.cwd.to_string_lossy().to_string()),
+            None,
+            vec!["qunux".to_string()],
+        )
+        .expect("spawn Qunux thread");
+    let child_qunux_context = RuntimeContext::with_ids(
+        harness.config.cwd.to_path_buf(),
+        parent_context.process_id.clone(),
+        spawned.thread_id.clone(),
+    )
+    .expect("child Qunux context")
+    .with_parent_actor_session_id(parent_thread_id.to_string())
+    .expect("parent actor binding");
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::Qunux);
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            child_config,
+            text_input("hello Qunux child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                qunux_runtime_context: Some(child_qunux_context.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("child spawn should succeed")
+        .thread_id;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+
+    let mut child_runtime = QunuxRuntime::load(child_qunux_context).expect("load child runtime");
+    let child_ticket_id = child_runtime
+        .create_ticket(&spawned.root_problem_id, "Do child work", "# Do child work")
+        .expect("child ticket");
+    child_runtime
+        .classify_ticket(&child_ticket_id, TicketClassification::OneGo, "direct")
+        .expect("classify child");
+    child_runtime
+        .set_status(EntityKind::Problem, &spawned.root_problem_id, "doing")
+        .expect("child problem doing");
+    child_runtime
+        .set_status(EntityKind::Ticket, &child_ticket_id, "executing")
+        .expect("child ticket executing");
+    let result_id = child_runtime
+        .record_result(&child_ticket_id, "Child done", "# Child done")
+        .expect("child result");
+    child_runtime
+        .check(
+            &spawned.root_problem_id,
+            CheckStatus::Success,
+            vec![result_id],
+            "Child success",
+            "# Child success",
+            None,
+        )
+        .expect("child success check");
+    child_runtime
+        .state_mut()
+        .handles
+        .get_mut(&spawned.handle_id)
+        .expect("child handle")
+        .status = IoHandleStatus::Pending;
+    child_runtime
+        .state_mut()
+        .waits
+        .get_mut(&spawned.wait_id)
+        .expect("child wait")
+        .status = WaitStatus::Waiting;
+    child_runtime.save().expect("save reset handle");
+
+    record_qunux_child_completion(
+        child_thread.as_ref(),
+        &AgentStatus::Completed(Some("done".to_string())),
+    );
+
+    let runtime = QunuxRuntime::load(parent_context).expect("load parent runtime");
+    assert_eq!(
+        runtime.state().handles[&spawned.handle_id].status,
+        IoHandleStatus::Consumed
+    );
+    assert_eq!(
+        runtime.state().waits[&spawned.wait_id].status,
+        WaitStatus::Consumed
+    );
+    assert!(
+        runtime.state().threads[&spawned.thread_id]
+            .joined_at
+            .is_some()
+    );
+    assert!(runtime.state().io_events.iter().any(|event| {
+        event.kind == IoEventKind::ChildThreadJoined
+            && event.handle_id.as_deref() == Some(spawned.handle_id.as_str())
+            && event.thread_id.as_deref() == Some(spawned.thread_id.as_str())
+    }));
 }
 
 #[tokio::test]

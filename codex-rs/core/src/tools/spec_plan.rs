@@ -13,6 +13,8 @@ use crate::tools::handlers::ListMcpResourcesHandler;
 use crate::tools::handlers::LocalShellHandler;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::PlanHandler;
+use crate::tools::handlers::QunuxHandler;
+use crate::tools::handlers::QunuxOperation;
 use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
@@ -337,6 +339,11 @@ fn collect_handler_tools(
         handlers.push(Arc::new(CreateGoalHandler));
         handlers.push(Arc::new(UpdateGoalHandler));
     }
+    if config.qunux_tools {
+        for operation in QunuxOperation::all() {
+            handlers.push(Arc::new(QunuxHandler::new(operation)));
+        }
+    }
 
     handlers.push(Arc::new(RequestUserInputHandler {
         available_modes: config.request_user_input_available_modes.clone(),
@@ -378,7 +385,7 @@ fn collect_handler_tools(
         })));
     }
 
-    if config.collab_tools {
+    if config.collab_tools && !config.qunux_tools {
         if config.multi_agent_v2 {
             let agent_type_description =
                 agent_type_description(config, params.default_agent_type_description);
