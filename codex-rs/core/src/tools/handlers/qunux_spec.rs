@@ -122,7 +122,7 @@ fn tool_for_operation(operation: QunuxOperation) -> ResponsesApiTool {
             ),
         ),
         QunuxOperation::SpawnThread => (
-            "Spawn a Qunux child thread bound to a problem subtree and fork a Codex child agent.",
+            "Spawn a Qunux child thread bound to a problem subtree and fork a Codex child agent. For fuzzy or semantic waits, use this same ordinary child-thread mechanism with a watcher bootstrap; do not invent a semantic wait kernel primitive.",
             object(
                 [
                     string(
@@ -131,7 +131,7 @@ fn tool_for_operation(operation: QunuxOperation) -> ResponsesApiTool {
                     ),
                     optional_string(
                         "bootstrap_instruction",
-                        "Optional instruction appended to the child agent bootstrap.",
+                        "Optional instruction appended to the child agent bootstrap. For watcher child threads, include the semantic goal, criteria, signals to inspect, evidence required, interval or trigger policy, budget/deadline, and escalation rule.",
                     ),
                     string_enum(
                         "context_policy",
@@ -314,5 +314,31 @@ mod tests {
             !properties.contains_key("spawn_agent"),
             "qunux.spawn_thread must always create a Codex child agent"
         );
+    }
+
+    #[test]
+    fn spawn_thread_schema_describes_watcher_bootstrap_pattern() {
+        let ToolSpec::Namespace(namespace) = create_qunux_tool(QunuxOperation::SpawnThread) else {
+            panic!("expected namespace spec");
+        };
+        let ResponsesApiNamespaceTool::Function(tool) = namespace.tools.first().expect("tool");
+        let properties = tool
+            .parameters
+            .properties
+            .as_ref()
+            .expect("object properties");
+        let bootstrap_description = properties["bootstrap_instruction"]
+            .description
+            .as_deref()
+            .expect("bootstrap description");
+
+        assert!(tool.description.contains("watcher bootstrap"));
+        assert!(tool.description.contains("ordinary child-thread"));
+        assert!(tool.description.contains("semantic wait kernel primitive"));
+        assert!(bootstrap_description.contains("semantic goal"));
+        assert!(bootstrap_description.contains("criteria"));
+        assert!(bootstrap_description.contains("signals"));
+        assert!(bootstrap_description.contains("evidence"));
+        assert!(bootstrap_description.contains("escalation"));
     }
 }

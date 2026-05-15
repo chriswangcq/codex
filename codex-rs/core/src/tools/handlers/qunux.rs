@@ -325,10 +325,7 @@ async fn spawn_codex_child_agent(
     )?;
     apply_spawn_agent_overrides(&mut config, child_depth);
 
-    let message = format!(
-        "You are a Qunux child thread.\n\nQunux thread id: {}\nBound root problem: {}\n\nRules:\n- Work only inside this Qunux thread subtree.\n- Start by calling qunux.current, then qunux.next.\n- Do exactly the current next action and let Qunux enforce closure.\n\nBootstrap:\n{}",
-        spawned.thread_id, spawned.root_problem_id, spawned.bootstrap_instruction
-    );
+    let message = child_thread_initial_message(spawned);
     let initial_operation: Op = vec![UserInput::Text {
         text: message,
         text_elements: Vec::new(),
@@ -372,6 +369,13 @@ async fn spawn_codex_child_agent(
     .await
     .map_err(collab_spawn_error)?;
     Ok(child.thread_id.to_string())
+}
+
+fn child_thread_initial_message(spawned: &SpawnedThread) -> String {
+    format!(
+        "You are a Qunux child thread.\n\nQunux thread id: {}\nBound root problem: {}\n\nRules:\n- Work only inside this Qunux thread subtree.\n- Start by calling qunux.current, then qunux.next.\n- Do exactly the current next action and let Qunux enforce closure.\n- If this is a watcher child thread for a fuzzy or semantic wait, inspect the requested signals, judge the criteria, record evidence, and close only when the criteria are met or the bootstrap escalation rule says to stop. Do not create a semantic wait primitive.\n\nBootstrap:\n{}",
+        spawned.thread_id, spawned.root_problem_id, spawned.bootstrap_instruction
+    )
 }
 
 fn default_thread_bootstrap() -> String {
@@ -514,6 +518,26 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn child_thread_bootstrap_preserves_watcher_guidance() {
+        let spawned = SpawnedThread {
+            thread_id: "QT001".to_string(),
+            root_problem_id: "P001".to_string(),
+            handle_id: "H000".to_string(),
+            wait_id: "W000".to_string(),
+            bootstrap_instruction: "Watcher goal: inspect CI every 30 minutes; close only when CI is green with evidence.".to_string(),
+        };
+
+        let message = child_thread_initial_message(&spawned);
+
+        assert!(message.contains("Qunux thread id: QT001"));
+        assert!(message.contains("Bound root problem: P001"));
+        assert!(message.contains("watcher child thread"));
+        assert!(message.contains("record evidence"));
+        assert!(message.contains("Do not create a semantic wait primitive"));
+        assert!(message.contains("Watcher goal: inspect CI every 30 minutes"));
+    }
 
     #[tokio::test]
     async fn native_handler_binds_root_session_to_process() {

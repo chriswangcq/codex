@@ -70,6 +70,7 @@ coverage/
 # personal files
 personal/
 .complex-problems/
+.qunux/
 codex-rs/.qunux/
 
 # os

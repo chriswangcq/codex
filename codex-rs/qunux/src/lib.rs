@@ -3161,6 +3161,75 @@ mod tests {
     }
 
     #[test]
+    fn watcher_thread_uses_ordinary_child_thread_wait() {
+        let mut runtime = runtime();
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(
+                &parent_ticket,
+                TicketClassification::Split,
+                "watch condition",
+            )
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "splitting")
+            .expect("splitting");
+        let child_id = runtime
+            .create_problem_from_ticket(
+                "P000",
+                &parent_ticket,
+                "Watch PR readiness",
+                "# Watch PR readiness",
+            )
+            .expect("child");
+        let watcher_bootstrap = "Watcher goal: inspect PR CI and comments every 30 minutes; close only with evidence when criteria are met.";
+
+        let spawned = runtime
+            .spawn_thread(
+                &child_id,
+                ContextForkPolicy::FullContext,
+                watcher_bootstrap,
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("spawn watcher thread");
+
+        let child_thread = &runtime.state().threads[&spawned.thread_id];
+        assert_eq!(child_thread.root_problem_id, child_id);
+        assert_eq!(
+            child_thread.context_fork.bootstrap_instruction,
+            watcher_bootstrap
+        );
+
+        let handle = &runtime.state().handles[&spawned.handle_id];
+        assert_eq!(handle.kind, IoHandleKind::ChildThread);
+        assert_eq!(handle.owner_thread_id, DEFAULT_THREAD_ID);
+        assert_eq!(
+            handle.target_thread_id.as_deref(),
+            Some(spawned.thread_id.as_str())
+        );
+        assert_eq!(handle.status, IoHandleStatus::Pending);
+
+        let wait = &runtime.state().waits[&spawned.wait_id];
+        assert_eq!(wait.thread_id, DEFAULT_THREAD_ID);
+        assert_eq!(wait.handle_ids, vec![spawned.handle_id.clone()]);
+        assert_eq!(wait.mode, WaitMode::All);
+        assert_eq!(wait.status, WaitStatus::Waiting);
+
+        let next = runtime.next();
+        assert_eq!(next.action, NextAction::WaitThread);
+        assert_eq!(next.disposition, NextDisposition::IoWait);
+        assert_eq!(
+            next.target_thread_id.as_deref(),
+            Some(spawned.thread_id.as_str())
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
     fn child_spawn_failure_records_failed_terminal_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root_context = RuntimeContext::new(dir.path());
