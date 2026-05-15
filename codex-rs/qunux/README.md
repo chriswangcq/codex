@@ -71,6 +71,10 @@ Thread invariants:
   readiness kernel: a thread blocks on a `WaitHandle`, leaves the run queue,
   and only becomes runnable again when user input, child completion, tool
   output, approval, timers, or external events resolve that handle.
+- Fuzzy or semantic wake does not need a special kernel primitive. Model it as
+  a watcher child thread: the parent blocks on the normal child-thread handle,
+  and the child periodically judges the semantic condition, records evidence,
+  and closes when the criteria are met.
 
 ## Codex Native Tool Integration
 

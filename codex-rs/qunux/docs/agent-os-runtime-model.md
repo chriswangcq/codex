@@ -265,6 +265,68 @@ Auto-join and explicit join are policies above the readiness layer:
 - The scheduler decides whether the next parent action is `join_thread`,
   recovery, check, or another semantic step.
 
+## Semantic Waits As Watcher Threads
+
+Fuzzy or semantic wake behavior does not require a new kernel primitive.
+
+Do not add a `SemanticWaitHandle` to the Wait/Wake Kernel just because a goal is
+soft, delayed, or judgment-heavy. Represent fuzzy wake as an ordinary child
+thread with a watcher ticket.
+
+The pattern is:
+
+```text
+parent thread
+  -> creates a child problem with a watcher ticket
+  -> spawn_thread(child problem)
+  -> blocks on the normal child_thread WaitHandle
+
+watcher child thread
+  -> inspects the required signals
+  -> judges the semantic criteria with an appropriate model
+  -> records evidence in result/check bodies
+  -> if criteria are met, closes the child problem
+  -> if criteria are not met, waits for the next time window or input signal
+
+Wait/Wake Kernel
+  -> only sees ordinary child_thread, timer, tool_result, user_input, or
+     external_signal handles
+  -> wakes the parent when the watcher child reaches a visible terminal state
+```
+
+This keeps the boundary clean:
+
+```text
+Wait/Wake Kernel owns hard readiness.
+Watcher thread owns semantic judgment.
+next owns the next runnable instruction.
+LLM CPU owns execution and review.
+```
+
+A watcher ticket should be explicit about:
+
+- goal
+- criteria
+- signals to inspect
+- evidence required before completion
+- model/cost preference, such as using a cheaper model for repeated checks
+- interval or trigger policy
+- maximum attempts, deadline, or escalation condition
+- what uncertainty should do, usually continue waiting or escalate to parent
+
+The watcher must not silently pretend that "not yet" is completion. If the
+condition is unmet, it records the observation and waits again. If the condition
+is met, it records the evidence and closes through the normal ticket/result/check
+loop. If the condition is ambiguous beyond its authority, it records a gap or
+escalates through a follow-up.
+
+In other words:
+
+```text
+Fuzzy wake is an agent pattern built from child thread + ordinary wait handles.
+It is not a Wait/Wake Kernel feature.
+```
+
 ## Tool And External IO
 
 Synchronous tools may return within the current dispatch. Long-running or
