@@ -268,6 +268,8 @@ Auto-join and explicit join are policies above the readiness layer:
 ## Semantic Waits As Watcher Threads
 
 Fuzzy or semantic wake behavior does not require a new kernel primitive.
+The operational recipe is documented in
+[`watcher-thread-pattern.md`](watcher-thread-pattern.md).
 
 Do not add a `SemanticWaitHandle` to the Wait/Wake Kernel just because a goal is
 soft, delayed, or judgment-heavy. Represent fuzzy wake as an ordinary child

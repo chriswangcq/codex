@@ -1,0 +1,254 @@
+# Watcher Child-Thread Pattern
+
+This document is the operational recipe for fuzzy or semantic wake behavior in
+Qunux.
+
+The rule is simple:
+
+```text
+Do not add a semantic wait primitive to the kernel.
+Create a watcher child thread.
+Let the watcher child decide whether the semantic condition is met.
+Let the parent block on the ordinary child_thread WaitHandle.
+```
+
+## When To Use
+
+Use a watcher child thread when progress depends on a condition that is not a
+single deterministic event.
+
+Good examples:
+
+- wait until a PR is ready to review
+- wait until an external page changes in a meaningful way
+- wait until a build or rollout looks healthy enough
+- wait until a user or external team has likely produced the needed context
+- wait until market, repo, incident, or issue signals meet a criterion
+- periodically inspect a queue and wake the parent when a useful item appears
+
+Do not use this pattern for hard events that already have exact signals. A tool
+result, child completion, approval, webhook, and user reply should use ordinary
+Wait/Wake handles directly.
+
+## Runtime Boundary
+
+The boundary stays sharp:
+
+```text
+Wait/Wake Kernel owns hard readiness.
+Watcher thread owns semantic judgment.
+next owns the next runnable instruction.
+LLM CPU owns execution and review.
+```
+
+The Wait/Wake Kernel should only see ordinary handles such as:
+
+- `child_thread`
+- `timer`
+- `tool_result`
+- `user_input`
+- `external_signal`
+
+The watcher thread translates fuzzy world state into an ordinary child-thread
+completion. That completion wakes the parent.
+
+## Parent Thread Flow
+
+The parent thread does this:
+
+```text
+1. Define the fuzzy condition as a child problem.
+2. Create a watcher ticket for that child problem.
+3. spawn_thread(child problem).
+4. Block on the normal child_thread WaitHandle.
+5. When the child closes, join/read the watcher result.
+6. Continue the parent task with the watcher evidence.
+```
+
+The parent does not poll. The parent does not repeatedly ask the LLM whether the
+condition is ready. It waits for the child-thread handle.
+
+## Watcher Child Flow
+
+The watcher child runs this loop:
+
+```text
+while not terminal:
+  inspect configured signals
+  judge configured criteria
+  record observation and evidence
+
+  if criteria are met:
+    record final result
+    pass success check
+    close child problem
+    return
+
+  if deadline/budget/escalation condition is reached:
+    record final result with blocker or uncertainty
+    pass a truthful check or create follow-up/escalation
+    close or escalate according to the ticket
+    return
+
+  create or wait on the next timer/input/tool/external-signal handle
+```
+
+The watcher must never treat "not yet" as success. "Not yet" means wait again,
+unless the watcher has hit a budget, deadline, or escalation rule.
+
+## Watcher Problem Template
+
+Use this shape for the child problem:
+
+```md
+# Watch until <semantic condition>
+
+## Problem
+
+The parent task cannot proceed until <condition>. This condition is semantic:
+it requires inspecting <signals> and judging whether <criteria> are met.
+
+The watcher child thread should monitor the condition and close only when the
+criteria are met or when the escalation policy is triggered.
+
+## Success Criteria
+
+- Signals inspected: <sources, tools, files, APIs, user input, repo state>.
+- Criteria: <specific condition that means ready>.
+- Evidence required: <what must be recorded before completion>.
+- Check interval or trigger: <time window or external signal>.
+- Budget/deadline: <max attempts, cost, or wall-clock deadline>.
+- Escalation: <what to do if uncertain, blocked, or expired>.
+```
+
+## Watcher Ticket Template
+
+Use this shape for the watcher ticket:
+
+```md
+# Watch <condition> and close when ready
+
+## Problem Definition
+
+The parent is blocked on a fuzzy condition. The watcher must decide whether the
+condition is met by inspecting configured signals and recording evidence.
+
+## Proposed Solution
+
+On each wake window, inspect the signals, judge the criteria with the cheapest
+model that is reliable enough, and either:
+
+- close with evidence when criteria are met
+- wait for the next window when criteria are not met
+- escalate when uncertainty, budget, or deadline requires parent attention
+
+## Acceptance Criteria
+
+- Every check records the inspected signals.
+- The final result includes evidence for why the condition is met or why it
+  cannot be met within the watcher budget.
+- The watcher does not claim success on thin evidence.
+- The parent can continue from the watcher result without redoing the same
+  investigation.
+
+## Verification Plan
+
+Review the final evidence against the criteria, stress test at least one false
+positive scenario, and state residual uncertainty.
+
+## Risks
+
+- False positive wake.
+- Infinite low-value polling.
+- Cheap-model overconfidence.
+- Stale or missing signals.
+
+## Assumptions
+
+- The parent is allowed to wait on this child thread.
+- The watcher may use a cheaper model for repeated checks, but must escalate
+  when confidence is insufficient.
+```
+
+## Observation Rules
+
+Watcher observations should be auditable. Each observation should record:
+
+- time/window
+- inspected signals
+- raw pointers or evidence references
+- model used, if relevant
+- criteria verdict
+- confidence or uncertainty
+- next wait reason
+
+If observations are not first-class runtime objects yet, keep them in the
+watcher thread's ticket notes, result draft, or child problem body until the
+final result is recorded.
+
+## Completion Rules
+
+The watcher child may close only when one of these is true:
+
+- Criteria met: final result records evidence and success check passes.
+- Criteria impossible or expired: final result records why and the check
+  truthfully closes or escalates according to the ticket.
+- Parent intervention needed: watcher records the reason and wakes/escalates
+  through the normal problem closure path.
+
+The watcher must not close just because it ran out of patience.
+
+## Model Policy
+
+Repeated watcher checks may use a cheaper model when:
+
+- criteria are structured
+- signals are narrow
+- false positives are low impact or easy to catch
+- final evidence is still recorded
+
+Escalate to a stronger model or parent thread when:
+
+- the condition is ambiguous
+- false positives are expensive
+- evidence conflicts
+- the watcher is changing scope
+- budget/deadline decisions need judgment outside the ticket
+
+## Anti-Patterns
+
+Do not:
+
+- add `SemanticWaitHandle` just for fuzzy goals
+- make the parent poll the condition directly
+- close the watcher without evidence
+- hide repeated failed observations
+- let a cheap model silently expand scope
+- keep polling forever without budget, deadline, or escalation
+
+## Minimal Example
+
+```text
+Parent task:
+  "Continue migration once the upstream PR is stable enough to build against."
+
+Child problem:
+  "Watch upstream PR until it is stable enough to build against."
+
+Watcher ticket:
+  - Signals: PR CI status, latest commit time, breaking API comments.
+  - Criteria: CI green, no blocking maintainer comments, API unchanged for
+    two check windows.
+  - Interval: every 30 minutes or webhook.
+  - Budget: 8 checks.
+  - Evidence: CI URL, commit hash, comment pointers, API diff summary.
+  - Escalation: if CI flakes or API keeps changing, wake parent with blocker.
+
+Runtime:
+  parent spawn_thread(child)
+  parent blocks on child_thread WaitHandle
+  watcher loops on timer/tool handles
+  watcher closes when criteria are met
+  parent wakes and joins watcher evidence
+```
+

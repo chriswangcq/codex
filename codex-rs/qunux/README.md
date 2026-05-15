@@ -8,6 +8,8 @@ Qunux does not replace LLM reasoning. The LLM remains the intelligent CPU. Qunux
 
 The unified Codex-native Agent OS model is specified in
 [`docs/agent-os-runtime-model.md`](docs/agent-os-runtime-model.md).
+The fuzzy-wake watcher child-thread recipe is specified in
+[`docs/watcher-thread-pattern.md`](docs/watcher-thread-pattern.md).
 The next native lifecycle and IO iteration is specified in
 [`docs/native-session-io-runtime-v1.md`](docs/native-session-io-runtime-v1.md).
 The `next` scheduler/syscall contract is specified in
