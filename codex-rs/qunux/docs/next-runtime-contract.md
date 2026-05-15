@@ -50,12 +50,21 @@ thread is not runnable.
 
 ## Native Codex Tool Surface
 
-Native Codex `qunux.next` is an agent-loop system call.
+Native Codex `qunux.next` is a pure tool surface over `QunuxRuntime::next()`.
 
-When pure `next()` returns `runnable` or `terminal`, the native tool returns the
-step directly. When pure `next()` returns `io_wait`, the native tool should park
-the current agent loop on the relevant logical IO source when it knows how to
-do so.
+The native tool returns the step directly for every disposition, including
+`io_wait`. It does not subscribe to child actors, wait for completion, or reload
+state in a loop.
+
+## Dispatch Preflight Parking
+
+Agent-loop parking happens before prompt context is assembled and before the
+model is called.
+
+Before a Qunux-backed turn dispatches to the model, Codex runs a preflight over
+the same pure `next()` frontier. When pure `next()` returns `io_wait`, preflight
+parks the current agent loop on the relevant logical IO source when it knows how
+to do so.
 
 Today the supported IO wait is a child-thread wait:
 
@@ -64,10 +73,11 @@ Today the supported IO wait is a child-thread wait:
 3. subscribe to the child actor status,
 4. await final actor status,
 5. reload Qunux state,
-6. return the fresh next step.
+6. let the parent proceed to normal model dispatch once it is runnable or
+   terminal.
 
-If native `qunux.next` cannot park an IO wait safely, it must fail explicitly.
-It must not hand the parent LLM an ordinary instruction that invites polling.
+If dispatch preflight cannot park an IO wait safely, it fails explicitly. It
+must not let the parent LLM receive an ordinary prompt that invites polling.
 
 ## Invariants
 
@@ -77,8 +87,8 @@ It must not hand the parent LLM an ordinary instruction that invites polling.
 - `next` never marks a problem successful; checks do that.
 - `next` never replaces LLM judgment; it constrains the legal state frontier.
 - `io_wait` is not a task. It is a runtime park state.
-- Native `qunux.next` may block asynchronously on IO; pure `QunuxRuntime::next`
-  never blocks.
+- Native `qunux.next` never blocks. Dispatch preflight may block asynchronously
+  on IO before model dispatch.
 
 ## Future Extensions
 

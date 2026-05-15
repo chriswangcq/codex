@@ -39,6 +39,7 @@ use crate::mentions::collect_explicit_plugin_mentions;
 use crate::mentions::collect_tool_mentions_from_messages;
 use crate::parse_turn_item;
 use crate::plugins::build_plugin_injections;
+use crate::qunux_dispatch::park_qunux_io_wait_before_dispatch;
 use crate::resolve_skill_dependencies_for_turn;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
@@ -432,6 +433,23 @@ pub(crate) async fn run_turn(
                 continue;
             }
             break;
+        }
+
+        let qunux_preflight_cancellation = cancellation_token.child_token();
+        if let Err(e) =
+            park_qunux_io_wait_before_dispatch(&sess, &qunux_preflight_cancellation).await
+        {
+            match e {
+                CodexErr::TurnAborted => {
+                    break;
+                }
+                e => {
+                    info!("Qunux dispatch preflight error: {e:#}");
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                    break;
+                }
+            }
         }
 
         // Construct the input that we will send to the model.

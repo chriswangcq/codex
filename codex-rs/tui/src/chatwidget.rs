@@ -68,6 +68,8 @@ use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
 use crate::multi_agents::AgentMetadata;
+use crate::qunux_cockpit::QunuxCockpitRenderable;
+use crate::qunux_cockpit::QunuxCockpitSnapshot;
 use crate::session_state::SessionNetworkProxyRuntime;
 use crate::session_state::ThreadSessionState;
 use crate::status::RateLimitWindowDisplay;
@@ -103,6 +105,7 @@ use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::ModelVerification as AppServerModelVerification;
+use codex_app_server_protocol::QunuxSnapshotNotification;
 use codex_app_server_protocol::RateLimitReachedType;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
@@ -536,6 +539,7 @@ pub(crate) struct ChatWidget {
     skills_all: Vec<ProtocolSkillMetadata>,
     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
     last_unified_wait: Option<UnifiedExecWaitState>,
+    qunux_snapshot: Option<QunuxCockpitSnapshot>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_lifecycle: TurnLifecycleState,
     task_complete_pending: bool,
@@ -888,6 +892,15 @@ impl ChatWidget {
         self.realtime_conversation_enabled()
     }
 
+    fn on_qunux_snapshot(&mut self, notification: QunuxSnapshotNotification) {
+        self.qunux_snapshot = Some(QunuxCockpitSnapshot::new(
+            notification.process_id,
+            notification.state_path,
+            notification.snapshot,
+        ));
+        self.request_redraw();
+    }
+
     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
     ///
     /// The bottom pane only has one running flag, but this module treats it as a derived state of
@@ -1238,6 +1251,7 @@ impl ChatWidget {
         self.thread_id = Some(session.thread_id);
         if previous_thread_id != self.thread_id {
             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
+            self.qunux_snapshot = None;
         }
         self.refresh_plan_mode_nudge();
         self.turn_lifecycle.reset_thread();
@@ -3861,6 +3875,7 @@ impl ChatWidget {
             pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
+            qunux_snapshot: None,
             unified_exec_wait_streak: None,
             turn_lifecycle: TurnLifecycleState::new(prevent_idle_sleep),
             task_complete_pending: false,
@@ -8823,6 +8838,28 @@ impl ChatWidget {
 
     fn as_renderable(&self) -> RenderableItem<'_> {
         let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
+        if self.config.features.enabled(Feature::Qunux) {
+            let mut flex = FlexRenderable::new();
+            flex.push(
+                /*flex*/ 1,
+                RenderableItem::Owned(Box::new(QunuxCockpitRenderable::new(
+                    self.config.cwd.as_path(),
+                    self.qunux_snapshot.as_ref(),
+                ))),
+            );
+            flex.push(
+                /*flex*/ 0,
+                RenderableItem::Owned(Box::new(BottomPaneComposerReserveRenderable {
+                    bottom_pane: &self.bottom_pane,
+                    right_reserve: active_cell_right_reserve,
+                }))
+                .inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                )),
+            );
+            return RenderableItem::Owned(Box::new(flex));
+        }
+
         let active_cell_renderable = match &self.transcript.active_cell {
             Some(cell) => RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
                 child: cell.as_ref(),

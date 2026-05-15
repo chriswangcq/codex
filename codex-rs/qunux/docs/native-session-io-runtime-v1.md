@@ -278,12 +278,16 @@ There are two surfaces:
 - Pure `QunuxRuntime::next()` is deterministic state inspection. It may return
   `WaitThread` so renderers, tests, and diagnostics can show why a thread is
   not runnable.
-- Native Codex `qunux.next` is an agent-loop system call. If the pure next step
-  is a running child-thread wait, the handler should asynchronously await the
-  child actor status notification, reload Qunux state, and then return the next
-  runnable action. If the wait cannot be parked because identity or status
-  subscription is missing, it should fail explicitly rather than invite LLM
-  polling.
+- Native Codex dispatch preflight is the parking surface. Before prompt context
+  is assembled for a Qunux-backed turn, Codex checks the same pure frontier. If
+  the current thread is waiting on a running child-thread wait, preflight
+  asynchronously awaits the child actor status notification, reloads Qunux
+  state, and only then lets the parent continue to model dispatch. If the wait
+  cannot be parked because identity or status subscription is missing, preflight
+  fails explicitly rather than invite LLM polling.
+- Native Codex `qunux.next` is intentionally a pure tool surface over
+  `QunuxRuntime::next()`. It reports `WaitThread` / `io_wait` for state
+  inspection, diagnostics, and UI, but it does not await child completion.
 
 ## Completion And Auto-Join
 

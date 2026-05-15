@@ -2,6 +2,34 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn qunux_snapshot_notification_updates_cockpit_snapshot() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::QunuxSnapshot(QunuxSnapshotNotification {
+            thread_id: "thread-1".to_string(),
+            process_id: "QP-live".to_string(),
+            qunux_thread_id: "QT-live".to_string(),
+            state_path: Some("/tmp/.qunux/processes/QP-live/closure.json".to_string()),
+            snapshot: json!({
+                "process_id": "QP-live",
+                "main_thread_id": "QT-live",
+                "problems": {}
+            }),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let snapshot = chat.qunux_snapshot.as_ref().expect("stored snapshot");
+    assert_eq!(snapshot.process_id, "QP-live");
+    assert_eq!(
+        snapshot.state_path.as_deref(),
+        Some("/tmp/.qunux/processes/QP-live/closure.json")
+    );
+    assert_eq!(snapshot.state["main_thread_id"], "QT-live");
+}
+
+#[tokio::test]
 async fn invalid_url_elicitation_is_declined() {
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let thread_id = ThreadId::new();

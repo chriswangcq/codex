@@ -98,6 +98,7 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ServerRequestResolved(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::QunuxSnapshot(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::McpToolCallProgress(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -176,10 +177,12 @@ mod tests {
     use super::ServerNotificationThreadTarget;
     use super::server_notification_thread_target;
     use codex_app_server_protocol::GuardianWarningNotification;
+    use codex_app_server_protocol::QunuxSnapshotNotification;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::WarningNotification;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
 
     #[test]
     fn warning_notifications_without_threads_are_global() {
@@ -212,6 +215,22 @@ mod tests {
         let notification = ServerNotification::GuardianWarning(GuardianWarningNotification {
             thread_id: thread_id.to_string(),
             message: "warning".to_string(),
+        });
+
+        let target = server_notification_thread_target(&notification);
+
+        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn qunux_snapshot_notifications_route_to_threads() {
+        let thread_id = ThreadId::new();
+        let notification = ServerNotification::QunuxSnapshot(QunuxSnapshotNotification {
+            thread_id: thread_id.to_string(),
+            process_id: "QP000".to_string(),
+            qunux_thread_id: "QT000".to_string(),
+            state_path: None,
+            snapshot: json!({ "process_id": "QP000" }),
         });
 
         let target = server_notification_thread_target(&notification);

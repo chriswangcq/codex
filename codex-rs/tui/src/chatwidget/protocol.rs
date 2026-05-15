@@ -154,6 +154,7 @@ impl ChatWidget {
                     .map(|details| format!("{}: {details}", notification.summary))
                     .unwrap_or(notification.summary),
             ),
+            ServerNotification::QunuxSnapshot(notification) => self.on_qunux_snapshot(notification),
             ServerNotification::McpServerStatusUpdated(notification) => {
                 self.on_mcp_server_status_updated(notification)
             }

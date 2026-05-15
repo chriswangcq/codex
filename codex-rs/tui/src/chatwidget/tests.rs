@@ -97,6 +97,7 @@ pub(super) use codex_app_server_protocol::PluginMarketplaceEntry;
 pub(super) use codex_app_server_protocol::PluginReadResponse;
 pub(super) use codex_app_server_protocol::PluginSource;
 pub(super) use codex_app_server_protocol::PluginSummary;
+pub(super) use codex_app_server_protocol::QunuxSnapshotNotification;
 pub(super) use codex_app_server_protocol::RateLimitReachedType;
 pub(super) use codex_app_server_protocol::RateLimitSnapshot;
 pub(super) use codex_app_server_protocol::RateLimitWindow;

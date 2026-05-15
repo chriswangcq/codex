@@ -2,7 +2,6 @@ use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
-use crate::agent::status::is_final;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -15,19 +14,14 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::qunux_spec::QUNUX_NAMESPACE;
 use crate::tools::handlers::qunux_spec::create_qunux_tool;
 use crate::tools::registry::ToolHandler;
-use codex_protocol::ThreadId;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_qunux::CheckStatus;
 use codex_qunux::ContextForkPolicy;
 use codex_qunux::EntityKind;
-use codex_qunux::NextAction;
-use codex_qunux::NextDisposition;
-use codex_qunux::NextStep;
 use codex_qunux::QunuxRuntime;
 use codex_qunux::RuntimeContext;
 use codex_qunux::SpawnedThread;
-use codex_qunux::ThreadStatus;
 use codex_qunux::TicketClassification;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -131,7 +125,7 @@ impl ToolHandler for QunuxHandler {
                 serde_json::to_value(runtime.current())
             }
             QunuxOperation::Next => {
-                serde_json::to_value(next_with_native_io_wait(runtime, &invocation).await?)
+                serde_json::to_value(runtime.next())
             }
             QunuxOperation::CreateProblem => {
                 let args: CreateProblemArgs = parse_arguments(&arguments)?;
@@ -380,125 +374,6 @@ async fn spawn_codex_child_agent(
     Ok(child.thread_id.to_string())
 }
 
-async fn next_with_native_io_wait(
-    mut runtime: QunuxRuntime,
-    invocation: &ToolInvocation,
-) -> Result<NextStep, FunctionCallError> {
-    loop {
-        let next = runtime.next();
-        if next.disposition != NextDisposition::IoWait {
-            return Ok(next);
-        }
-        if next.action != NextAction::WaitThread {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "Qunux next returned unsupported IO-wait action {:?}; cannot park the agent loop",
-                next.action
-            )));
-        }
-
-        let target_thread_id = next.target_thread_id.clone().ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "Qunux next returned wait_thread without target_thread_id; cannot park the agent loop"
-                    .to_string(),
-            )
-        })?;
-        let target_thread = runtime
-            .state()
-            .threads
-            .get(&target_thread_id)
-            .cloned()
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "Qunux next returned wait_thread for missing thread {target_thread_id}; cannot park the agent loop"
-                ))
-            })?;
-
-        if !matches!(
-            target_thread.status,
-            ThreadStatus::Running | ThreadStatus::WaitingChildren | ThreadStatus::WaitingIo
-        ) {
-            return Ok(next);
-        }
-
-        let actor_session_id = target_thread
-            .codex_thread_id
-            .clone()
-            .or(target_thread.actor_session_id.clone())
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "Qunux thread {target_thread_id} is waiting but has no bound Codex actor; cannot park the agent loop"
-                ))
-            })?;
-        let actor_thread_id = ThreadId::try_from(actor_session_id.as_str()).map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "Qunux thread {target_thread_id} has invalid Codex actor id {actor_session_id}: {err}; cannot park the agent loop"
-            ))
-        })?;
-
-        wait_for_agent_final_status(invocation, actor_thread_id, &target_thread_id).await?;
-
-        let context = runtime.context().clone();
-        runtime = QunuxRuntime::load(context).map_err(qunux_error)?;
-        let reloaded_next = runtime.next();
-        if reloaded_next.action == NextAction::WaitThread
-            && reloaded_next.target_thread_id.as_deref() == Some(target_thread_id.as_str())
-        {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "Codex child actor for Qunux thread {target_thread_id} reached a final status, but Qunux still reports the same wait_thread state. The completion hook did not advance the wait; inspect qunux.status/thread_status instead of polling next."
-            )));
-        }
-    }
-}
-
-async fn wait_for_agent_final_status(
-    invocation: &ToolInvocation,
-    actor_thread_id: ThreadId,
-    target_thread_id: &str,
-) -> Result<(), FunctionCallError> {
-    let mut status_rx = invocation
-        .session
-        .services
-        .agent_control
-        .subscribe_status(actor_thread_id)
-        .await
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "cannot subscribe to Codex actor {actor_thread_id} for Qunux thread {target_thread_id}: {err}; cannot park the agent loop"
-            ))
-        })?;
-
-    let mut status = status_rx.borrow().clone();
-    while !is_final(&status) {
-        tokio::select! {
-            changed = status_rx.changed() => {
-                if changed.is_err() {
-                    status = invocation
-                        .session
-                        .services
-                        .agent_control
-                        .get_status(actor_thread_id)
-                        .await;
-                    break;
-                }
-                status = status_rx.borrow().clone();
-            }
-            () = invocation.cancellation_token.cancelled() => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "Qunux wait for child thread {target_thread_id} was cancelled before the child actor reached a final status"
-                )));
-            }
-        }
-    }
-
-    if !is_final(&status) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "Qunux wait for child thread {target_thread_id} ended without a final Codex actor status: {status:?}"
-        )));
-    }
-
-    Ok(())
-}
-
 fn default_thread_bootstrap() -> String {
     "Solve the bound Qunux subtree to closure. Do not touch parent or sibling subtrees.".to_string()
 }
@@ -626,10 +501,12 @@ mod tests {
     use crate::session::tests::make_session_and_context;
     use crate::tools::context::ToolCallSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
+    use codex_protocol::ThreadId;
     use codex_qunux::DEFAULT_THREAD_ID;
     use codex_qunux::IoEventKind;
     use codex_qunux::IoHandleStatus;
     use codex_qunux::NextAction;
+    use codex_qunux::NextDisposition;
     use codex_qunux::ThreadStatus;
     use codex_qunux::process_id_for_session_id;
     use core_test_support::TempDirExt;
@@ -846,7 +723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_next_refuses_wait_without_bound_actor() {
+    async fn native_next_returns_wait_without_bound_actor() {
         let (session, mut turn) = make_session_and_context().await;
         let actor_session_id = session.thread_id().to_string();
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -877,18 +754,18 @@ mod tests {
                 .is_none()
         );
 
-        let result = call_result(session, turn, QunuxOperation::Next, json!({})).await;
-        let Err(err) = result else {
-            panic!("native next must reject an unparkable wait without actor binding");
-        };
-        assert!(
-            err.to_string().contains("has no bound Codex actor"),
-            "unexpected error: {err}"
+        let next = call(session, turn, QunuxOperation::Next, json!({})).await;
+        let next: serde_json::Value = serde_json::from_str(&next).expect("json");
+        assert_eq!(next["action"].as_str(), Some("wait_thread"));
+        assert_eq!(next["disposition"].as_str(), Some("io_wait"));
+        assert_eq!(
+            next["target_thread_id"].as_str(),
+            Some(spawned.thread_id.as_str())
         );
     }
 
     #[tokio::test]
-    async fn native_next_refuses_wait_without_status_subscription() {
+    async fn native_next_returns_wait_without_status_subscription() {
         let (session, mut turn) = make_session_and_context().await;
         let actor_session_id = session.thread_id().to_string();
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -916,13 +793,13 @@ mod tests {
             .expect("bind unavailable actor id");
         assert_eq!(runtime.next().disposition, NextDisposition::IoWait);
 
-        let result = call_result(session, turn, QunuxOperation::Next, json!({})).await;
-        let Err(err) = result else {
-            panic!("native next must reject a wait whose actor status cannot be subscribed");
-        };
-        assert!(
-            err.to_string().contains("cannot subscribe to Codex actor"),
-            "unexpected error: {err}"
+        let next = call(session, turn, QunuxOperation::Next, json!({})).await;
+        let next: serde_json::Value = serde_json::from_str(&next).expect("json");
+        assert_eq!(next["action"].as_str(), Some("wait_thread"));
+        assert_eq!(next["disposition"].as_str(), Some("io_wait"));
+        assert_eq!(
+            next["target_thread_id"].as_str(),
+            Some(spawned.thread_id.as_str())
         );
     }
 

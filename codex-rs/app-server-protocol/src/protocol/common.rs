@@ -1471,6 +1471,7 @@ server_notification_definitions! {
     FileChangeOutputDelta => "item/fileChange/outputDelta" (v2::FileChangeOutputDeltaNotification),
     FileChangePatchUpdated => "item/fileChange/patchUpdated" (v2::FileChangePatchUpdatedNotification),
     ServerRequestResolved => "serverRequest/resolved" (v2::ServerRequestResolvedNotification),
+    QunuxSnapshot => "qunux/snapshot" (v2::QunuxSnapshotNotification),
     McpToolCallProgress => "item/mcpToolCall/progress" (v2::McpToolCallProgressNotification),
     McpServerOauthLoginCompleted => "mcpServer/oauthLogin/completed" (v2::McpServerOauthLoginCompletedNotification),
     McpServerStatusUpdated => "mcpServer/startupStatus/updated" (v2::McpServerStatusUpdatedNotification),
@@ -1555,6 +1556,55 @@ mod tests {
     fn request_id() -> RequestId {
         const REQUEST_ID: i64 = 1;
         RequestId::Integer(REQUEST_ID)
+    }
+
+    #[test]
+    fn qunux_snapshot_notification_serializes_with_thread_target() -> Result<()> {
+        let notification = ServerNotification::QunuxSnapshot(v2::QunuxSnapshotNotification {
+            thread_id: "thread-1".to_string(),
+            process_id: "QP000".to_string(),
+            qunux_thread_id: "QT000".to_string(),
+            state_path: Some("/tmp/.qunux/processes/QP000/closure.json".to_string()),
+            snapshot: json!({
+                "process_id": "QP000",
+                "main_thread_id": "QT000",
+                "problems": {}
+            }),
+        });
+
+        let value = serde_json::to_value(&notification)?;
+
+        assert_eq!(
+            value,
+            json!({
+                "method": "qunux/snapshot",
+                "params": {
+                    "threadId": "thread-1",
+                    "processId": "QP000",
+                    "qunuxThreadId": "QT000",
+                    "statePath": "/tmp/.qunux/processes/QP000/closure.json",
+                    "snapshot": {
+                        "process_id": "QP000",
+                        "main_thread_id": "QT000",
+                        "problems": {}
+                    }
+                }
+            })
+        );
+
+        let decoded: ServerNotification = serde_json::from_value(value)?;
+        assert!(matches!(
+            decoded,
+            ServerNotification::QunuxSnapshot(v2::QunuxSnapshotNotification {
+                thread_id,
+                process_id,
+                qunux_thread_id,
+                ..
+            }) if thread_id == "thread-1"
+                && process_id == "QP000"
+                && qunux_thread_id == "QT000"
+        ));
+        Ok(())
     }
 
     #[test]

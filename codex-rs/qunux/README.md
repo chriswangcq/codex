@@ -6,10 +6,14 @@ Qunux does not replace LLM reasoning. The LLM remains the intelligent CPU. Qunux
 
 ## Runtime Model
 
+The unified Codex-native Agent OS model is specified in
+[`docs/agent-os-runtime-model.md`](docs/agent-os-runtime-model.md).
 The next native lifecycle and IO iteration is specified in
 [`docs/native-session-io-runtime-v1.md`](docs/native-session-io-runtime-v1.md).
 The `next` scheduler/syscall contract is specified in
 [`docs/next-runtime-contract.md`](docs/next-runtime-contract.md).
+The read-only runtime dashboard is documented in
+[`docs/dashboard.md`](docs/dashboard.md).
 
 The native runtime stores Qunux process state under the active workspace. A
 root Codex agent session is bound to one Qunux process. The process id is
@@ -59,9 +63,14 @@ Thread invariants:
 - Qunux does not schedule instead of the LLM. It gives the LLM CPU fork/run/join/resume/audit state.
 - A Qunux-backed agent loop has only three meaningful lifecycle modes:
   runnable work, logical IO wait, or destroyed. Child-thread waits are IO
-  waits, so native `qunux.next` may park the parent until the child actor
-  reaches a final status. Pure `QunuxRuntime::next()` still reports
-  `wait_thread` for dashboards, tests, and state inspection.
+  waits, so Codex parks the parent during dispatch preflight before prompt
+  context is assembled or sent to the model. Native `qunux.next` still reports
+  `wait_thread` for dashboards, tests, and state inspection; it does not own
+  the wait.
+- Logical waiting is owned by the Wait/Wake Kernel, which is the thread
+  readiness kernel: a thread blocks on a `WaitHandle`, leaves the run queue,
+  and only becomes runnable again when user input, child completion, tool
+  output, approval, timers, or external events resolve that handle.
 
 ## Codex Native Tool Integration
 
@@ -113,8 +122,51 @@ completion hook auto-joins that child thread: the handle and wait are consumed,
 actor exits before its Qunux root is done, Qunux records a failed child-thread
 state instead of pretending the child is still running.
 
-The native tool boundary is responsible for parking, not the model. When
-`qunux.next` sees a running child-thread wait, it can await the child Codex
-actor's status notification, reload the Qunux process, and return the next
-runnable action. This keeps the parent LLM from spending tokens polling a
-non-runnable wait state.
+The agent dispatch boundary is responsible for parking, not the model and not
+the `qunux.next` tool call. Before Codex assembles prompt context for a Qunux
+thread, dispatch preflight checks the Qunux frontier. If the thread is waiting
+on a running child, Codex awaits the child actor's status notification, reloads
+the Qunux process, and only then lets the parent continue to model dispatch.
+This keeps the parent LLM from spending tokens polling a non-runnable wait
+state while preserving `qunux.next` as a pure scheduler query.
+
+## Native TUI Cockpit
+
+The product UI for Qunux is the native Codex TUI cockpit. When `Feature::Qunux`
+is enabled, the TUI's old chat-first main surface is replaced by a Qunux Agent
+OS cockpit that renders runtime-pushed `qunux/snapshot` notifications for the
+current Codex thread. Those snapshots make processes, threads, tasks, waits,
+handles, events, and the current runnable frontier visible in the terminal
+without asking the model to poll state files.
+
+The composer and session machinery remain available so the user can still drive
+the agent, but the primary shell is no longer just a transcript. It is a runtime
+view of the LLM CPU's process/thread/task closure state.
+
+Persisted `.qunux/processes/*/closure.json` files remain the durable runtime
+record and the cockpit's fallback/debug source when no pushed snapshot has
+arrived yet. The live product path is app-server/runtime -> `qunux/snapshot` ->
+TUI cockpit: app-server emits an initial snapshot on turn start and refreshes it
+after item completion and turn completion.
+
+## Runtime Dashboard
+
+Qunux process state can also be rendered into a static, read-only dashboard:
+
+```bash
+node codex-rs/qunux/scripts/render-dashboard.mjs --workspace /path/to/workspace
+```
+
+By default the renderer reads `.qunux/processes/*/closure.json` under the
+workspace and writes `.qunux/dashboard.html`. Use `--process QP-...` to render a
+single process, or `--output path/to/dashboard.html` to choose a different
+output file.
+
+The dashboard is diagnostic only. It does not mutate Qunux state. It shows the
+process overview, problem and thread trees, selected entity details, scheduler
+frontier, handles, waits, events, checks, and diagnostics. The scheduler panel
+uses `runnable`, `io_wait`, and `terminal` to make the current thread frontier
+visible without spending model tokens on polling.
+
+This HTML dashboard is an offline debug artifact, not the primary Codex CLI UI.
+The primary Qunux UI is the native TUI cockpit.

@@ -69,6 +69,8 @@ coverage/
 
 # personal files
 personal/
+.complex-problems/
+codex-rs/.qunux/
 
 # os
 .DS_Store

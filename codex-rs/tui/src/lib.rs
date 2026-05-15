@@ -157,6 +157,7 @@ mod oss_selection;
 mod pager_overlay;
 mod permission_compat;
 pub(crate) mod public_widgets;
+mod qunux_cockpit;
 mod render;
 mod resize_reflow_cap;
 mod resume_picker;

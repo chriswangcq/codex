@@ -85,6 +85,7 @@ use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
+use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
@@ -175,6 +176,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             outgoing
                 .send_server_notification(ServerNotification::TurnStarted(notification))
                 .await;
+            emit_qunux_snapshot_if_available(&conversation_id, &conversation, &outgoing).await;
         }
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
@@ -185,13 +187,14 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
                 .await;
             handle_turn_complete(
-                conversation_id,
+                conversation_id.clone(),
                 event_turn_id,
                 turn_complete_event,
                 &outgoing,
                 &thread_state,
             )
             .await;
+            emit_qunux_snapshot_if_available(&conversation_id, &conversation, &outgoing).await;
         }
         EventMsg::McpStartupUpdate(update) => {
             let (status, error) = match update.status {
@@ -972,12 +975,16 @@ pub(crate) async fn apply_bespoke_event_handling(
         | EventMsg::ItemCompleted(_)
         | EventMsg::PatchApplyUpdated(_)
         | EventMsg::TerminalInteraction(_)) => {
+            let emit_qunux_snapshot = matches!(&msg, EventMsg::ItemCompleted(_));
             let notification = item_event_to_server_notification(
                 msg,
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
             outgoing.send_server_notification(notification).await;
+            if emit_qunux_snapshot {
+                emit_qunux_snapshot_if_available(&conversation_id, &conversation, &outgoing).await;
+            }
         }
         EventMsg::HookStarted(event) => {
             let notification = HookStartedNotification {
@@ -1289,6 +1296,24 @@ async fn emit_turn_completed_with_status(
     };
     outgoing
         .send_server_notification(ServerNotification::TurnCompleted(notification))
+        .await;
+}
+
+async fn emit_qunux_snapshot_if_available(
+    conversation_id: &ThreadId,
+    conversation: &Arc<CodexThread>,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+) {
+    let config = conversation.config().await;
+    let Some(notification) = crate::qunux_snapshot::snapshot_notification_for_workspace(
+        &conversation_id.to_string(),
+        config.cwd.as_path(),
+        config.features.enabled(Feature::Qunux),
+    ) else {
+        return;
+    };
+    outgoing
+        .send_server_notification(ServerNotification::QunuxSnapshot(notification))
         .await;
 }
 
@@ -2100,6 +2125,7 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+    use core_test_support::PathExt;
     use core_test_support::load_default_config_for_test;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -3252,6 +3278,200 @@ mod tests {
                 assert_eq!(n.turn.id, "turn-1");
                 assert_eq!(n.turn.items_view, TurnItemsView::NotLoaded);
                 assert!(n.turn.items.is_empty());
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "non-Qunux turn should not emit snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_started_emits_qunux_snapshot_when_available() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.cwd = workspace.path().abs();
+        config.features.enable(Feature::Qunux)?;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config.clone()).await?;
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(
+                "turn-1",
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    started_at: Some(42),
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                }),
+            );
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-1".to_string(),
+                msg: EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    started_at: Some(42),
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        let started = recv_broadcast_message(&mut rx).await?;
+        assert!(
+            matches!(
+                started,
+                OutgoingMessage::AppServerNotification(ServerNotification::TurnStarted(_))
+            ),
+            "first message should preserve existing turn-start notification"
+        );
+        let snapshot = recv_broadcast_message(&mut rx).await?;
+        match snapshot {
+            OutgoingMessage::AppServerNotification(ServerNotification::QunuxSnapshot(n)) => {
+                assert_eq!(n.thread_id, conversation_id.to_string());
+                assert_eq!(
+                    Some(n.qunux_thread_id.as_str()),
+                    n.snapshot["main_thread_id"].as_str()
+                );
+                assert_eq!(
+                    Some(n.process_id.as_str()),
+                    n.snapshot["process_id"].as_str()
+                );
+                assert!(
+                    n.state_path
+                        .as_deref()
+                        .expect("state path")
+                        .contains(".qunux/processes")
+                );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_complete_emits_qunux_snapshot_when_available() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.cwd = workspace.path().abs();
+        config.features.enable(Feature::Qunux)?;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config.clone()).await?;
+        let event_turn_id = "turn-1".to_string();
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(
+                &event_turn_id,
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: event_turn_id.clone(),
+                    started_at: Some(42),
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                }),
+            );
+            state.track_current_turn_event(
+                &event_turn_id,
+                &EventMsg::TurnComplete(turn_complete_event(&event_turn_id)),
+            );
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: event_turn_id.clone(),
+                msg: EventMsg::TurnComplete(turn_complete_event(&event_turn_id)),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        let completed = recv_broadcast_message(&mut rx).await?;
+        assert!(
+            matches!(
+                completed,
+                OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(_))
+            ),
+            "first message should preserve existing turn-complete notification"
+        );
+        let snapshot = recv_broadcast_message(&mut rx).await?;
+        match snapshot {
+            OutgoingMessage::AppServerNotification(ServerNotification::QunuxSnapshot(n)) => {
+                assert_eq!(n.thread_id, conversation_id.to_string());
+                assert_eq!(
+                    Some(n.qunux_thread_id.as_str()),
+                    n.snapshot["main_thread_id"].as_str()
+                );
+                assert_eq!(
+                    Some(n.process_id.as_str()),
+                    n.snapshot["process_id"].as_str()
+                );
             }
             other => bail!("unexpected message: {other:?}"),
         }

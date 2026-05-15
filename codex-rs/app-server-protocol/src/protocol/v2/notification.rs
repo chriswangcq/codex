@@ -3,6 +3,7 @@ use crate::RequestId;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -53,4 +54,20 @@ pub struct ErrorNotification {
 pub struct ServerRequestResolvedNotification {
     pub thread_id: String,
     pub request_id: RequestId,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct QunuxSnapshotNotification {
+    /// Codex thread that should receive and render this snapshot.
+    pub thread_id: String,
+    /// Stable Qunux process identity for the current Codex session.
+    pub process_id: String,
+    /// Qunux logical thread that produced or owns the snapshot.
+    pub qunux_thread_id: String,
+    /// Optional persisted snapshot path for debug/offline fallback.
+    pub state_path: Option<String>,
+    /// Runtime snapshot payload. Currently mirrors the persisted Qunux closure state.
+    pub snapshot: JsonValue,
 }
