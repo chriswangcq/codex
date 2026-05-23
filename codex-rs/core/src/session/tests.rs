@@ -36,6 +36,8 @@ use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -96,6 +98,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ConversationAudioParams;
@@ -787,9 +790,7 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
 
     let mut stream = tokio::net::TcpStream::connect(started_proxy.proxy().http_addr()).await?;
     stream
-        .write_all(
-            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(b"GET http://8.8.8.8/ HTTP/1.1\r\nHost: 8.8.8.8\r\nConnection: close\r\n\r\n")
         .await?;
     let mut buffer = [0_u8; 4096];
     let bytes_read = tokio::time::timeout(StdDuration::from_secs(2), stream.read(&mut buffer))
@@ -3956,6 +3957,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         mailbox,
         mailbox_rx: Mutex::new(mailbox_rx),
         idle_pending_input: Mutex::new(Vec::new()),
+        qunux_auto_dispatch_key: Mutex::new(None),
         goal_runtime: crate::goals::GoalRuntimeState::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -5680,6 +5682,7 @@ where
         mailbox,
         mailbox_rx: Mutex::new(mailbox_rx),
         idle_pending_input: Mutex::new(Vec::new()),
+        qunux_auto_dispatch_key: Mutex::new(None),
         goal_runtime: crate::goals::GoalRuntimeState::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -6298,6 +6301,57 @@ async fn configured_multi_agent_v2_usage_hint_texts_omit_effectively_disabled_fe
     let hint_texts = session.configured_multi_agent_v2_usage_hint_texts().await;
 
     assert_eq!(hint_texts, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn build_initial_context_adds_qunux_agent_os_instructions_when_feature_enabled() {
+    let (session, turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            let _ = config.features.enable(Feature::Qunux);
+        },
+    )
+    .await;
+
+    let initial_context = session.build_initial_context(turn_context.as_ref()).await;
+    let developer_texts = developer_input_texts(&initial_context);
+
+    assert!(
+        developer_texts.iter().any(|text| {
+            text.contains("<qunux_instructions>")
+                && text.contains("qunux.current")
+                && text.contains("qunux.next")
+                && text.contains("process-mission root")
+                && text.contains("Do not replace `P000` with the first user task")
+                && text.contains("does not pre-create the root ticket")
+                && text.contains("The LLM agent decides")
+                && text.contains("The root process mission is long-lived")
+                && text
+                    .contains("Do not close it merely because the process is initialized or idle")
+                && text.contains("call `qunux.wait` for user input")
+                && text.contains("native task-closure runtime")
+                && text.contains("mode=split")
+                && text.contains("mode=spawn")
+                && !text.contains("first actionable request")
+        }),
+        "expected Qunux Agent OS developer instructions, got {developer_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_omits_qunux_agent_os_instructions_when_feature_disabled() {
+    let (session, turn_context) = make_session_and_context().await;
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    let developer_texts = developer_input_texts(&initial_context);
+
+    assert!(
+        !developer_texts
+            .iter()
+            .any(|text| text.contains("<qunux_instructions>")),
+        "did not expect Qunux Agent OS developer instructions, got {developer_texts:?}"
+    );
 }
 
 #[tokio::test]
@@ -7362,6 +7416,91 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
             ..
         }) if turn_id == tc.sub_id
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qunux_user_input_dispatch_turn_emits_visible_fallback_when_silent() {
+    let (sess, _tc, rx) = make_session_and_context_with_rx().await;
+    let turn_context = sess
+        .new_default_turn_with_sub_id("qunux-user-input-test".to_string())
+        .await;
+    let input = vec![UserInput::Text {
+        text: "wake qunux".to_string(),
+        text_elements: Vec::new(),
+    }];
+    sess.spawn_task(
+        Arc::clone(&turn_context),
+        input,
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    sess.on_task_finished(Arc::clone(&turn_context), /*last_agent_message*/ None)
+        .await;
+    let fallback_message = "Qunux received this input, but the dispatch turn ended without a visible assistant reply. I am ready for your next message.";
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected fallback item started event")
+        .expect("channel open");
+    match first.msg {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::AgentMessage(AgentMessageItem { content, .. }),
+            ..
+        }) => assert!(matches!(
+            content.as_slice(),
+            [AgentMessageContent::Text { text }] if text == fallback_message
+        )),
+        other => panic!("unexpected first event: {other:?}"),
+    }
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected fallback item completed event")
+        .expect("channel open");
+    match second.msg {
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::AgentMessage(AgentMessageItem { content, .. }),
+            ..
+        }) => assert!(matches!(
+            content.as_slice(),
+            [AgentMessageContent::Text { text }] if text == fallback_message
+        )),
+        other => panic!("unexpected second event: {other:?}"),
+    }
+
+    let third = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected legacy agent message event")
+        .expect("channel open");
+    assert!(matches!(
+        third.msg,
+        EventMsg::AgentMessage(AgentMessageEvent {
+            message,
+            ..
+        }) if message == fallback_message
+    ));
+
+    let fourth = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event")
+        .expect("channel open");
+    match fourth.msg {
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id,
+            last_agent_message,
+            ..
+        }) => {
+            assert_eq!(turn_id, turn_context.sub_id);
+            assert_eq!(last_agent_message.as_deref(), Some(fallback_message));
+        }
+        other => panic!("unexpected third event: {other:?}"),
+    }
 }
 
 #[tokio::test]

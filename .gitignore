@@ -72,6 +72,7 @@ personal/
 .complex-problems/
 .qunux/
 codex-rs/.qunux/
+codex-rs/.qunux.bak.*/
 
 # os
 .DS_Store

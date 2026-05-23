@@ -8,9 +8,34 @@ use std::io;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 8;
 pub const DEFAULT_PROCESS_ID: &str = "QP000";
 pub const DEFAULT_THREAD_ID: &str = "QT000";
+pub const DEFAULT_ROOT_PROBLEM_TITLE: &str = "Serve the user well in this Qunux process";
+const LEGACY_DEFAULT_ROOT_PROBLEM_TITLE: &str = "Qunux root task";
+pub const DEFAULT_ROOT_PROBLEM_BODY: &str = r#"# Serve the user well in this Qunux process
+
+## Problem
+
+This Qunux process exists to help the user effectively, safely, and continuously for the lifetime of this Codex session. It is a headless-first Agent OS process: the TUI cockpit, chat transcript, shell, files, tools, timers, webhooks, and external systems are all world I/O surfaces around the same durable runtime state.
+
+At process birth, Qunux creates exactly this root problem as ordinary PTRC state. Qunux does not pre-create a ticket, pre-classify the problem, create child problems, record results or checks, or decide whether the process should wait. The LLM agent reads this problem, the current world event, and the runtime frontier, then decides the next legal PTRC move.
+
+This root problem is a lifecycle mission, not an initialization task. Do not close it just because the process is ready. When there is no concrete demand from the user or world, park the thread with `qunux.wait` for user input, timer, external signal, child completion, or another relevant wake event. Close this root only for an explicit shutdown/end-of-process request.
+
+## Success Criteria
+
+- Understand whether each world input is conversational, clarifying, actionable, background signal, or absent.
+- For actionable work, use the normal problem -> ticket -> result -> check closure loop.
+- For broad or risky work, split into child problems instead of pretending the root is one-go.
+- For pure small talk, narrow meta questions, acknowledgements, or "wait for my next message", answer visibly in the current thread and then wait; do not create a routing child problem or spawn a child thread merely to handle conversation plumbing.
+- For unclear input, ask a focused clarification or wait instead of inventing work.
+- For no current demand, wait for user input, timer, external signal, child completion, or another relevant wake event.
+- Readiness, initialization, or absence of current work are not success conditions for closing the root problem.
+- Keep visible user replies separate from Qunux state mutation: assistant messages are output; Qunux tools update runtime state.
+- Preserve useful preferences, context, and evidence when they help future work.
+- Avoid false completion: success requires evidence, criteria mapping, stress testing, and explicit residual-risk review.
+"#;
 
 #[derive(Debug, Error)]
 pub enum QunuxError {
@@ -150,6 +175,13 @@ pub enum TicketClassification {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TicketChildMode {
+    Split,
+    Spawn,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Success,
     NotSuccess,
@@ -165,6 +197,8 @@ pub enum NextAction {
     SplitTicket,
     SpawnThread,
     WaitThread,
+    WaitIo,
+    HandleInbox,
     JoinThread,
     RecoverThread,
     RecordResult,
@@ -183,7 +217,7 @@ pub enum NextDisposition {
 impl NextDisposition {
     fn for_action(action: NextAction) -> Self {
         match action {
-            NextAction::WaitThread => Self::IoWait,
+            NextAction::WaitThread | NextAction::WaitIo => Self::IoWait,
             NextAction::None => Self::Terminal,
             NextAction::CreateSolutionTicket
             | NextAction::DefineTicket
@@ -191,6 +225,7 @@ impl NextDisposition {
             | NextAction::ExecuteTicket
             | NextAction::SplitTicket
             | NextAction::SpawnThread
+            | NextAction::HandleInbox
             | NextAction::JoinThread
             | NextAction::RecoverThread
             | NextAction::RecordResult
@@ -208,12 +243,16 @@ pub enum ThreadStatus {
     Done,
     Failed,
     Cancelled,
+    Recovered,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IoHandleKind {
     ChildThread,
+    UserInput,
+    Timer,
+    ExternalSignal,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,7 +289,159 @@ pub enum IoEventKind {
     ActorCompletedWithoutThreadDone,
     ChildThreadFailed,
     ChildThreadSpawnFailed,
+    ChildThreadRecovered,
     HandleReady,
+    PassiveEventReceived,
+    PassiveWaitCreated,
+    PassiveEventMatched,
+    PassiveEventInboxed,
+    PassiveEventHandled,
+    PassiveHandleReady,
+    PassiveHandleConsumed,
+    PassiveHandleCancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PassiveEventKind {
+    UserInput,
+    Timer,
+    ExternalSignal,
+}
+
+impl PassiveEventKind {
+    fn handle_kind(self) -> IoHandleKind {
+        match self {
+            Self::UserInput => IoHandleKind::UserInput,
+            Self::Timer => IoHandleKind::Timer,
+            Self::ExternalSignal => IoHandleKind::ExternalSignal,
+        }
+    }
+
+    fn event_key_kind(self) -> &'static str {
+        match self {
+            Self::UserInput => "user.input",
+            Self::Timer => "timer",
+            Self::ExternalSignal => "external.signal",
+        }
+    }
+
+    fn from_event_key_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "user.input" => Some(Self::UserInput),
+            "timer" => Some(Self::Timer),
+            "external.signal" => Some(Self::ExternalSignal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitSpecKind {
+    UserInput,
+    Timer,
+    ExternalSignal,
+    EventKey,
+}
+
+impl WaitSpecKind {
+    fn passive_kind(self) -> Option<PassiveEventKind> {
+        match self {
+            Self::UserInput => Some(PassiveEventKind::UserInput),
+            Self::Timer => Some(PassiveEventKind::Timer),
+            Self::ExternalSignal => Some(PassiveEventKind::ExternalSignal),
+            Self::EventKey => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EventKey {
+    pub kind: String,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub target_thread_id: Option<String>,
+}
+
+impl EventKey {
+    pub fn new(
+        kind: impl Into<String>,
+        resource: Option<String>,
+        source: Option<String>,
+        target_thread_id: Option<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            resource,
+            source,
+            target_thread_id,
+        }
+    }
+
+    pub fn passive(
+        kind: PassiveEventKind,
+        resource: Option<String>,
+        source: Option<String>,
+        target_thread_id: Option<String>,
+    ) -> Self {
+        Self::new(kind.event_key_kind(), resource, source, target_thread_id)
+    }
+
+    fn passive_kind(&self) -> PassiveEventKind {
+        PassiveEventKind::from_event_key_kind(&self.kind)
+            .unwrap_or(PassiveEventKind::ExternalSignal)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PassiveEventStatus {
+    Inboxed,
+    Matched,
+    Handled,
+    Duplicate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PassiveEvent {
+    pub id: String,
+    pub kind: PassiveEventKind,
+    #[serde(default)]
+    pub event_key: Option<EventKey>,
+    pub status: PassiveEventStatus,
+    pub target_thread_id: Option<String>,
+    pub condition: Option<String>,
+    pub source: Option<String>,
+    pub summary: String,
+    pub payload_ref: Option<String>,
+    pub dedupe_key: Option<String>,
+    pub matched_handle_ids: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboxItem {
+    pub id: String,
+    pub passive_event_id: String,
+    #[serde(default)]
+    pub event_key: Option<EventKey>,
+    pub target_thread_id: Option<String>,
+    #[serde(default)]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    pub summary: String,
+    #[serde(default)]
+    pub payload_ref: Option<String>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    pub status: PassiveEventStatus,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +450,18 @@ pub struct IoHandle {
     pub kind: IoHandleKind,
     pub owner_thread_id: String,
     pub target_thread_id: Option<String>,
+    #[serde(default)]
+    pub event_key: Option<EventKey>,
+    #[serde(default)]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub payload_ref: Option<String>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default)]
+    pub resolved_event_id: Option<String>,
     pub status: IoHandleStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -327,6 +530,22 @@ pub struct Thread {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadActorRoute {
+    pub thread_id: String,
+    pub is_current_thread: bool,
+    pub actor_session_id: Option<String>,
+    pub codex_thread_id: Option<String>,
+}
+
+impl ThreadActorRoute {
+    pub fn bound_actor_id(&self) -> Option<&str> {
+        self.codex_thread_id
+            .as_deref()
+            .or(self.actor_session_id.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Problem {
     pub id: String,
     pub title: String,
@@ -335,7 +554,15 @@ pub struct Problem {
     pub owner_thread_id: String,
     pub parent_id: Option<String>,
     pub created_from_ticket_id: Option<String>,
+    #[serde(default)]
+    pub created_from_ticket_mode: Option<TicketChildMode>,
     pub created_from_check_id: Option<String>,
+    #[serde(default)]
+    pub created_from_passive_event_id: Option<String>,
+    #[serde(default)]
+    pub created_from_inbox_item_id: Option<String>,
+    #[serde(default)]
+    pub created_from_user_task_kind: Option<PassiveEventKind>,
     pub ticket_id: Option<String>,
     pub child_problem_ids: Vec<String>,
     pub followup_problem_ids: Vec<String>,
@@ -382,6 +609,25 @@ pub struct Check {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserTaskProblem {
+    pub problem_id: String,
+    pub parent_problem_id: String,
+    pub inbox_item_id: String,
+    pub passive_event_id: String,
+    pub source_kind: PassiveEventKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScaffoldedTask {
+    pub problem_id: String,
+    pub parent_problem_id: String,
+    pub ticket_id: String,
+    pub inbox_item_id: Option<String>,
+    pub passive_event_id: Option<String>,
+    pub source_kind: Option<PassiveEventKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
     pub kind: String,
     pub entity_id: String,
@@ -411,6 +657,10 @@ pub struct ClosureState {
     pub next_handle_seq: u32,
     pub next_wait_seq: u32,
     pub next_io_event_seq: u32,
+    #[serde(default)]
+    pub next_passive_event_seq: u32,
+    #[serde(default)]
+    pub next_inbox_item_seq: u32,
     pub next_problem_seq: u32,
     pub next_ticket_seq: u32,
     pub next_result_seq: u32,
@@ -422,6 +672,10 @@ pub struct ClosureState {
     pub tickets: BTreeMap<String, Ticket>,
     pub results: BTreeMap<String, ExecutionResult>,
     pub checks: BTreeMap<String, Check>,
+    #[serde(default)]
+    pub passive_events: Vec<PassiveEvent>,
+    #[serde(default)]
+    pub inbox: Vec<InboxItem>,
     pub io_events: Vec<IoEvent>,
     pub events: Vec<Event>,
 }
@@ -483,7 +737,11 @@ impl ClosureState {
                 owner_thread_id: main_thread_id.clone(),
                 parent_id: None,
                 created_from_ticket_id: None,
+                created_from_ticket_mode: None,
                 created_from_check_id: None,
+                created_from_passive_event_id: None,
+                created_from_inbox_item_id: None,
+                created_from_user_task_kind: None,
                 ticket_id: None,
                 child_problem_ids: Vec::new(),
                 followup_problem_ids: Vec::new(),
@@ -503,6 +761,8 @@ impl ClosureState {
             next_handle_seq: 0,
             next_wait_seq: 0,
             next_io_event_seq: 0,
+            next_passive_event_seq: 0,
+            next_inbox_item_seq: 0,
             next_problem_seq: 1,
             next_ticket_seq: 0,
             next_result_seq: 0,
@@ -514,6 +774,8 @@ impl ClosureState {
             tickets: BTreeMap::new(),
             results: BTreeMap::new(),
             checks: BTreeMap::new(),
+            passive_events: Vec::new(),
+            inbox: Vec::new(),
             io_events: Vec::new(),
             events: vec![Event {
                 kind: "process_created".to_string(),
@@ -566,6 +828,9 @@ pub struct RuntimeStatus {
     pub failed_threads: usize,
     pub failed_handles: usize,
     pub waiting_threads: usize,
+    pub passive_events: usize,
+    pub inbox_items: usize,
+    pub pending_inbox_items: usize,
     pub valid: bool,
 }
 
@@ -594,6 +859,220 @@ pub struct JoinedThread {
     pub wait_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveredThread {
+    pub thread_id: String,
+    pub root_problem_id: String,
+    pub parent_thread_id: String,
+    pub handle_id: String,
+    pub wait_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PassiveEventInput {
+    pub kind: PassiveEventKind,
+    #[serde(default)]
+    pub event_key: Option<EventKey>,
+    pub target_thread_id: Option<String>,
+    pub condition: Option<String>,
+    pub source: Option<String>,
+    pub summary: String,
+    pub payload_ref: Option<String>,
+    pub dedupe_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutedPassiveEvent {
+    pub kind: PassiveEventKind,
+    pub event_key: EventKey,
+    pub target_thread_id: Option<String>,
+    pub input: PassiveEventInput,
+}
+
+pub struct EventRoutingAgent;
+
+impl EventRoutingAgent {
+    pub fn route_passive_event(input: PassiveEventInput) -> Result<RoutedPassiveEvent> {
+        let event_key = input.event_key.clone().unwrap_or_else(|| {
+            EventKey::passive(
+                input.kind,
+                input.condition.clone(),
+                input.source.clone(),
+                input.target_thread_id.clone(),
+            )
+        });
+        if let Some(input_target_thread_id) = input.target_thread_id.as_deref()
+            && event_key.target_thread_id.as_deref() != Some(input_target_thread_id)
+        {
+            return Err(QunuxError::InvalidState(format!(
+                "passive event target thread {input_target_thread_id} does not match event key target {:?}",
+                event_key.target_thread_id
+            )));
+        }
+        Ok(RoutedPassiveEvent {
+            kind: event_key.passive_kind(),
+            target_thread_id: event_key.target_thread_id.clone(),
+            event_key,
+            input,
+        })
+    }
+}
+
+pub struct WaitWakeKernel;
+
+impl WaitWakeKernel {
+    fn matching_passive_handle_ids(
+        state: &ClosureState,
+        routed: &RoutedPassiveEvent,
+    ) -> Vec<String> {
+        let handle_kind = routed.kind.handle_kind();
+        state
+            .handles
+            .values()
+            .filter(|handle| {
+                handle.kind == handle_kind
+                    && handle.status == IoHandleStatus::Pending
+                    && passive_input_matches_handle(&routed.input, &routed.event_key, handle)
+            })
+            .map(|handle| handle.id.clone())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnableThread {
+    pub thread_id: String,
+    pub root_problem_id: String,
+    pub wake_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WakeDecision {
+    pub event_id: String,
+    pub event_key: EventKey,
+    pub status: PassiveEventStatus,
+    pub matched_handle_ids: Vec<String>,
+    pub runnable_threads: Vec<RunnableThread>,
+    pub inbox_item_id: Option<String>,
+    pub duplicate_of_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PassiveEventReceipt {
+    pub event_id: String,
+    pub status: PassiveEventStatus,
+    pub matched_handle_ids: Vec<String>,
+    pub inbox_item_id: Option<String>,
+    pub duplicate_of_event_id: Option<String>,
+    pub wake_decision: WakeDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PassiveWait {
+    pub thread_id: String,
+    pub handle_id: String,
+    pub wait_id: String,
+    pub kind: PassiveEventKind,
+    pub event_key: EventKey,
+    pub status: WaitStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WaitSpec {
+    pub kind: WaitSpecKind,
+    #[serde(default)]
+    pub event_key: Option<EventKey>,
+    #[serde(default)]
+    pub target_thread_id: Option<String>,
+    #[serde(default)]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParkedWait {
+    pub thread_id: String,
+    pub wait_id: String,
+    pub handle_ids: Vec<String>,
+    pub mode: WaitMode,
+    pub status: WaitStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitHandleSnapshot {
+    pub handle: IoHandle,
+    pub wait: Option<ThreadWait>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsumedWait {
+    pub thread_id: String,
+    pub handle_id: String,
+    pub wait_id: String,
+    pub kind: IoHandleKind,
+    pub target_thread_id: Option<String>,
+    pub resolved_event_id: Option<String>,
+    pub payload_ref: Option<String>,
+    pub joined_thread: Option<JoinedThread>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelledWait {
+    pub thread_id: String,
+    pub handle_id: String,
+    pub wait_id: String,
+    pub kind: IoHandleKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum WaitCommand {
+    Park {
+        mode: WaitMode,
+        reason: String,
+        specs: Vec<WaitSpec>,
+    },
+    Status {
+        handle_id: String,
+    },
+    Consume {
+        handle_id: String,
+    },
+    Cancel {
+        handle_id: String,
+        reason: String,
+    },
+    Wake {
+        event: PassiveEventInput,
+    },
+}
+
+impl WaitCommand {
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Self::Park { .. } => "park",
+            Self::Status { .. } => "status",
+            Self::Consume { .. } => "consume",
+            Self::Cancel { .. } => "cancel",
+            Self::Wake { .. } => "wake",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum WaitResult {
+    Parked { wait: ParkedWait },
+    Status { snapshot: WaitHandleSnapshot },
+    Consumed { consumed: ConsumedWait },
+    Cancelled { cancelled: CancelledWait },
+    Woke { receipt: PassiveEventReceipt },
+}
+
 pub struct QunuxRuntime {
     context: RuntimeContext,
     state: ClosureState,
@@ -615,17 +1094,21 @@ impl QunuxRuntime {
         title: impl Into<String>,
         body: impl Into<String>,
     ) -> Result<Self> {
+        let title = title.into();
+        let body = body.into();
         let path = context.state_path();
         if path.exists() {
-            return Self::load(context);
+            let mut runtime = Self::load(context)?;
+            runtime.upgrade_legacy_pristine_root_problem(&title, &body)?;
+            return Ok(runtime);
         }
 
         let state = ClosureState::new_root(
             context.process_id.clone(),
             context.thread_id.clone(),
             context.actor_session_id.clone(),
-            title.into(),
-            body.into(),
+            title,
+            body,
         );
         let runtime = Self { context, state }.with_resolved_thread();
         runtime.save()?;
@@ -638,11 +1121,14 @@ impl QunuxRuntime {
             path: path.clone(),
             source,
         })?;
-        let state: ClosureState =
+        let mut state: ClosureState =
             serde_json::from_str(&raw).map_err(|source| QunuxError::Json {
                 path: path.clone(),
                 source,
             })?;
+        if state.schema_version < SCHEMA_VERSION {
+            state.schema_version = SCHEMA_VERSION;
+        }
         Ok(Self { context, state }.with_resolved_thread())
     }
 
@@ -712,6 +1198,798 @@ impl QunuxRuntime {
         }
     }
 
+    pub fn target_thread_id_for_passive_event_kind(&self, kind: PassiveEventKind) -> String {
+        let current_thread_id = self.context.thread_id.clone();
+        self.find_pending_passive_handle_thread(
+            &current_thread_id,
+            kind.handle_kind(),
+            &mut Vec::new(),
+        )
+        .unwrap_or(current_thread_id)
+    }
+
+    pub fn thread_actor_route(&self, thread_id: impl AsRef<str>) -> Result<ThreadActorRoute> {
+        let thread_id = thread_id.as_ref();
+        let thread = self.require_thread(thread_id)?;
+        Ok(ThreadActorRoute {
+            thread_id: thread_id.to_string(),
+            is_current_thread: thread_id == self.context.thread_id,
+            actor_session_id: thread.actor_session_id.clone(),
+            codex_thread_id: thread.codex_thread_id.clone(),
+        })
+    }
+
+    pub fn wait(&mut self, command: WaitCommand) -> Result<WaitResult> {
+        match command {
+            WaitCommand::Park {
+                mode,
+                reason,
+                specs,
+            } => Ok(WaitResult::Parked {
+                wait: self.park_wait(mode, reason, specs)?,
+            }),
+            WaitCommand::Status { handle_id } => Ok(WaitResult::Status {
+                snapshot: self.wait_status(handle_id)?,
+            }),
+            WaitCommand::Consume { handle_id } => Ok(WaitResult::Consumed {
+                consumed: self.consume_wait_handle(handle_id)?,
+            }),
+            WaitCommand::Cancel { handle_id, reason } => Ok(WaitResult::Cancelled {
+                cancelled: self.cancel_wait_handle(handle_id, reason)?,
+            }),
+            WaitCommand::Wake { event } => Ok(WaitResult::Woke {
+                receipt: self.receive_passive_event(event)?,
+            }),
+        }
+    }
+
+    pub fn wait_for_user_input(
+        &mut self,
+        condition: Option<String>,
+        source: Option<String>,
+        dedupe_key: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<PassiveWait> {
+        let spec = WaitSpec {
+            kind: WaitSpecKind::UserInput,
+            event_key: None,
+            target_thread_id: None,
+            condition,
+            source,
+            dedupe_key,
+        };
+        self.park_single_passive_wait(reason, spec)
+    }
+
+    pub fn wait_for_timer(
+        &mut self,
+        condition: Option<String>,
+        source: Option<String>,
+        dedupe_key: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<PassiveWait> {
+        let spec = WaitSpec {
+            kind: WaitSpecKind::Timer,
+            event_key: None,
+            target_thread_id: None,
+            condition,
+            source,
+            dedupe_key,
+        };
+        self.park_single_passive_wait(reason, spec)
+    }
+
+    pub fn wait_for_external_signal(
+        &mut self,
+        condition: Option<String>,
+        source: Option<String>,
+        dedupe_key: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<PassiveWait> {
+        let spec = WaitSpec {
+            kind: WaitSpecKind::ExternalSignal,
+            event_key: None,
+            target_thread_id: None,
+            condition,
+            source,
+            dedupe_key,
+        };
+        self.park_single_passive_wait(reason, spec)
+    }
+
+    pub fn create_passive_wait(
+        &mut self,
+        kind: PassiveEventKind,
+        condition: Option<String>,
+        source: Option<String>,
+        dedupe_key: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<PassiveWait> {
+        let spec = WaitSpec {
+            kind: match kind {
+                PassiveEventKind::UserInput => WaitSpecKind::UserInput,
+                PassiveEventKind::Timer => WaitSpecKind::Timer,
+                PassiveEventKind::ExternalSignal => WaitSpecKind::ExternalSignal,
+            },
+            event_key: None,
+            target_thread_id: None,
+            condition,
+            source,
+            dedupe_key,
+        };
+        self.park_single_passive_wait(reason, spec)
+    }
+
+    pub fn wait_for_event_key(
+        &mut self,
+        event_key: EventKey,
+        dedupe_key: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<PassiveWait> {
+        self.create_passive_wait_for_key(event_key, dedupe_key, reason)
+    }
+
+    fn create_passive_wait_for_key(
+        &mut self,
+        event_key: EventKey,
+        dedupe_key: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<PassiveWait> {
+        let spec = WaitSpec {
+            kind: WaitSpecKind::EventKey,
+            event_key: Some(event_key),
+            target_thread_id: None,
+            condition: None,
+            source: None,
+            dedupe_key,
+        };
+        self.park_single_passive_wait(reason, spec)
+    }
+
+    fn park_single_passive_wait(
+        &mut self,
+        reason: impl Into<String>,
+        spec: WaitSpec,
+    ) -> Result<PassiveWait> {
+        let parked = self.park_wait(WaitMode::All, reason.into(), vec![spec])?;
+        let handle_id = parked.handle_ids.first().cloned().ok_or_else(|| {
+            QunuxError::InvalidState("passive wait did not create a handle".to_string())
+        })?;
+        let handle = self.require_handle(&handle_id)?;
+        let event_key = handle.event_key.clone().ok_or_else(|| {
+            QunuxError::InvalidState(format!("handle {handle_id} has no event key"))
+        })?;
+        Ok(PassiveWait {
+            thread_id: parked.thread_id,
+            handle_id,
+            wait_id: parked.wait_id,
+            kind: event_key.passive_kind(),
+            event_key,
+            status: parked.status,
+        })
+    }
+
+    fn park_wait(
+        &mut self,
+        mode: WaitMode,
+        reason: String,
+        specs: Vec<WaitSpec>,
+    ) -> Result<ParkedWait> {
+        if specs.is_empty() {
+            return Err(QunuxError::InvalidState(
+                "wait park requires at least one spec".to_string(),
+            ));
+        }
+        let thread_id = self.context.thread_id.clone();
+        let thread_status = self.current_thread()?.status;
+        if matches!(
+            thread_status,
+            ThreadStatus::Done
+                | ThreadStatus::Failed
+                | ThreadStatus::Cancelled
+                | ThreadStatus::Recovered
+        ) {
+            return Err(QunuxError::InvalidState(format!(
+                "thread {thread_id} cannot create wait from terminal status {thread_status:?}"
+            )));
+        }
+        if let Some(frontier) = self.blocking_frontier_for_wait() {
+            return Err(QunuxError::InvalidState(format!(
+                "thread {thread_id} cannot wait while runnable action {:?} exists for problem {:?} ticket {:?}",
+                frontier.action, frontier.problem_id, frontier.ticket_id
+            )));
+        }
+
+        let wait_id = self.next_wait_id();
+        let now = Utc::now();
+        let mut handle_ids = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let dedupe_key = spec.dedupe_key.clone();
+            let (kind, event_key) = self.event_key_for_wait_spec(&thread_id, &spec)?;
+            let handle_id = self.next_handle_id();
+            let handle = IoHandle {
+                id: handle_id.clone(),
+                kind: kind.handle_kind(),
+                owner_thread_id: thread_id.clone(),
+                target_thread_id: None,
+                event_key: Some(event_key.clone()),
+                condition: event_key.resource.clone(),
+                source: event_key.source.clone(),
+                payload_ref: None,
+                dedupe_key,
+                resolved_event_id: None,
+                status: IoHandleStatus::Pending,
+                created_at: now,
+                updated_at: now,
+            };
+            self.state.handles.insert(handle_id.clone(), handle);
+            handle_ids.push(handle_id);
+        }
+
+        let wait = ThreadWait {
+            id: wait_id.clone(),
+            thread_id: thread_id.clone(),
+            handle_ids: handle_ids.clone(),
+            mode,
+            status: WaitStatus::Waiting,
+            created_at: now,
+            updated_at: now,
+        };
+        self.state.waits.insert(wait_id.clone(), wait);
+        {
+            let thread = self.thread_mut(&thread_id)?;
+            thread.status = ThreadStatus::WaitingIo;
+            thread.updated_at = now;
+        }
+        for handle_id in &handle_ids {
+            self.io_event(
+                IoEventKind::PassiveWaitCreated,
+                Some(handle_id),
+                Some(&thread_id),
+                format!("passive wait created: {reason}"),
+            );
+            self.match_inboxed_event_for_handle(handle_id)?;
+        }
+        let wait_status = self
+            .state
+            .waits
+            .get(&wait_id)
+            .map(|wait| wait.status)
+            .unwrap_or(WaitStatus::Waiting);
+        self.save()?;
+        Ok(ParkedWait {
+            thread_id,
+            wait_id,
+            handle_ids,
+            mode,
+            status: wait_status,
+        })
+    }
+
+    fn event_key_for_wait_spec(
+        &self,
+        current_thread_id: &str,
+        spec: &WaitSpec,
+    ) -> Result<(PassiveEventKind, EventKey)> {
+        let event_key = match spec.kind {
+            WaitSpecKind::EventKey => spec.event_key.clone().ok_or_else(|| {
+                QunuxError::InvalidState("event_key wait spec requires event_key".to_string())
+            })?,
+            kind => {
+                if spec.event_key.is_some() {
+                    return Err(QunuxError::InvalidState(
+                        "non-event_key wait specs must not provide event_key".to_string(),
+                    ));
+                }
+                let passive_kind = kind.passive_kind().expect("passive wait spec kind");
+                EventKey::passive(
+                    passive_kind,
+                    spec.condition.clone(),
+                    spec.source.clone(),
+                    Some(
+                        spec.target_thread_id
+                            .clone()
+                            .unwrap_or_else(|| current_thread_id.to_string()),
+                    ),
+                )
+            }
+        };
+        if let Some(target_thread_id) = event_key.target_thread_id.as_deref() {
+            self.require_thread(target_thread_id)?;
+            if target_thread_id != current_thread_id {
+                return Err(QunuxError::InvalidState(format!(
+                    "thread {current_thread_id} cannot park a wait targeted at thread {target_thread_id}"
+                )));
+            }
+        }
+        Ok((event_key.passive_kind(), event_key))
+    }
+
+    fn wait_status(&self, handle_id: impl AsRef<str>) -> Result<WaitHandleSnapshot> {
+        let handle_id = handle_id.as_ref();
+        let handle = self.require_handle(handle_id)?.clone();
+        self.require_handle_owned_by_current_thread(&handle)?;
+        let wait = self
+            .wait_id_for_handle(handle_id)
+            .and_then(|wait_id| self.state.waits.get(&wait_id).cloned());
+        Ok(WaitHandleSnapshot { handle, wait })
+    }
+
+    fn consume_wait_handle(&mut self, handle_id: impl AsRef<str>) -> Result<ConsumedWait> {
+        let handle_id = handle_id.as_ref();
+        let handle = self.require_handle(handle_id)?.clone();
+        self.require_handle_owned_by_current_thread(&handle)?;
+        if handle.kind == IoHandleKind::ChildThread {
+            let target_thread_id = handle.target_thread_id.clone().ok_or_else(|| {
+                QunuxError::InvalidState(format!("child-thread handle {handle_id} has no target"))
+            })?;
+            let joined = self.join_child_thread_in_state(
+                &target_thread_id,
+                &self.context.thread_id.clone(),
+                format!("consumed child-thread wait handle {handle_id}"),
+            )?;
+            self.save()?;
+            return Ok(ConsumedWait {
+                thread_id: self.context.thread_id.clone(),
+                handle_id: joined.handle_id.clone(),
+                wait_id: joined.wait_id.clone(),
+                kind: IoHandleKind::ChildThread,
+                target_thread_id: Some(target_thread_id),
+                resolved_event_id: None,
+                payload_ref: None,
+                joined_thread: Some(joined),
+            });
+        }
+        if handle.status != IoHandleStatus::Ready {
+            return Err(QunuxError::InvalidState(format!(
+                "cannot consume handle {handle_id} while status is {:?}",
+                handle.status
+            )));
+        }
+        let wait_id = self
+            .wait_id_for_handle(handle_id)
+            .ok_or_else(|| QunuxError::InvalidState(format!("handle {handle_id} has no wait")))?;
+        let now = Utc::now();
+        {
+            let handle = self.handle_mut(handle_id)?;
+            handle.status = IoHandleStatus::Consumed;
+            handle.updated_at = now;
+        }
+        let wait = self.wait_mut(&wait_id)?.clone();
+        if wait.mode == WaitMode::Any {
+            for sibling_handle_id in wait.handle_ids.iter().filter(|id| id.as_str() != handle_id) {
+                if let Some(sibling) = self.state.handles.get_mut(sibling_handle_id)
+                    && matches!(
+                        sibling.status,
+                        IoHandleStatus::Pending | IoHandleStatus::Ready
+                    )
+                {
+                    sibling.status = IoHandleStatus::Cancelled;
+                    sibling.updated_at = now;
+                }
+            }
+            let wait = self.wait_mut(&wait_id)?;
+            wait.status = WaitStatus::Consumed;
+            wait.updated_at = now;
+        } else {
+            self.refresh_wait_statuses_for_handle(handle_id);
+            self.mark_wait_consumed_if_all_handles_consumed(&wait_id)?;
+        }
+        if let Some(thread) = self.state.threads.get_mut(&self.context.thread_id) {
+            thread.status = ThreadStatus::Running;
+            thread.updated_at = now;
+        }
+        self.io_event(
+            IoEventKind::PassiveHandleConsumed,
+            Some(handle_id),
+            Some(&self.context.thread_id.clone()),
+            format!("passive wait handle {handle_id} consumed"),
+        );
+        self.save()?;
+        Ok(ConsumedWait {
+            thread_id: self.context.thread_id.clone(),
+            handle_id: handle_id.to_string(),
+            wait_id,
+            kind: handle.kind,
+            target_thread_id: handle.target_thread_id,
+            resolved_event_id: handle.resolved_event_id,
+            payload_ref: handle.payload_ref,
+            joined_thread: None,
+        })
+    }
+
+    fn cancel_wait_handle(
+        &mut self,
+        handle_id: impl AsRef<str>,
+        reason: impl Into<String>,
+    ) -> Result<CancelledWait> {
+        let handle_id = handle_id.as_ref();
+        let handle = self.require_handle(handle_id)?.clone();
+        self.require_handle_owned_by_current_thread(&handle)?;
+        if handle.kind == IoHandleKind::ChildThread {
+            return Err(QunuxError::InvalidState(format!(
+                "cannot cancel child-thread handle {handle_id}; close or fail the child thread instead"
+            )));
+        }
+        if matches!(
+            handle.status,
+            IoHandleStatus::Consumed | IoHandleStatus::Failed | IoHandleStatus::Cancelled
+        ) {
+            return Err(QunuxError::InvalidState(format!(
+                "cannot cancel handle {handle_id} while status is {:?}",
+                handle.status
+            )));
+        }
+        let wait_id = self
+            .wait_id_for_handle(handle_id)
+            .ok_or_else(|| QunuxError::InvalidState(format!("handle {handle_id} has no wait")))?;
+        let now = Utc::now();
+        {
+            let handle = self.handle_mut(handle_id)?;
+            handle.status = IoHandleStatus::Cancelled;
+            handle.updated_at = now;
+        }
+        self.refresh_wait_statuses_for_handle(handle_id);
+        self.mark_ready_wait_threads_running(handle_id);
+        self.io_event(
+            IoEventKind::PassiveHandleCancelled,
+            Some(handle_id),
+            Some(&self.context.thread_id.clone()),
+            format!(
+                "passive wait handle {handle_id} cancelled: {}",
+                reason.into()
+            ),
+        );
+        self.save()?;
+        Ok(CancelledWait {
+            thread_id: self.context.thread_id.clone(),
+            handle_id: handle_id.to_string(),
+            wait_id,
+            kind: handle.kind,
+        })
+    }
+
+    pub fn receive_passive_event(
+        &mut self,
+        input: PassiveEventInput,
+    ) -> Result<PassiveEventReceipt> {
+        let routed = EventRoutingAgent::route_passive_event(input)?;
+        let event_key = routed.event_key.clone();
+        let target_thread_id = routed.target_thread_id.clone();
+        if let Some(thread_id) = target_thread_id.as_deref() {
+            self.require_thread(thread_id)?;
+        }
+        let kind = routed.kind;
+        if let Some(dedupe_key) = routed.input.dedupe_key.as_deref()
+            && let Some(existing) = self
+                .state
+                .passive_events
+                .iter()
+                .find(|event| event.dedupe_key.as_deref() == Some(dedupe_key))
+        {
+            let event_key = event_key_from_passive_event(existing);
+            let inbox_item_id = self
+                .state
+                .inbox
+                .iter()
+                .find(|item| item.passive_event_id == existing.id)
+                .map(|item| item.id.clone());
+            let wake_decision = WakeDecision {
+                event_id: existing.id.clone(),
+                event_key,
+                status: PassiveEventStatus::Duplicate,
+                matched_handle_ids: existing.matched_handle_ids.clone(),
+                runnable_threads: Vec::new(),
+                inbox_item_id: inbox_item_id.clone(),
+                duplicate_of_event_id: Some(existing.id.clone()),
+            };
+            return Ok(PassiveEventReceipt {
+                event_id: existing.id.clone(),
+                status: PassiveEventStatus::Duplicate,
+                matched_handle_ids: existing.matched_handle_ids.clone(),
+                inbox_item_id,
+                duplicate_of_event_id: Some(existing.id.clone()),
+                wake_decision,
+            });
+        }
+
+        let event_id = self.next_passive_event_id();
+        let now = Utc::now();
+        let matched_handle_ids = WaitWakeKernel::matching_passive_handle_ids(&self.state, &routed);
+        let status = if matched_handle_ids.is_empty() {
+            PassiveEventStatus::Inboxed
+        } else {
+            PassiveEventStatus::Matched
+        };
+
+        self.state.passive_events.push(PassiveEvent {
+            id: event_id.clone(),
+            kind,
+            event_key: Some(event_key.clone()),
+            status,
+            target_thread_id: target_thread_id.clone(),
+            condition: routed.input.condition.clone(),
+            source: routed.input.source.clone(),
+            summary: routed.input.summary.clone(),
+            payload_ref: routed.input.payload_ref.clone(),
+            dedupe_key: routed.input.dedupe_key.clone(),
+            matched_handle_ids: matched_handle_ids.clone(),
+            created_at: now,
+        });
+        self.io_event(
+            IoEventKind::PassiveEventReceived,
+            None,
+            target_thread_id.as_deref(),
+            format!(
+                "passive {:?} event received: {}",
+                kind, routed.input.summary
+            ),
+        );
+
+        let mut inbox_item_id = None;
+        let mut runnable_threads = Vec::new();
+        if matched_handle_ids.is_empty() {
+            let id = self.next_inbox_item_id();
+            self.state.inbox.push(InboxItem {
+                id: id.clone(),
+                passive_event_id: event_id.clone(),
+                event_key: Some(event_key.clone()),
+                target_thread_id: target_thread_id.clone(),
+                condition: routed.input.condition.clone(),
+                source: routed.input.source.clone(),
+                summary: routed.input.summary.clone(),
+                payload_ref: routed.input.payload_ref.clone(),
+                dedupe_key: routed.input.dedupe_key.clone(),
+                status,
+                created_at: now,
+            });
+            self.io_event(
+                IoEventKind::PassiveEventInboxed,
+                None,
+                target_thread_id.as_deref(),
+                format!("passive event {event_id} had no matching pending handle"),
+            );
+            inbox_item_id = Some(id);
+        } else {
+            for handle_id in &matched_handle_ids {
+                {
+                    let handle = self.handle_mut(handle_id)?;
+                    handle.status = IoHandleStatus::Ready;
+                    handle.payload_ref = routed.input.payload_ref.clone();
+                    handle.resolved_event_id = Some(event_id.clone());
+                    handle.updated_at = now;
+                }
+                self.refresh_wait_statuses_for_handle(handle_id);
+                runnable_threads.extend(self.mark_ready_wait_threads_running(handle_id));
+                self.io_event(
+                    IoEventKind::PassiveEventMatched,
+                    Some(handle_id),
+                    target_thread_id.as_deref(),
+                    format!("passive event {event_id} matched handle {handle_id}"),
+                );
+                self.io_event(
+                    IoEventKind::PassiveHandleReady,
+                    Some(handle_id),
+                    target_thread_id.as_deref(),
+                    "passive handle is ready",
+                );
+            }
+        }
+        dedupe_runnable_threads(&mut runnable_threads);
+        self.save()?;
+        let wake_decision = WakeDecision {
+            event_id: event_id.clone(),
+            event_key,
+            status,
+            matched_handle_ids: matched_handle_ids.clone(),
+            runnable_threads,
+            inbox_item_id: inbox_item_id.clone(),
+            duplicate_of_event_id: None,
+        };
+        Ok(PassiveEventReceipt {
+            event_id,
+            status,
+            matched_handle_ids,
+            inbox_item_id,
+            duplicate_of_event_id: None,
+            wake_decision,
+        })
+    }
+
+    pub fn acknowledge_inbox_item(
+        &mut self,
+        inbox_item_id: impl AsRef<str>,
+        note: impl Into<String>,
+    ) -> Result<InboxItem> {
+        let inbox_item_id = inbox_item_id.as_ref();
+        let note = note.into();
+        let item_index = self
+            .state
+            .inbox
+            .iter()
+            .position(|item| item.id == inbox_item_id)
+            .ok_or_else(|| {
+                QunuxError::InvalidState(format!("unknown inbox item {inbox_item_id}"))
+            })?;
+        let event_id = self.state.inbox[item_index].passive_event_id.clone();
+        let target_thread_id = self.state.inbox[item_index].target_thread_id.clone();
+        if let Some(target_thread_id) = target_thread_id.as_deref()
+            && target_thread_id != self.context.thread_id
+        {
+            return Err(QunuxError::InvalidState(format!(
+                "thread {} cannot acknowledge inbox item {inbox_item_id} targeted at {target_thread_id}",
+                self.context.thread_id
+            )));
+        }
+        if self.state.inbox[item_index].status != PassiveEventStatus::Inboxed {
+            return Err(QunuxError::InvalidState(format!(
+                "inbox item {inbox_item_id} is {:?}, not inboxed",
+                self.state.inbox[item_index].status
+            )));
+        }
+        self.state.inbox[item_index].status = PassiveEventStatus::Handled;
+        if let Some(event) = self
+            .state
+            .passive_events
+            .iter_mut()
+            .find(|event| event.id == event_id)
+            && event.status == PassiveEventStatus::Inboxed
+        {
+            event.status = PassiveEventStatus::Handled;
+        }
+        let item = self.state.inbox[item_index].clone();
+        self.io_event(
+            IoEventKind::PassiveEventHandled,
+            None,
+            target_thread_id.as_deref(),
+            format!("inbox item {inbox_item_id} handled: {note}"),
+        );
+        self.save()?;
+        Ok(item)
+    }
+
+    pub fn create_user_task_from_inbox(
+        &mut self,
+        inbox_item_id: impl AsRef<str>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        note: impl Into<String>,
+    ) -> Result<UserTaskProblem> {
+        let inbox_item_id = inbox_item_id.as_ref();
+        let title = title.into();
+        let body = body.into();
+        let note = note.into();
+        let item_index = self
+            .state
+            .inbox
+            .iter()
+            .position(|item| item.id == inbox_item_id)
+            .ok_or_else(|| {
+                QunuxError::InvalidState(format!("unknown inbox item {inbox_item_id}"))
+            })?;
+        let item = self.state.inbox[item_index].clone();
+        if let Some(target_thread_id) = item.target_thread_id.as_deref()
+            && target_thread_id != self.context.thread_id
+        {
+            return Err(QunuxError::InvalidState(format!(
+                "thread {} cannot create user task from inbox item {inbox_item_id} targeted at {target_thread_id}",
+                self.context.thread_id
+            )));
+        }
+        if item.status != PassiveEventStatus::Inboxed {
+            return Err(QunuxError::InvalidState(format!(
+                "inbox item {inbox_item_id} is {:?}, not inboxed",
+                item.status
+            )));
+        }
+        let event_index = self
+            .state
+            .passive_events
+            .iter()
+            .position(|event| event.id == item.passive_event_id)
+            .ok_or_else(|| {
+                QunuxError::InvalidState(format!(
+                    "inbox item {inbox_item_id} points to unknown passive event {}",
+                    item.passive_event_id
+                ))
+            })?;
+        let event = self.state.passive_events[event_index].clone();
+        if event.status != PassiveEventStatus::Inboxed {
+            return Err(QunuxError::InvalidState(format!(
+                "passive event {} is {:?}, not inboxed",
+                event.id, event.status
+            )));
+        }
+        if item.event_key != event.event_key
+            || item.target_thread_id != event.target_thread_id
+            || item.condition != event.condition
+            || item.source != event.source
+            || item.dedupe_key != event.dedupe_key
+        {
+            return Err(QunuxError::InvalidState(format!(
+                "inbox item {inbox_item_id} does not match passive event {}",
+                event.id
+            )));
+        }
+
+        let parent_problem_id = self.current_thread()?.root_problem_id.clone();
+        self.require_problem_writable(&parent_problem_id)?;
+        let problem_id = self.next_problem_id();
+        let now = Utc::now();
+        let problem = Problem {
+            id: problem_id.clone(),
+            title,
+            body,
+            status: ProblemStatus::Todo,
+            owner_thread_id: self.context.thread_id.clone(),
+            parent_id: Some(parent_problem_id.clone()),
+            created_from_ticket_id: None,
+            created_from_ticket_mode: None,
+            created_from_check_id: None,
+            created_from_passive_event_id: Some(event.id.clone()),
+            created_from_inbox_item_id: Some(item.id.clone()),
+            created_from_user_task_kind: Some(event.kind),
+            ticket_id: None,
+            child_problem_ids: Vec::new(),
+            followup_problem_ids: Vec::new(),
+            result_ids: Vec::new(),
+            check_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.state.problems.insert(problem_id.clone(), problem);
+        self.problem_mut(&parent_problem_id)?
+            .child_problem_ids
+            .push(problem_id.clone());
+        self.touch_problem(&parent_problem_id)?;
+        self.state.inbox[item_index].status = PassiveEventStatus::Handled;
+        self.state.passive_events[event_index].status = PassiveEventStatus::Handled;
+        self.io_event(
+            IoEventKind::PassiveEventHandled,
+            None,
+            item.target_thread_id.as_deref(),
+            format!("inbox item {inbox_item_id} converted to user task {problem_id}: {note}"),
+        );
+        self.event(
+            "problem_created",
+            &problem_id,
+            format!(
+                "created user task from inbox item {} passive event {}",
+                item.id, event.id
+            ),
+        );
+        self.save()?;
+        Ok(UserTaskProblem {
+            problem_id,
+            parent_problem_id,
+            inbox_item_id: item.id,
+            passive_event_id: event.id,
+            source_kind: event.kind,
+        })
+    }
+
+    pub fn scaffold_user_task_from_inbox(
+        &mut self,
+        inbox_item_id: impl AsRef<str>,
+        problem_title: impl Into<String>,
+        problem_body: impl Into<String>,
+        ticket_title: impl Into<String>,
+        ticket_body: impl Into<String>,
+        note: impl Into<String>,
+    ) -> Result<ScaffoldedTask> {
+        let user_task =
+            self.create_user_task_from_inbox(inbox_item_id, problem_title, problem_body, note)?;
+        let ticket_id = self.create_ticket(&user_task.problem_id, ticket_title, ticket_body)?;
+        Ok(ScaffoldedTask {
+            problem_id: user_task.problem_id,
+            parent_problem_id: user_task.parent_problem_id,
+            ticket_id,
+            inbox_item_id: Some(user_task.inbox_item_id),
+            passive_event_id: Some(user_task.passive_event_id),
+            source_kind: Some(user_task.source_kind),
+        })
+    }
+
     pub fn initialize_root_problem(
         &mut self,
         title: Option<String>,
@@ -749,10 +2027,58 @@ impl QunuxRuntime {
         self.save()
     }
 
+    fn upgrade_legacy_pristine_root_problem(
+        &mut self,
+        current_default_title: &str,
+        current_default_body: &str,
+    ) -> Result<()> {
+        let root_problem_id = self.state.root_problem_id.clone();
+        let root = self.require_problem(&root_problem_id)?.clone();
+        let root_is_pristine = root.status == ProblemStatus::Todo
+            && root.ticket_id.is_none()
+            && root.child_problem_ids.is_empty()
+            && root.followup_problem_ids.is_empty()
+            && root.result_ids.is_empty()
+            && root.check_ids.is_empty();
+        if !root_is_pristine || root.title != LEGACY_DEFAULT_ROOT_PROBLEM_TITLE {
+            return Ok(());
+        }
+
+        {
+            let root = self.problem_mut(&root_problem_id)?;
+            root.title = current_default_title.to_string();
+            root.body = current_default_body.to_string();
+            root.updated_at = Utc::now();
+        }
+        self.event(
+            "root_problem_upgraded",
+            root_problem_id,
+            "legacy pristine root problem upgraded to process mission",
+        );
+        self.save()
+    }
+
     pub fn create_problem_from_ticket(
         &mut self,
         parent_id: impl AsRef<str>,
         ticket_id: impl AsRef<str>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Result<String> {
+        self.create_problem_from_ticket_with_mode(
+            parent_id,
+            ticket_id,
+            TicketChildMode::Split,
+            title,
+            body,
+        )
+    }
+
+    pub fn create_problem_from_ticket_with_mode(
+        &mut self,
+        parent_id: impl AsRef<str>,
+        ticket_id: impl AsRef<str>,
+        mode: TicketChildMode,
         title: impl Into<String>,
         body: impl Into<String>,
     ) -> Result<String> {
@@ -765,15 +2091,37 @@ impl QunuxRuntime {
                 "ticket {ticket_id} does not belong to problem {parent_id}"
             )));
         }
-        if ticket.classification != Some(TicketClassification::Split) {
-            return Err(QunuxError::InvalidState(format!(
-                "ticket {ticket_id} is not classified as split"
-            )));
-        }
-        if ticket.status != TicketStatus::Splitting {
-            return Err(QunuxError::InvalidState(format!(
-                "ticket {ticket_id} must be splitting before creating child problems"
-            )));
+        match mode {
+            TicketChildMode::Split => {
+                if ticket.classification != Some(TicketClassification::Split) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "ticket {ticket_id} is not classified as split"
+                    )));
+                }
+                if ticket.status != TicketStatus::Splitting {
+                    return Err(QunuxError::InvalidState(format!(
+                        "ticket {ticket_id} must be splitting before creating split child problems"
+                    )));
+                }
+            }
+            TicketChildMode::Spawn => {
+                let parent_status = self.require_problem(parent_id)?.status;
+                if !matches!(parent_status, ProblemStatus::Doing) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {parent_id} must be doing before spawning runtime child problems"
+                    )));
+                }
+                if ticket.classification != Some(TicketClassification::OneGo) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "ticket {ticket_id} is not classified as one_go"
+                    )));
+                }
+                if ticket.status != TicketStatus::Executing {
+                    return Err(QunuxError::InvalidState(format!(
+                        "ticket {ticket_id} must be executing before spawning runtime child problems"
+                    )));
+                }
+            }
         }
 
         let problem_id = self.next_problem_id();
@@ -786,7 +2134,11 @@ impl QunuxRuntime {
             owner_thread_id: self.context.thread_id.clone(),
             parent_id: Some(parent_id.to_string()),
             created_from_ticket_id: Some(ticket_id.to_string()),
+            created_from_ticket_mode: Some(mode),
             created_from_check_id: None,
+            created_from_passive_event_id: None,
+            created_from_inbox_item_id: None,
+            created_from_user_task_kind: None,
             ticket_id: None,
             child_problem_ids: Vec::new(),
             followup_problem_ids: Vec::new(),
@@ -803,7 +2155,7 @@ impl QunuxRuntime {
         self.event(
             "problem_created",
             &problem_id,
-            format!("created from split ticket {ticket_id}"),
+            format!("created from {mode:?} ticket {ticket_id}"),
         );
         self.save()?;
         Ok(problem_id)
@@ -979,28 +2331,28 @@ impl QunuxRuntime {
                 "cannot record result for ticket {ticket_id} while status is {active_status:?}"
             )));
         }
+        let children = self.child_problem_ids_from_ticket(ticket_id);
         if active_status == TicketStatus::Splitting {
-            let children = self.child_problem_ids_from_ticket(ticket_id);
             if children.is_empty() {
                 return Err(QunuxError::InvalidState(format!(
                     "cannot finish split ticket {ticket_id}; create at least one child problem first"
                 )));
             }
-            let open_children: Vec<_> = children
-                .into_iter()
-                .filter(|child_id| {
-                    self.state
-                        .problems
-                        .get(child_id)
-                        .is_some_and(|problem| problem.status != ProblemStatus::Done)
-                })
-                .collect();
-            if !open_children.is_empty() {
-                return Err(QunuxError::InvalidState(format!(
-                    "cannot finish split ticket {ticket_id}; child problems still open: {}",
-                    open_children.join(", ")
-                )));
-            }
+        }
+        let open_children: Vec<_> = children
+            .into_iter()
+            .filter(|child_id| {
+                self.state
+                    .problems
+                    .get(child_id)
+                    .is_some_and(|problem| problem.status != ProblemStatus::Done)
+            })
+            .collect();
+        if !open_children.is_empty() {
+            return Err(QunuxError::InvalidState(format!(
+                "cannot finish ticket {ticket_id}; child problems still open: {}",
+                open_children.join(", ")
+            )));
         }
 
         let result_id = self.next_result_id();
@@ -1090,7 +2442,11 @@ impl QunuxRuntime {
                 owner_thread_id: self.context.thread_id.clone(),
                 parent_id: Some(problem_id.to_string()),
                 created_from_ticket_id: None,
+                created_from_ticket_mode: None,
                 created_from_check_id: Some(check_id.clone()),
+                created_from_passive_event_id: None,
+                created_from_inbox_item_id: None,
+                created_from_user_task_kind: None,
                 ticket_id: None,
                 child_problem_ids: Vec::new(),
                 followup_problem_ids: Vec::new(),
@@ -1211,6 +2567,12 @@ impl QunuxRuntime {
             kind: IoHandleKind::ChildThread,
             owner_thread_id: parent_thread_id.clone(),
             target_thread_id: Some(thread_id.clone()),
+            event_key: None,
+            condition: None,
+            source: None,
+            payload_ref: None,
+            dedupe_key: None,
+            resolved_event_id: None,
             status: IoHandleStatus::Pending,
             created_at: now,
             updated_at: now,
@@ -1283,6 +2645,87 @@ impl QunuxRuntime {
         )?;
         self.save()?;
         Ok(joined)
+    }
+
+    pub fn recover_thread(&mut self, thread_id: impl AsRef<str>) -> Result<RecoveredThread> {
+        let thread_id = thread_id.as_ref();
+        let parent_thread_id = self.context.thread_id.clone();
+        let child = self.require_thread(thread_id)?.clone();
+        if child.parent_thread_id.as_deref() != Some(parent_thread_id.as_str()) {
+            return Err(QunuxError::InvalidState(format!(
+                "thread {parent_thread_id} cannot recover non-child thread {thread_id}"
+            )));
+        }
+        if !matches!(child.status, ThreadStatus::Failed | ThreadStatus::Cancelled) {
+            return Err(QunuxError::InvalidState(format!(
+                "cannot recover thread {thread_id} while status is {:?}",
+                child.status
+            )));
+        }
+        if child.joined_at.is_some() {
+            return Err(QunuxError::InvalidState(format!(
+                "thread {thread_id} is already joined"
+            )));
+        }
+
+        let handle_id = self.child_thread_handle_id(thread_id).ok_or_else(|| {
+            QunuxError::InvalidState(format!("thread {thread_id} has no child-thread handle"))
+        })?;
+        let wait_id = self.wait_id_for_handle(&handle_id).ok_or_else(|| {
+            QunuxError::InvalidState(format!("handle {handle_id} has no parent wait"))
+        })?;
+        self.require_handle_owned_by_current_thread(self.require_handle(&handle_id)?)?;
+
+        let now = Utc::now();
+        self.transfer_subtree_owner(&child.root_problem_id, &parent_thread_id)?;
+        {
+            let child_thread = self.thread_mut(thread_id)?;
+            child_thread.status = ThreadStatus::Recovered;
+            child_thread.updated_at = now;
+        }
+        {
+            let handle = self.handle_mut(&handle_id)?;
+            if !matches!(
+                handle.status,
+                IoHandleStatus::Failed | IoHandleStatus::Cancelled
+            ) {
+                return Err(QunuxError::InvalidState(format!(
+                    "cannot recover thread {thread_id}; handle {handle_id} is {:?}",
+                    handle.status
+                )));
+            }
+            handle.status = IoHandleStatus::Cancelled;
+            handle.updated_at = now;
+        }
+        {
+            let wait = self.wait_mut(&wait_id)?;
+            wait.status = WaitStatus::Consumed;
+            wait.updated_at = now;
+        }
+        if let Some(parent) = self.state.threads.get_mut(&parent_thread_id) {
+            parent.status = ThreadStatus::Running;
+            parent.updated_at = now;
+        }
+
+        let message = format!(
+            "recovered failed child thread {thread_id}; subtree {} returned to parent {parent_thread_id}",
+            child.root_problem_id
+        );
+        self.event("thread_recovered", thread_id, message.clone());
+        self.io_event(
+            IoEventKind::ChildThreadRecovered,
+            Some(&handle_id),
+            Some(thread_id),
+            message,
+        );
+        self.save()?;
+        Ok(RecoveredThread {
+            thread_id: thread_id.to_string(),
+            root_problem_id: child.root_problem_id,
+            parent_thread_id,
+            handle_id,
+            wait_id,
+        })
     }
 
     pub fn auto_join_child_thread(
@@ -1456,11 +2899,16 @@ impl QunuxRuntime {
     }
 
     pub fn next(&self) -> NextStep {
-        let root_problem_id = self
-            .current_thread()
-            .map(|thread| thread.root_problem_id.clone())
-            .unwrap_or_else(|_| self.state.root_problem_id.clone());
-        self.next_for_problem(&root_problem_id)
+        if let Some(inbox_step) = self.next_pending_inbox() {
+            return inbox_step;
+        }
+        if let Some(frontier_step) = self.runnable_frontier_for_current_thread() {
+            return frontier_step;
+        }
+        if let Some(wait_step) = self.next_passive_io_wait() {
+            return wait_step;
+        }
+        self.next_for_current_thread_root()
             .unwrap_or_else(|| NextStep {
                 action: NextAction::None,
                 disposition: NextDisposition::Terminal,
@@ -1473,6 +2921,108 @@ impl QunuxRuntime {
                         .to_string(),
                 reason: "current thread subtree is closed or waiting".to_string(),
             })
+    }
+
+    fn next_for_current_thread_root(&self) -> Option<NextStep> {
+        let root_problem_id = self
+            .current_thread()
+            .map(|thread| thread.root_problem_id.clone())
+            .unwrap_or_else(|_| self.state.root_problem_id.clone());
+        self.next_for_problem(&root_problem_id)
+    }
+
+    fn runnable_frontier_for_current_thread(&self) -> Option<NextStep> {
+        self.next_for_current_thread_root()
+            .filter(|step| !self.is_bare_lifecycle_root_create_ticket(step))
+    }
+
+    fn blocking_frontier_for_wait(&self) -> Option<NextStep> {
+        self.runnable_frontier_for_current_thread()
+            .filter(|step| step.action != NextAction::RecordResult)
+    }
+
+    fn is_bare_lifecycle_root_create_ticket(&self, step: &NextStep) -> bool {
+        if step.action != NextAction::CreateSolutionTicket {
+            return false;
+        }
+        let Ok(thread) = self.current_thread() else {
+            return false;
+        };
+        step.problem_id.as_deref() == Some(self.state.root_problem_id.as_str())
+            && thread.root_problem_id == self.state.root_problem_id
+            && self
+                .state
+                .problems
+                .get(&self.state.root_problem_id)
+                .is_some_and(|problem| problem.ticket_id.is_none())
+    }
+
+    fn next_pending_inbox(&self) -> Option<NextStep> {
+        let thread = self.current_thread().ok()?;
+        let item = self.state.inbox.iter().find(|item| {
+            item.status == PassiveEventStatus::Inboxed
+                && item
+                    .target_thread_id
+                    .as_deref()
+                    .is_none_or(|target| target == thread.id)
+        })?;
+        let event = self
+            .state
+            .passive_events
+            .iter()
+            .find(|event| event.id == item.passive_event_id);
+        let event_summary = event
+            .map(|event| event.summary.as_str())
+            .unwrap_or(item.summary.as_str());
+        Some(self.step(
+            NextAction::HandleInbox,
+            None,
+            Some(&thread.root_problem_id),
+            None,
+            format!(
+                "Handle pending inbox item {} from passive event {}: {event_summary}. First triage the input. If it is actionable work (solve, implement, investigate, run, fix, design, review, or other durable task), prefer `qunux.scaffold_user_task` with this inbox item id, a child problem title/body, a default ticket title/body, and a handling note; then follow the next Qunux frontier. Use `qunux.ingest_user_task` only when the ticket must be authored separately. If it is pure small talk, acknowledgement, narrow meta question, clarification, or an explicit idle/wait instruction, emit any needed visible assistant reply in this turn, then call `qunux.ack_inbox` for {} so the same input is not dispatched again. `qunux.ack_inbox` is state-only and not visible to the user; do not claim a visible reply in the ack note unless one was actually emitted. If the right next step is waiting, call `qunux.wait` only after the inbox item is incorporated. Do not close the lifecycle root merely because the process is ready or idle.",
+                item.id, item.passive_event_id, item.id
+            ),
+            format!("pending inbox item {} can create a scheduler frontier", item.id),
+        ))
+    }
+
+    fn next_passive_io_wait(&self) -> Option<NextStep> {
+        let thread = self.current_thread().ok()?;
+        if thread.status != ThreadStatus::WaitingIo {
+            return None;
+        }
+        let wait = self.state.waits.values().find(|wait| {
+            wait.thread_id == thread.id
+                && wait.status == WaitStatus::Waiting
+                && wait.handle_ids.iter().any(|handle_id| {
+                    self.state.handles.get(handle_id).is_some_and(|handle| {
+                        matches!(
+                            handle.kind,
+                            IoHandleKind::UserInput
+                                | IoHandleKind::Timer
+                                | IoHandleKind::ExternalSignal
+                        ) && handle.status == IoHandleStatus::Pending
+                    })
+                })
+        })?;
+        let wait_reason = wait
+            .handle_ids
+            .iter()
+            .filter_map(|handle_id| self.state.handles.get(handle_id))
+            .find(|handle| handle.status == IoHandleStatus::Pending)
+            .map(|handle| format!("{:?}", handle.kind))
+            .unwrap_or_else(|| "passive IO".to_string());
+        Some(self.step(
+            NextAction::WaitIo,
+            None,
+            Some(&thread.root_problem_id),
+            None,
+            format!(
+                "Thread is parked on {wait_reason}; do not build LLM context until a passive event wakes this wait."
+            ),
+            format!("thread {} has pending passive wait {}", thread.id, wait.id),
+        ))
     }
 
     pub fn status(&self) -> RuntimeStatus {
@@ -1497,7 +3047,10 @@ impl QunuxRuntime {
                 .filter(|thread| {
                     !matches!(
                         thread.status,
-                        ThreadStatus::Done | ThreadStatus::Failed | ThreadStatus::Cancelled
+                        ThreadStatus::Done
+                            | ThreadStatus::Failed
+                            | ThreadStatus::Cancelled
+                            | ThreadStatus::Recovered
                     )
                 })
                 .count(),
@@ -1546,6 +3099,14 @@ impl QunuxRuntime {
                         ThreadStatus::WaitingChildren | ThreadStatus::WaitingIo
                     )
                 })
+                .count(),
+            passive_events: self.state.passive_events.len(),
+            inbox_items: self.state.inbox.len(),
+            pending_inbox_items: self
+                .state
+                .inbox
+                .iter()
+                .filter(|item| item.status == PassiveEventStatus::Inboxed)
                 .count(),
             valid: self.validate().is_ok(),
         }
@@ -1634,6 +3195,44 @@ impl QunuxRuntime {
                         IoHandleStatus::Pending | IoHandleStatus::Cancelled => {}
                     }
                 }
+                IoHandleKind::UserInput | IoHandleKind::Timer | IoHandleKind::ExternalSignal => {
+                    if handle.target_thread_id.is_some() {
+                        return Err(QunuxError::InvalidState(format!(
+                            "passive handle {handle_id} must not target a child thread"
+                        )));
+                    }
+                    if let Some(event_key) = handle.event_key.as_ref()
+                        && let Some(target_thread_id) = event_key.target_thread_id.as_deref()
+                    {
+                        self.require_thread(target_thread_id)?;
+                    }
+                }
+            }
+        }
+        for event in &self.state.passive_events {
+            if let Some(event_key) = event.event_key.as_ref()
+                && let Some(target_thread_id) = event_key.target_thread_id.as_deref()
+            {
+                self.require_thread(target_thread_id)?;
+                if event.target_thread_id.as_deref() != Some(target_thread_id) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "passive event {} target {:?} does not match event key target {target_thread_id}",
+                        event.id, event.target_thread_id
+                    )));
+                }
+            }
+        }
+        for item in &self.state.inbox {
+            if let Some(event_key) = item.event_key.as_ref()
+                && let Some(target_thread_id) = event_key.target_thread_id.as_deref()
+            {
+                self.require_thread(target_thread_id)?;
+                if item.target_thread_id.as_deref() != Some(target_thread_id) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "inbox item {} target {:?} does not match event key target {target_thread_id}",
+                        item.id, item.target_thread_id
+                    )));
+                }
             }
         }
         for (thread_id, thread) in &self.state.threads {
@@ -1683,6 +3282,88 @@ impl QunuxRuntime {
             if let Some(parent_id) = &problem.parent_id {
                 self.require_problem(parent_id)?;
             }
+            let has_user_task_provenance = problem.created_from_passive_event_id.is_some()
+                || problem.created_from_inbox_item_id.is_some()
+                || problem.created_from_user_task_kind.is_some();
+            if let Some(ticket_id) = &problem.created_from_ticket_id {
+                let ticket = self.require_ticket(ticket_id)?;
+                if problem.created_from_check_id.is_some() {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {problem_id} has both ticket and check provenance"
+                    )));
+                }
+                if has_user_task_provenance {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {problem_id} has both ticket and user-task provenance"
+                    )));
+                }
+                if problem.parent_id.as_deref() != Some(ticket.problem_id.as_str()) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {problem_id} source ticket {ticket_id} belongs to {}, not parent {:?}",
+                        ticket.problem_id, problem.parent_id
+                    )));
+                }
+                match problem.created_from_ticket_mode {
+                    Some(TicketChildMode::Split) | None => {
+                        if ticket.classification != Some(TicketClassification::Split) {
+                            return Err(QunuxError::InvalidState(format!(
+                                "problem {problem_id} source ticket {ticket_id} is not split"
+                            )));
+                        }
+                        if !matches!(ticket.status, TicketStatus::Splitting | TicketStatus::Done) {
+                            return Err(QunuxError::InvalidState(format!(
+                                "problem {problem_id} source split ticket {ticket_id} is not splitting or done"
+                            )));
+                        }
+                    }
+                    Some(TicketChildMode::Spawn) => {
+                        if ticket.classification != Some(TicketClassification::OneGo) {
+                            return Err(QunuxError::InvalidState(format!(
+                                "problem {problem_id} source ticket {ticket_id} is not one_go"
+                            )));
+                        }
+                        if !matches!(ticket.status, TicketStatus::Executing | TicketStatus::Done) {
+                            return Err(QunuxError::InvalidState(format!(
+                                "problem {problem_id} source spawn ticket {ticket_id} is not executing or done"
+                            )));
+                        }
+                    }
+                }
+            } else if problem.parent_id.is_some()
+                && problem.created_from_check_id.is_none()
+                && !has_user_task_provenance
+            {
+                return Err(QunuxError::InvalidState(format!(
+                    "problem {problem_id} has no ticket, check, or user-task provenance"
+                )));
+            }
+            if let Some(check_id) = &problem.created_from_check_id {
+                if has_user_task_provenance {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {problem_id} has both check and user-task provenance"
+                    )));
+                }
+                let check = self.require_check(check_id)?;
+                if check.status != CheckStatus::NotSuccess {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {problem_id} source check {check_id} is not not_success"
+                    )));
+                }
+                if check.followup_problem_id.as_deref() != Some(problem_id.as_str()) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {problem_id} source check {check_id} does not point to it"
+                    )));
+                }
+                if problem.parent_id.as_deref() != Some(check.problem_id.as_str()) {
+                    return Err(QunuxError::InvalidState(format!(
+                        "problem {problem_id} source check {check_id} belongs to {}, not parent {:?}",
+                        check.problem_id, problem.parent_id
+                    )));
+                }
+            }
+            if has_user_task_provenance {
+                self.validate_user_task_problem_provenance(problem_id, problem)?;
+            }
             if let Some(ticket_id) = &problem.ticket_id {
                 let ticket = self.require_ticket(ticket_id)?;
                 if ticket.problem_id != *problem_id {
@@ -1722,6 +3403,38 @@ impl QunuxRuntime {
                     return Err(QunuxError::InvalidState(format!(
                         "check {check_id} does not belong to {problem_id}"
                     )));
+                }
+                match check.status {
+                    CheckStatus::Success => {
+                        if check.followup_problem_id.is_some() {
+                            return Err(QunuxError::InvalidState(format!(
+                                "success check {check_id} has a follow-up problem"
+                            )));
+                        }
+                    }
+                    CheckStatus::NotSuccess => {
+                        let followup_id = check.followup_problem_id.as_ref().ok_or_else(|| {
+                            QunuxError::InvalidState(format!(
+                                "not_success check {check_id} has no follow-up problem"
+                            ))
+                        })?;
+                        let followup = self.require_problem(followup_id)?;
+                        if followup.created_from_check_id.as_deref() != Some(check_id.as_str()) {
+                            return Err(QunuxError::InvalidState(format!(
+                                "check {check_id} points to follow-up {followup_id}, but the follow-up does not point back"
+                            )));
+                        }
+                        if followup.parent_id.as_deref() != Some(problem_id.as_str()) {
+                            return Err(QunuxError::InvalidState(format!(
+                                "check {check_id} follow-up {followup_id} does not belong to parent {problem_id}"
+                            )));
+                        }
+                        if !problem.followup_problem_ids.contains(followup_id) {
+                            return Err(QunuxError::InvalidState(format!(
+                                "check {check_id} follow-up {followup_id} is missing from parent {problem_id}"
+                            )));
+                        }
+                    }
                 }
             }
             if problem.status == ProblemStatus::Done {
@@ -1773,6 +3486,24 @@ impl QunuxRuntime {
                     "done ticket {ticket_id} has no result"
                 )));
             }
+            if ticket.status == TicketStatus::Done {
+                let open_children: Vec<_> = self
+                    .child_problem_ids_from_ticket(ticket_id)
+                    .into_iter()
+                    .filter(|child_id| {
+                        self.state
+                            .problems
+                            .get(child_id)
+                            .is_some_and(|child| child.status != ProblemStatus::Done)
+                    })
+                    .collect();
+                if !open_children.is_empty() {
+                    return Err(QunuxError::InvalidState(format!(
+                        "done ticket {ticket_id} has open child problems: {}",
+                        open_children.join(", ")
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1808,7 +3539,7 @@ impl QunuxRuntime {
                         Some(&child_thread.id),
                         Some(child_id),
                         None,
-                        "Join the completed child thread before summarizing the parent split ticket.",
+                        "Join the completed child thread before summarizing the parent ticket.",
                         "child thread is done but not joined",
                     ));
                 }
@@ -1821,7 +3552,7 @@ impl QunuxRuntime {
                         Some(&child_thread.id),
                         Some(child_id),
                         None,
-                        "Recover the failed child thread before the parent split ticket can be summarized.",
+                        "Recover the failed child thread before the parent ticket can be summarized.",
                         "child thread failed before closing its subtree",
                     ));
                 }
@@ -1844,7 +3575,7 @@ impl QunuxRuntime {
                     Some(child_id),
                     None,
                     "Spawn a child Qunux thread bound to this child problem subtree.",
-                    "split child problem is not assigned to a child thread",
+                    "child problem is not assigned to a child thread",
                 ));
             }
         }
@@ -1934,7 +3665,7 @@ impl QunuxRuntime {
                     None,
                     Some(problem_id),
                     Some(ticket_id),
-                    "Execute the ticket, then record the actual result.",
+                    "Execute the ticket; record the actual result, or create a runtime-spawned child problem if execution discovers a blocking subprogram.",
                     "ticket is classified one_go",
                 )),
                 Some(TicketClassification::Split) => Some(self.step(
@@ -1957,11 +3688,11 @@ impl QunuxRuntime {
             TicketStatus::Executing => Some(self.step(
                 NextAction::RecordResult,
                 None,
-                Some(problem_id),
-                Some(ticket_id),
-                "Record the result for the current executing ticket.",
-                "ticket is executing",
-            )),
+                    Some(problem_id),
+                    Some(ticket_id),
+                    "Record the result for the current executing ticket, unless it still needs a runtime-spawned child problem.",
+                    "ticket is executing",
+                )),
             TicketStatus::Splitting => {
                 let children = self.child_problem_ids_from_ticket(ticket_id);
                 if children.is_empty() {
@@ -1979,8 +3710,8 @@ impl QunuxRuntime {
                     None,
                     Some(problem_id),
                     Some(ticket_id),
-                    "Record the parent ticket summary result after all split children are done.",
-                    "split children are closed",
+                    "Record the parent ticket summary result after all children created from this ticket are done.",
+                    "ticket children are closed",
                 ))
             }
             TicketStatus::Done => Some(self.step(
@@ -2098,11 +3829,108 @@ impl QunuxRuntime {
             .ok_or_else(|| QunuxError::InvalidState(format!("unknown check {check_id}")))
     }
 
+    fn validate_user_task_problem_provenance(
+        &self,
+        problem_id: &str,
+        problem: &Problem,
+    ) -> Result<()> {
+        let passive_event_id = problem
+            .created_from_passive_event_id
+            .as_deref()
+            .ok_or_else(|| {
+                QunuxError::InvalidState(format!(
+                    "problem {problem_id} has incomplete user-task provenance: missing passive event"
+                ))
+            })?;
+        let inbox_item_id = problem
+            .created_from_inbox_item_id
+            .as_deref()
+            .ok_or_else(|| {
+                QunuxError::InvalidState(format!(
+                    "problem {problem_id} has incomplete user-task provenance: missing inbox item"
+                ))
+            })?;
+        let user_task_kind = problem.created_from_user_task_kind.ok_or_else(|| {
+            QunuxError::InvalidState(format!(
+                "problem {problem_id} has incomplete user-task provenance: missing source kind"
+            ))
+        })?;
+        let event = self
+            .state
+            .passive_events
+            .iter()
+            .find(|event| event.id == passive_event_id)
+            .ok_or_else(|| {
+                QunuxError::InvalidState(format!(
+                    "problem {problem_id} source passive event {passive_event_id} is missing"
+                ))
+            })?;
+        let item = self
+            .state
+            .inbox
+            .iter()
+            .find(|item| item.id == inbox_item_id)
+            .ok_or_else(|| {
+                QunuxError::InvalidState(format!(
+                    "problem {problem_id} source inbox item {inbox_item_id} is missing"
+                ))
+            })?;
+        if item.passive_event_id != event.id {
+            return Err(QunuxError::InvalidState(format!(
+                "problem {problem_id} source inbox item {inbox_item_id} points to {}, not passive event {}",
+                item.passive_event_id, event.id
+            )));
+        }
+        if user_task_kind != event.kind {
+            return Err(QunuxError::InvalidState(format!(
+                "problem {problem_id} user-task kind {:?} does not match passive event kind {:?}",
+                user_task_kind, event.kind
+            )));
+        }
+        if item.event_key != event.event_key
+            || item.target_thread_id != event.target_thread_id
+            || item.condition != event.condition
+            || item.source != event.source
+            || item.dedupe_key != event.dedupe_key
+        {
+            return Err(QunuxError::InvalidState(format!(
+                "problem {problem_id} source inbox item {inbox_item_id} does not match passive event {}",
+                event.id
+            )));
+        }
+        if item.status != PassiveEventStatus::Handled || event.status != PassiveEventStatus::Handled
+        {
+            return Err(QunuxError::InvalidState(format!(
+                "problem {problem_id} user-task source must be handled, got inbox {:?} and event {:?}",
+                item.status, event.status
+            )));
+        }
+        if let Some(target_thread_id) = item.target_thread_id.as_deref()
+            && target_thread_id != problem.owner_thread_id
+        {
+            return Err(QunuxError::InvalidState(format!(
+                "problem {problem_id} source inbox item {inbox_item_id} targets {target_thread_id}, not owner {}",
+                problem.owner_thread_id
+            )));
+        }
+        Ok(())
+    }
+
     fn require_handle(&self, handle_id: &str) -> Result<&IoHandle> {
         self.state
             .handles
             .get(handle_id)
             .ok_or_else(|| QunuxError::InvalidState(format!("unknown handle {handle_id}")))
+    }
+
+    fn require_handle_owned_by_current_thread(&self, handle: &IoHandle) -> Result<()> {
+        if handle.owner_thread_id != self.context.thread_id {
+            return Err(QunuxError::InvalidState(format!(
+                "thread {} cannot access handle {} owned by {}",
+                self.context.thread_id, handle.id, handle.owner_thread_id
+            )));
+        }
+        Ok(())
     }
 
     fn handle_mut(&mut self, handle_id: &str) -> Result<&mut IoHandle> {
@@ -2146,6 +3974,18 @@ impl QunuxRuntime {
     fn next_io_event_id(&mut self) -> String {
         let id = format!("IO{:03}", self.state.next_io_event_seq);
         self.state.next_io_event_seq += 1;
+        id
+    }
+
+    fn next_passive_event_id(&mut self) -> String {
+        let id = format!("PE{:03}", self.state.next_passive_event_seq);
+        self.state.next_passive_event_seq += 1;
+        id
+    }
+
+    fn next_inbox_item_id(&mut self) -> String {
+        let id = format!("IN{:03}", self.state.next_inbox_item_seq);
+        self.state.next_inbox_item_seq += 1;
         id
     }
 
@@ -2271,10 +4111,9 @@ impl QunuxRuntime {
     }
 
     fn thread_for_root_problem(&self, problem_id: &str) -> Option<&Thread> {
-        self.state
-            .threads
-            .values()
-            .find(|thread| thread.root_problem_id == problem_id)
+        self.state.threads.values().find(|thread| {
+            thread.root_problem_id == problem_id && thread.status != ThreadStatus::Recovered
+        })
     }
 
     fn open_child_thread_ids(&self, thread_id: &str) -> Vec<String> {
@@ -2290,7 +4129,10 @@ impl QunuxRuntime {
                     .is_some_and(|child| {
                         !matches!(
                             child.status,
-                            ThreadStatus::Done | ThreadStatus::Failed | ThreadStatus::Cancelled
+                            ThreadStatus::Done
+                                | ThreadStatus::Failed
+                                | ThreadStatus::Cancelled
+                                | ThreadStatus::Recovered
                         )
                     })
             })
@@ -2307,6 +4149,61 @@ impl QunuxRuntime {
                     && handle.target_thread_id.as_deref() == Some(thread_id)
             })
             .map(|handle| handle.id.clone())
+    }
+
+    fn find_pending_passive_handle_thread(
+        &self,
+        thread_id: &str,
+        handle_kind: IoHandleKind,
+        visited: &mut Vec<String>,
+    ) -> Option<String> {
+        if visited.iter().any(|visited_id| visited_id == thread_id) {
+            return None;
+        }
+        visited.push(thread_id.to_string());
+
+        if self.thread_has_pending_passive_handle(thread_id, handle_kind) {
+            return Some(thread_id.to_string());
+        }
+
+        let thread = self.state.threads.get(thread_id)?;
+        for child_thread_id in &thread.child_thread_ids {
+            let Some(child_thread) = self.state.threads.get(child_thread_id) else {
+                continue;
+            };
+            if matches!(
+                child_thread.status,
+                ThreadStatus::Done
+                    | ThreadStatus::Failed
+                    | ThreadStatus::Cancelled
+                    | ThreadStatus::Recovered
+            ) {
+                continue;
+            }
+            if let Some(found) =
+                self.find_pending_passive_handle_thread(child_thread_id, handle_kind, visited)
+            {
+                return Some(found);
+            }
+        }
+
+        None
+    }
+
+    fn thread_has_pending_passive_handle(
+        &self,
+        thread_id: &str,
+        handle_kind: IoHandleKind,
+    ) -> bool {
+        self.state.waits.values().any(|wait| {
+            wait.thread_id == thread_id
+                && wait.status == WaitStatus::Waiting
+                && wait.handle_ids.iter().any(|handle_id| {
+                    self.state.handles.get(handle_id).is_some_and(|handle| {
+                        handle.kind == handle_kind && handle.status == IoHandleStatus::Pending
+                    })
+                })
+        })
     }
 
     fn wait_id_for_handle(&self, handle_id: &str) -> Option<String> {
@@ -2344,6 +4241,23 @@ impl QunuxRuntime {
         }
     }
 
+    fn mark_wait_consumed_if_all_handles_consumed(&mut self, wait_id: &str) -> Result<()> {
+        let Some(wait) = self.state.waits.get(wait_id).cloned() else {
+            return Err(QunuxError::InvalidState(format!("unknown wait {wait_id}")));
+        };
+        if wait.handle_ids.iter().all(|handle_id| {
+            self.state
+                .handles
+                .get(handle_id)
+                .is_some_and(|handle| handle.status == IoHandleStatus::Consumed)
+        }) {
+            let wait = self.wait_mut(wait_id)?;
+            wait.status = WaitStatus::Consumed;
+            wait.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
     fn refresh_wait_statuses_for_handle(&mut self, handle_id: &str) {
         let wait_ids: Vec<_> = self
             .state
@@ -2369,6 +4283,91 @@ impl QunuxRuntime {
                 wait.updated_at = Utc::now();
             }
         }
+    }
+
+    fn mark_ready_wait_threads_running(&mut self, handle_id: &str) -> Vec<RunnableThread> {
+        let wait_thread_ids: Vec<_> = self
+            .state
+            .waits
+            .values()
+            .filter(|wait| {
+                wait.status == WaitStatus::Ready && wait.handle_ids.iter().any(|id| id == handle_id)
+            })
+            .map(|wait| wait.thread_id.clone())
+            .collect();
+        let mut runnable_threads = Vec::new();
+        for thread_id in wait_thread_ids {
+            if let Some(thread) = self.state.threads.get_mut(&thread_id)
+                && thread.status == ThreadStatus::WaitingIo
+            {
+                thread.status = ThreadStatus::Running;
+                thread.updated_at = Utc::now();
+                runnable_threads.push(RunnableThread {
+                    thread_id: thread.id.clone(),
+                    root_problem_id: thread.root_problem_id.clone(),
+                    wake_reason: format!("handle {handle_id} ready"),
+                });
+            }
+        }
+        runnable_threads
+    }
+
+    fn match_inboxed_event_for_handle(&mut self, handle_id: &str) -> Result<()> {
+        let handle = self.require_handle(handle_id)?.clone();
+        let Some((event_id, payload_ref)) = self
+            .state
+            .passive_events
+            .iter()
+            .find(|event| {
+                event.status == PassiveEventStatus::Inboxed
+                    && passive_event_matches_handle(event, &handle)
+            })
+            .map(|event| (event.id.clone(), event.payload_ref.clone()))
+        else {
+            return Ok(());
+        };
+        let now = Utc::now();
+        {
+            let handle = self.handle_mut(handle_id)?;
+            handle.status = IoHandleStatus::Ready;
+            handle.resolved_event_id = Some(event_id.clone());
+            handle.payload_ref = payload_ref;
+            handle.updated_at = now;
+        }
+        if let Some(event) = self
+            .state
+            .passive_events
+            .iter_mut()
+            .find(|event| event.id == event_id)
+        {
+            event.status = PassiveEventStatus::Matched;
+            if !event.matched_handle_ids.iter().any(|id| id == handle_id) {
+                event.matched_handle_ids.push(handle_id.to_string());
+            }
+        }
+        for item in self
+            .state
+            .inbox
+            .iter_mut()
+            .filter(|item| item.passive_event_id == event_id)
+        {
+            item.status = PassiveEventStatus::Matched;
+        }
+        self.refresh_wait_statuses_for_handle(handle_id);
+        self.mark_ready_wait_threads_running(handle_id);
+        self.io_event(
+            IoEventKind::PassiveEventMatched,
+            Some(handle_id),
+            Some(&handle.owner_thread_id),
+            format!("inboxed passive event {event_id} matched newly created handle {handle_id}"),
+        );
+        self.io_event(
+            IoEventKind::PassiveHandleReady,
+            Some(handle_id),
+            Some(&handle.owner_thread_id),
+            "passive handle is ready from inboxed event",
+        );
+        Ok(())
     }
 
     fn mark_child_thread_ready_in_state(
@@ -2618,6 +4617,101 @@ fn ticket_status_name(status: TicketStatus) -> &'static str {
     }
 }
 
+fn event_key_from_passive_event(event: &PassiveEvent) -> EventKey {
+    event.event_key.clone().unwrap_or_else(|| {
+        EventKey::passive(
+            event.kind,
+            event.condition.clone(),
+            event.source.clone(),
+            event.target_thread_id.clone(),
+        )
+    })
+}
+
+fn dedupe_runnable_threads(runnable_threads: &mut Vec<RunnableThread>) {
+    runnable_threads.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    runnable_threads.dedup_by(|left, right| left.thread_id == right.thread_id);
+}
+
+fn passive_input_matches_handle(
+    input: &PassiveEventInput,
+    event_key: &EventKey,
+    handle: &IoHandle,
+) -> bool {
+    if let Some(handle_key) = handle.event_key.as_ref() {
+        if handle_key != event_key {
+            return false;
+        }
+        if let Some(dedupe_key) = handle.dedupe_key.as_deref()
+            && input.dedupe_key.as_deref() != Some(dedupe_key)
+        {
+            return false;
+        }
+        return true;
+    }
+    if let Some(target_thread_id) = input.target_thread_id.as_deref()
+        && handle.owner_thread_id != target_thread_id
+    {
+        return false;
+    }
+    if let Some(condition) = handle.condition.as_deref()
+        && input.condition.as_deref() != Some(condition)
+    {
+        return false;
+    }
+    if let Some(source) = handle.source.as_deref()
+        && input.source.as_deref() != Some(source)
+    {
+        return false;
+    }
+    if let Some(dedupe_key) = handle.dedupe_key.as_deref()
+        && input.dedupe_key.as_deref() != Some(dedupe_key)
+    {
+        return false;
+    }
+    true
+}
+
+fn passive_event_matches_handle(event: &PassiveEvent, handle: &IoHandle) -> bool {
+    if handle.kind != event.kind.handle_kind() || handle.status != IoHandleStatus::Pending {
+        return false;
+    }
+    if let (Some(event_key), Some(handle_key)) =
+        (event.event_key.as_ref(), handle.event_key.as_ref())
+    {
+        if event_key != handle_key {
+            return false;
+        }
+        if let Some(dedupe_key) = handle.dedupe_key.as_deref()
+            && event.dedupe_key.as_deref() != Some(dedupe_key)
+        {
+            return false;
+        }
+        return true;
+    }
+    if let Some(target_thread_id) = event.target_thread_id.as_deref()
+        && handle.owner_thread_id != target_thread_id
+    {
+        return false;
+    }
+    if let Some(condition) = handle.condition.as_deref()
+        && event.condition.as_deref() != Some(condition)
+    {
+        return false;
+    }
+    if let Some(source) = handle.source.as_deref()
+        && event.source.as_deref() != Some(source)
+    {
+        return false;
+    }
+    if let Some(dedupe_key) = handle.dedupe_key.as_deref()
+        && event.dedupe_key.as_deref() != Some(dedupe_key)
+    {
+        return false;
+    }
+    true
+}
+
 pub fn title_from_body(body: &str, fallback: &str) -> String {
     body.lines()
         .find_map(|line| line.strip_prefix("# ").map(str::trim))
@@ -2673,6 +4767,63 @@ mod tests {
         (ticket_id, result_id, check_id)
     }
 
+    fn runtime_with_failed_check_followup() -> (QunuxRuntime, String, String) {
+        let mut runtime = runtime();
+        let ticket = runtime
+            .create_ticket("P000", "Ticket", "# Ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&ticket, TicketClassification::OneGo, "bounded")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Problem, "P000", "doing")
+            .expect("doing");
+        let result = runtime
+            .record_result(&ticket, "Result", "# Result")
+            .expect("result");
+        let check = runtime
+            .check(
+                "P000",
+                CheckStatus::NotSuccess,
+                vec![result],
+                "Check",
+                "# Check",
+                Some(("Follow up".to_string(), "# Follow up".to_string())),
+            )
+            .expect("not success");
+        let followup = runtime.state().checks[&check]
+            .followup_problem_id
+            .clone()
+            .expect("follow-up");
+        (runtime, check, followup)
+    }
+
+    fn runtime_with_user_task_child() -> QunuxRuntime {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: Some("task".to_string()),
+                source: Some("chat".to_string()),
+                summary: "user gave a task".to_string(),
+                payload_ref: Some("turn:task".to_string()),
+                dedupe_key: Some("msg-task".to_string()),
+            })
+            .expect("receive passive event");
+        runtime
+            .create_user_task_from_inbox(
+                "IN000",
+                "User task",
+                "# User task\n\n## Problem\n\nDo the task.\n\n## Success Criteria\n\n- Done.",
+                "actionable user input converted to child problem",
+            )
+            .expect("create user task");
+        runtime.validate().expect("valid user-task child");
+        runtime
+    }
+
     #[test]
     fn runtime_persists_root_state() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2685,6 +4836,127 @@ mod tests {
 
         let loaded = QunuxRuntime::load(context).expect("load");
         assert_eq!(loaded.state().problems["P000"].title, "Root task");
+    }
+
+    #[test]
+    fn default_root_problem_is_process_mission_without_precreated_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let context = RuntimeContext::new(dir.path());
+        let runtime = QunuxRuntime::load_or_init(
+            context,
+            DEFAULT_ROOT_PROBLEM_TITLE,
+            DEFAULT_ROOT_PROBLEM_BODY,
+        )
+        .expect("init");
+
+        let state = runtime.state();
+        assert_eq!(state.problems.len(), 1);
+        assert_eq!(state.root_problem_id, "P000");
+        let root = &state.problems["P000"];
+        assert_eq!(root.title, DEFAULT_ROOT_PROBLEM_TITLE);
+        assert!(root.body.contains("## Problem"));
+        assert!(root.body.contains("## Success Criteria"));
+        assert!(root.body.contains("exactly this root problem"));
+        assert!(root.body.contains("does not pre-create a ticket"));
+        assert!(root.body.contains("headless-first Agent OS process"));
+        assert!(
+            root.body
+                .contains("TUI cockpit, chat transcript, shell, files, tools, timers")
+        );
+        assert!(
+            root.body
+                .contains("lifecycle mission, not an initialization task")
+        );
+        assert!(root.body.contains("park the thread with `qunux.wait`"));
+        assert!(
+            root.body
+                .contains("Keep visible user replies separate from Qunux state mutation")
+        );
+        assert!(
+            root.body
+                .contains("Close this root only for an explicit shutdown/end-of-process request")
+        );
+        assert!(root.ticket_id.is_none());
+        assert!(root.child_problem_ids.is_empty());
+        assert!(root.followup_problem_ids.is_empty());
+        assert!(root.result_ids.is_empty());
+        assert!(root.check_ids.is_empty());
+
+        assert!(state.tickets.is_empty());
+        assert!(state.results.is_empty());
+        assert!(state.checks.is_empty());
+        assert!(state.waits.is_empty());
+        assert!(state.handles.is_empty());
+        assert!(state.passive_events.is_empty());
+        assert!(state.inbox.is_empty());
+        assert!(state.io_events.is_empty());
+
+        let next = runtime.next();
+        assert_eq!(next.action, NextAction::CreateSolutionTicket);
+        assert_eq!(next.disposition, NextDisposition::Runnable);
+        assert_eq!(runtime.state().tickets.len(), 0);
+        assert_eq!(runtime.state().waits.len(), 0);
+    }
+
+    #[test]
+    fn load_or_init_upgrades_legacy_pristine_root_problem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let context = RuntimeContext::new(dir.path());
+        let first = QunuxRuntime::load_or_init(
+            context.clone(),
+            LEGACY_DEFAULT_ROOT_PROBLEM_TITLE,
+            "# Qunux root task\n\n## Problem\n\nOld placeholder.",
+        )
+        .expect("legacy init");
+        assert_eq!(
+            first.state().problems["P000"].title,
+            LEGACY_DEFAULT_ROOT_PROBLEM_TITLE
+        );
+
+        let upgraded = QunuxRuntime::load_or_init(
+            context,
+            DEFAULT_ROOT_PROBLEM_TITLE,
+            DEFAULT_ROOT_PROBLEM_BODY,
+        )
+        .expect("upgrade");
+
+        let root = &upgraded.state().problems["P000"];
+        assert_eq!(root.title, DEFAULT_ROOT_PROBLEM_TITLE);
+        assert!(root.body.contains("This Qunux process exists"));
+        assert!(
+            upgraded
+                .state()
+                .events
+                .iter()
+                .any(|event| event.kind == "root_problem_upgraded")
+        );
+    }
+
+    #[test]
+    fn load_or_init_does_not_upgrade_non_pristine_legacy_root_problem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let context = RuntimeContext::new(dir.path());
+        let mut first = QunuxRuntime::load_or_init(
+            context.clone(),
+            LEGACY_DEFAULT_ROOT_PROBLEM_TITLE,
+            "# Qunux root task\n\n## Problem\n\nOld placeholder.",
+        )
+        .expect("legacy init");
+        first
+            .create_ticket("P000", "Existing work", "# Existing work")
+            .expect("ticket");
+
+        let reloaded = QunuxRuntime::load_or_init(
+            context,
+            DEFAULT_ROOT_PROBLEM_TITLE,
+            DEFAULT_ROOT_PROBLEM_BODY,
+        )
+        .expect("reload");
+
+        assert_eq!(
+            reloaded.state().problems["P000"].title,
+            LEGACY_DEFAULT_ROOT_PROBLEM_TITLE
+        );
     }
 
     #[test]
@@ -2924,6 +5196,163 @@ mod tests {
     }
 
     #[test]
+    fn runtime_spawn_child_from_executing_one_go_ticket() {
+        let mut runtime = runtime();
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&parent_ticket, TicketClassification::OneGo, "bounded")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Problem, "P000", "doing")
+            .expect("parent doing");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "executing")
+            .expect("executing");
+        let child_id = runtime
+            .create_problem_from_ticket_with_mode(
+                "P000",
+                &parent_ticket,
+                TicketChildMode::Spawn,
+                "Runtime child",
+                "# Runtime child",
+            )
+            .expect("spawned child problem");
+
+        let child = &runtime.state().problems[&child_id];
+        assert_eq!(child.created_from_ticket_mode, Some(TicketChildMode::Spawn));
+        let next = runtime.next();
+        assert_eq!(next.action, NextAction::SpawnThread);
+        assert_eq!(next.problem_id.as_deref(), Some(child_id.as_str()));
+
+        let early = runtime
+            .record_result(&parent_ticket, "Parent result", "# Parent result")
+            .expect_err("spawned child still open");
+        assert!(early.to_string().contains("child problems still open"));
+
+        solve_one_go(&mut runtime, &child_id);
+        let parent_result = runtime
+            .record_result(&parent_ticket, "Parent result", "# Parent result")
+            .expect("parent result");
+        runtime
+            .check(
+                "P000",
+                CheckStatus::Success,
+                vec![parent_result],
+                "Parent check",
+                "# Parent check",
+                None,
+            )
+            .expect("parent check");
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn split_and_spawn_child_modes_reject_wrong_ticket_state() {
+        let mut one_go_runtime = runtime();
+        let ticket = one_go_runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        one_go_runtime
+            .classify_ticket(&ticket, TicketClassification::OneGo, "bounded")
+            .expect("classify");
+        one_go_runtime
+            .set_status(EntityKind::Problem, "P000", "doing")
+            .expect("parent doing");
+        one_go_runtime
+            .set_status(EntityKind::Ticket, &ticket, "executing")
+            .expect("executing");
+
+        let wrong_split = one_go_runtime
+            .create_problem_from_ticket_with_mode(
+                "P000",
+                &ticket,
+                TicketChildMode::Split,
+                "Wrong split",
+                "# Wrong split",
+            )
+            .expect_err("one_go ticket cannot create split child");
+        assert!(wrong_split.to_string().contains("not classified as split"));
+
+        let mut split_runtime = runtime();
+        let split_ticket = split_runtime
+            .create_ticket("P000", "Split ticket", "# Split ticket")
+            .expect("ticket");
+        split_runtime
+            .classify_ticket(&split_ticket, TicketClassification::Split, "needs split")
+            .expect("classify");
+        split_runtime
+            .set_status(EntityKind::Problem, "P000", "doing")
+            .expect("parent doing");
+        split_runtime
+            .set_status(EntityKind::Ticket, &split_ticket, "splitting")
+            .expect("splitting");
+        let wrong_spawn = split_runtime
+            .create_problem_from_ticket_with_mode(
+                "P000",
+                &split_ticket,
+                TicketChildMode::Spawn,
+                "Wrong spawn",
+                "# Wrong spawn",
+            )
+            .expect_err("split ticket cannot runtime-spawn child");
+        assert!(wrong_spawn.to_string().contains("not classified as one_go"));
+
+        let child_id = split_runtime
+            .create_problem_from_ticket_with_mode(
+                "P000",
+                &split_ticket,
+                TicketChildMode::Split,
+                "Right split",
+                "# Right split",
+            )
+            .expect("split child");
+        assert_eq!(
+            split_runtime.state().problems[&child_id].created_from_ticket_mode,
+            Some(TicketChildMode::Split)
+        );
+        split_runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn ticket_child_creation_rejects_ticket_from_different_problem() {
+        let mut runtime = runtime();
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("parent ticket");
+        runtime
+            .classify_ticket(&parent_ticket, TicketClassification::Split, "needs child")
+            .expect("classify parent ticket");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "splitting")
+            .expect("parent splitting");
+        let child_id = runtime
+            .create_problem_from_ticket("P000", &parent_ticket, "Child", "# Child")
+            .expect("child problem");
+
+        let child_ticket = runtime
+            .create_ticket(&child_id, "Child ticket", "# Child ticket")
+            .expect("child ticket");
+        runtime
+            .classify_ticket(&child_ticket, TicketClassification::Split, "nested")
+            .expect("classify child ticket");
+        runtime
+            .set_status(EntityKind::Ticket, &child_ticket, "splitting")
+            .expect("child splitting");
+
+        let wrong_parent = runtime
+            .create_problem_from_ticket("P000", &child_ticket, "Wrong", "# Wrong")
+            .expect_err("source ticket must belong to requested parent");
+        assert!(
+            wrong_parent
+                .to_string()
+                .contains("does not belong to problem P000")
+        );
+        runtime.validate().expect("valid after rejected mismatch");
+    }
+
+    #[test]
     fn spawned_child_thread_gets_scoped_next_and_parent_joins() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root_context = RuntimeContext::new(dir.path());
@@ -3016,6 +5445,45 @@ mod tests {
         );
         assert_eq!(parent_runtime.next().action, NextAction::RecordResult);
         parent_runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn parent_cannot_mutate_child_problem_after_spawn_transfer() {
+        let mut runtime = runtime();
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&parent_ticket, TicketClassification::Split, "child")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "splitting")
+            .expect("splitting");
+        let child_id = runtime
+            .create_problem_from_ticket("P000", &parent_ticket, "Child", "# Child")
+            .expect("child");
+        let spawned = runtime
+            .spawn_thread(
+                &child_id,
+                ContextForkPolicy::FullContext,
+                "Solve child",
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("spawn thread");
+
+        assert_eq!(
+            runtime.state().problems[&child_id].owner_thread_id,
+            spawned.thread_id
+        );
+        let parent_write = runtime
+            .create_ticket(&child_id, "Parent write", "# Parent write")
+            .expect_err("parent no longer owns child subtree");
+        assert!(parent_write.to_string().contains("cannot mutate problem"));
+        runtime
+            .validate()
+            .expect("valid after rejected parent write");
     }
 
     #[test]
@@ -3154,6 +5622,80 @@ mod tests {
         }));
         assert!(runtime.state().io_events.iter().any(|event| {
             event.kind == IoEventKind::ChildThreadFailed
+                && event.thread_id.as_deref() == Some(spawned.thread_id.as_str())
+                && event.handle_id.as_deref() == Some(spawned.handle_id.as_str())
+        }));
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn recover_failed_child_thread_returns_subtree_to_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_context = RuntimeContext::new(dir.path());
+        let mut runtime =
+            QunuxRuntime::load_or_init(root_context.clone(), "Root task", "# Root task")
+                .expect("init");
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(
+                &parent_ticket,
+                TicketClassification::Split,
+                "parallel child",
+            )
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "splitting")
+            .expect("splitting");
+        let child_id = runtime
+            .create_problem_from_ticket("P000", &parent_ticket, "Child", "# Child")
+            .expect("child");
+        let spawned = runtime
+            .spawn_thread(
+                &child_id,
+                ContextForkPolicy::FullContext,
+                "Solve child",
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("spawn thread");
+        runtime
+            .record_actor_completed_without_thread_done(&spawned.thread_id, "completed")
+            .expect("record incomplete actor completion");
+        assert_eq!(runtime.next().action, NextAction::RecoverThread);
+
+        let recovered = runtime
+            .recover_thread(&spawned.thread_id)
+            .expect("recover failed child thread");
+
+        assert_eq!(recovered.thread_id, spawned.thread_id);
+        assert_eq!(recovered.root_problem_id, child_id);
+        assert_eq!(
+            runtime.state().threads[&spawned.thread_id].status,
+            ThreadStatus::Recovered
+        );
+        assert_eq!(
+            runtime.state().handles[&spawned.handle_id].status,
+            IoHandleStatus::Cancelled
+        );
+        assert_eq!(
+            runtime.state().waits[&spawned.wait_id].status,
+            WaitStatus::Consumed
+        );
+        assert_eq!(
+            runtime.state().problems[&recovered.root_problem_id].owner_thread_id,
+            DEFAULT_THREAD_ID
+        );
+        let next = runtime.next();
+        assert_eq!(next.action, NextAction::SpawnThread);
+        assert_eq!(
+            next.problem_id.as_deref(),
+            Some(recovered.root_problem_id.as_str())
+        );
+        assert!(runtime.state().io_events.iter().any(|event| {
+            event.kind == IoEventKind::ChildThreadRecovered
                 && event.thread_id.as_deref() == Some(spawned.thread_id.as_str())
                 && event.handle_id.as_deref() == Some(spawned.handle_id.as_str())
         }));
@@ -3357,6 +5899,73 @@ mod tests {
     }
 
     #[test]
+    fn thread_actor_route_reports_current_and_bound_child_actor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_context =
+            RuntimeContext::for_session(dir.path(), "parent-session").expect("root context");
+        let mut runtime =
+            QunuxRuntime::load_or_init(root_context.clone(), "Root task", "# Root task")
+                .expect("init");
+
+        let current_route = runtime
+            .thread_actor_route(DEFAULT_THREAD_ID)
+            .expect("current route");
+        assert!(current_route.is_current_thread);
+        assert_eq!(current_route.bound_actor_id(), Some("parent-session"));
+
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&parent_ticket, TicketClassification::Split, "child actor")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "splitting")
+            .expect("splitting");
+        let child_id = runtime
+            .create_problem_from_ticket("P000", &parent_ticket, "Child", "# Child")
+            .expect("child");
+        let spawned = runtime
+            .spawn_thread(
+                &child_id,
+                ContextForkPolicy::FullContext,
+                "Solve child",
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("spawn thread");
+
+        let unbound_child_route = runtime
+            .thread_actor_route(&spawned.thread_id)
+            .expect("unbound child route");
+        assert!(!unbound_child_route.is_current_thread);
+        assert_eq!(unbound_child_route.bound_actor_id(), None);
+
+        runtime
+            .bind_thread_actor(&spawned.thread_id, "child-session")
+            .expect("bind child actor");
+        let child_route = runtime
+            .thread_actor_route(&spawned.thread_id)
+            .expect("bound child route");
+        assert!(!child_route.is_current_thread);
+        assert_eq!(
+            child_route.actor_session_id.as_deref(),
+            Some("child-session")
+        );
+        assert_eq!(
+            child_route.codex_thread_id.as_deref(),
+            Some("child-session")
+        );
+        assert_eq!(child_route.bound_actor_id(), Some("child-session"));
+
+        let missing = runtime
+            .thread_actor_route("QT999")
+            .expect_err("missing thread");
+        assert!(missing.to_string().contains("unknown thread QT999"));
+    }
+
+    #[test]
     fn followup_must_close_before_parent_success() {
         let mut runtime = runtime();
         let (_ticket_id, root_result, _check_id) = {
@@ -3415,6 +6024,116 @@ mod tests {
     }
 
     #[test]
+    fn check_status_enforces_followup_payload_rules() {
+        let mut runtime = runtime();
+        let ticket = runtime
+            .create_ticket("P000", "Ticket", "# Ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&ticket, TicketClassification::OneGo, "bounded")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Problem, "P000", "doing")
+            .expect("doing");
+        let result = runtime
+            .record_result(&ticket, "Result", "# Result")
+            .expect("result");
+
+        let success_with_followup = runtime
+            .check(
+                "P000",
+                CheckStatus::Success,
+                vec![result.clone()],
+                "Check",
+                "# Check",
+                Some((
+                    "Impossible follow-up".to_string(),
+                    "# Follow-up".to_string(),
+                )),
+            )
+            .expect_err("success cannot create follow-up");
+        assert!(
+            success_with_followup
+                .to_string()
+                .contains("success check cannot include a follow-up")
+        );
+
+        let missing_followup = runtime
+            .check(
+                "P000",
+                CheckStatus::NotSuccess,
+                vec![result],
+                "Check",
+                "# Check",
+                None,
+            )
+            .expect_err("not_success requires follow-up");
+        assert!(
+            missing_followup
+                .to_string()
+                .contains("not_success check requires a follow-up problem")
+        );
+        assert!(runtime.state().problems["P000"].check_ids.is_empty());
+        runtime.validate().expect("valid after rejected checks");
+    }
+
+    #[test]
+    fn validate_rejects_broken_followup_check_provenance() {
+        let (runtime, _check, followup) = runtime_with_failed_check_followup();
+        assert_eq!(
+            runtime.state().problems[&followup]
+                .created_from_check_id
+                .as_deref(),
+            Some("C000")
+        );
+        runtime.validate().expect("valid follow-up provenance");
+
+        let (mut missing_backlink, _check, followup) = runtime_with_failed_check_followup();
+        missing_backlink
+            .state_mut()
+            .problems
+            .get_mut(&followup)
+            .expect("followup")
+            .created_from_check_id = None;
+        let missing_backlink_error = missing_backlink
+            .validate()
+            .expect_err("missing follow-up backlink");
+        assert!(
+            missing_backlink_error
+                .to_string()
+                .contains("the follow-up does not point back")
+        );
+
+        let (mut missing_followup, check, _followup) = runtime_with_failed_check_followup();
+        missing_followup
+            .state_mut()
+            .checks
+            .get_mut(&check)
+            .expect("check")
+            .followup_problem_id = None;
+        let missing_followup_error = missing_followup
+            .validate()
+            .expect_err("not_success must point to follow-up");
+        assert!(
+            missing_followup_error
+                .to_string()
+                .contains("has no follow-up problem")
+        );
+
+        let (mut wrong_status, check, _followup) = runtime_with_failed_check_followup();
+        wrong_status
+            .state_mut()
+            .checks
+            .get_mut(&check)
+            .expect("check")
+            .status = CheckStatus::Success;
+        let wrong_status_error = wrong_status
+            .validate()
+            .expect_err("follow-up source check must be not_success");
+        assert!(wrong_status_error.to_string().contains("success check"));
+    }
+
+    #[test]
     fn guards_duplicate_ticket_and_done_reopen() {
         let mut runtime = runtime();
         let (ticket_id, _result_id, _check_id) = solve_one_go(&mut runtime, "P000");
@@ -3433,5 +6152,1151 @@ mod tests {
             .record_result(&ticket_id, "Again", "# Again")
             .expect_err("ticket already done");
         assert!(second_result.to_string().contains("done problem"));
+    }
+
+    #[test]
+    fn passive_unmatched_event_is_preserved_in_inbox() {
+        let mut runtime = runtime();
+
+        let receipt = runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: Some("reply".to_string()),
+                source: Some("chat".to_string()),
+                summary: "user replied".to_string(),
+                payload_ref: Some("turn:1".to_string()),
+                dedupe_key: Some("msg-1".to_string()),
+            })
+            .expect("receive passive event");
+
+        assert_eq!(receipt.status, PassiveEventStatus::Inboxed);
+        assert_eq!(receipt.wake_decision.status, PassiveEventStatus::Inboxed);
+        assert!(receipt.wake_decision.runnable_threads.is_empty());
+        assert_eq!(runtime.state().passive_events.len(), 1);
+        assert_eq!(
+            runtime.state().passive_events[0].event_key.as_ref(),
+            Some(&EventKey::passive(
+                PassiveEventKind::UserInput,
+                Some("reply".to_string()),
+                Some("chat".to_string()),
+                Some(DEFAULT_THREAD_ID.to_string())
+            ))
+        );
+        assert_eq!(runtime.state().inbox.len(), 1);
+        assert_eq!(
+            runtime.state().inbox[0].event_key,
+            runtime.state().passive_events[0].event_key
+        );
+        assert_eq!(runtime.state().inbox[0].condition.as_deref(), Some("reply"));
+        assert_eq!(runtime.state().inbox[0].source.as_deref(), Some("chat"));
+        assert_eq!(
+            runtime.state().inbox[0].payload_ref.as_deref(),
+            Some("turn:1")
+        );
+        assert_eq!(
+            runtime.state().inbox[0].dedupe_key.as_deref(),
+            Some("msg-1")
+        );
+        assert_eq!(runtime.status().pending_inbox_items, 1);
+        let next = runtime.next();
+        assert_eq!(next.action, NextAction::HandleInbox);
+        assert_eq!(next.disposition, NextDisposition::Runnable);
+        assert!(next.instruction.contains("IN000"));
+        assert!(next.instruction.contains("user replied"));
+        assert!(next.instruction.contains("qunux.scaffold_user_task"));
+        assert!(next.instruction.contains("qunux.ingest_user_task"));
+        assert!(
+            next.instruction
+                .contains("ticket must be authored separately")
+        );
+        assert!(next.instruction.contains("actionable work"));
+        assert!(next.instruction.contains("pure small talk"));
+        assert!(next.instruction.contains("state-only"));
+        assert!(next.instruction.contains("not visible to the user"));
+        assert!(
+            next.instruction
+                .contains("emit any needed visible assistant reply")
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn acknowledged_inbox_item_is_not_runnable_again() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: None,
+                summary: "user gave a new task".to_string(),
+                payload_ref: Some("turn:1".to_string()),
+                dedupe_key: Some("msg-1".to_string()),
+            })
+            .expect("receive passive event");
+        assert_eq!(runtime.next().action, NextAction::HandleInbox);
+
+        let item = runtime
+            .acknowledge_inbox_item("IN000", "converted into current response")
+            .expect("ack inbox");
+        assert_eq!(item.status, PassiveEventStatus::Handled);
+        assert_eq!(item.payload_ref.as_deref(), Some("turn:1"));
+        assert_eq!(item.dedupe_key.as_deref(), Some("msg-1"));
+        assert_eq!(
+            runtime.state().passive_events[0].status,
+            PassiveEventStatus::Handled
+        );
+        assert_eq!(runtime.status().pending_inbox_items, 0);
+        assert_eq!(runtime.next().action, NextAction::CreateSolutionTicket);
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn create_user_task_from_inbox_creates_child_problem() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: Some("chat".to_string()),
+                summary: "user asked for code review".to_string(),
+                payload_ref: Some("turn:review".to_string()),
+                dedupe_key: Some("msg-review".to_string()),
+            })
+            .expect("receive passive event");
+
+        let created = runtime
+            .create_user_task_from_inbox(
+                "IN000",
+                "Review requested code",
+                "# Review requested code\n\n## Problem\n\nReview the code.\n\n## Success Criteria\n\n- Findings are clear.",
+                "actionable user input converted to a child problem",
+            )
+            .expect("create user task");
+
+        assert_eq!(created.problem_id, "P001");
+        assert_eq!(created.parent_problem_id, "P000");
+        assert_eq!(created.inbox_item_id, "IN000");
+        assert_eq!(created.passive_event_id, "PE000");
+        assert_eq!(created.source_kind, PassiveEventKind::UserInput);
+        let problem = &runtime.state().problems["P001"];
+        assert_eq!(problem.parent_id.as_deref(), Some("P000"));
+        assert_eq!(problem.owner_thread_id, DEFAULT_THREAD_ID);
+        assert_eq!(
+            problem.created_from_passive_event_id.as_deref(),
+            Some("PE000")
+        );
+        assert_eq!(problem.created_from_inbox_item_id.as_deref(), Some("IN000"));
+        assert_eq!(
+            problem.created_from_user_task_kind,
+            Some(PassiveEventKind::UserInput)
+        );
+        assert!(
+            runtime.state().problems["P000"]
+                .child_problem_ids
+                .contains(&"P001".to_string())
+        );
+        assert_eq!(runtime.state().inbox[0].status, PassiveEventStatus::Handled);
+        assert_eq!(
+            runtime.state().passive_events[0].status,
+            PassiveEventStatus::Handled
+        );
+        assert_eq!(runtime.next().action, NextAction::SpawnThread);
+        assert_eq!(runtime.next().problem_id.as_deref(), Some("P001"));
+    }
+
+    #[test]
+    fn create_user_task_from_inbox_creates_valid_child_problem() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: Some("chat".to_string()),
+                summary: "user asked for implementation".to_string(),
+                payload_ref: Some("turn:impl".to_string()),
+                dedupe_key: Some("msg-impl".to_string()),
+            })
+            .expect("receive passive event");
+
+        runtime
+            .create_user_task_from_inbox(
+                "IN000",
+                "Implement requested change",
+                "# Implement requested change\n\n## Problem\n\nImplement it.\n\n## Success Criteria\n\n- Change is done.",
+                "actionable user input converted to child problem",
+            )
+            .expect("create user task");
+
+        runtime.validate().expect("valid user-task provenance");
+    }
+
+    #[test]
+    fn scaffold_user_task_from_inbox_creates_problem_and_ticket() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: Some("chat".to_string()),
+                summary: "user asked for implementation".to_string(),
+                payload_ref: Some("turn:impl".to_string()),
+                dedupe_key: Some("msg-impl".to_string()),
+            })
+            .expect("receive passive event");
+
+        let scaffold = runtime
+            .scaffold_user_task_from_inbox(
+                "IN000",
+                "Implement requested change",
+                "# Implement requested change\n\n## Problem\n\nImplement it.\n\n## Success Criteria\n\n- Change is done.",
+                "Solve requested change",
+                "# Solve requested change\n\n## Problem Definition\n\nImplement the requested change.\n\n## Proposed Solution\n\nInvestigate, edit, and verify.\n\n## Acceptance Criteria\n\n- Criteria are satisfied.\n\n## Verification Plan\n\nRun focused checks.\n\n## Risks\n\n- Hidden gaps.\n\n## Assumptions\n\n- Request is actionable.",
+                "actionable user input scaffolded into ledger-backed task",
+            )
+            .expect("scaffold user task");
+
+        assert_eq!(scaffold.problem_id, "P001");
+        assert_eq!(scaffold.parent_problem_id, "P000");
+        assert_eq!(scaffold.ticket_id, "T000");
+        assert_eq!(scaffold.inbox_item_id.as_deref(), Some("IN000"));
+        assert_eq!(scaffold.passive_event_id.as_deref(), Some("PE000"));
+        assert_eq!(scaffold.source_kind, Some(PassiveEventKind::UserInput));
+
+        let problem = &runtime.state().problems["P001"];
+        assert_eq!(problem.ticket_id.as_deref(), Some("T000"));
+        assert_eq!(
+            problem.created_from_passive_event_id.as_deref(),
+            Some("PE000")
+        );
+        assert_eq!(problem.created_from_inbox_item_id.as_deref(), Some("IN000"));
+        assert_eq!(
+            problem.created_from_user_task_kind,
+            Some(PassiveEventKind::UserInput)
+        );
+
+        let ticket = &runtime.state().tickets["T000"];
+        assert_eq!(ticket.problem_id, "P001");
+        assert_eq!(ticket.status, TicketStatus::Defined);
+        assert_eq!(ticket.classification, None);
+        assert_eq!(ticket.result_id, None);
+        assert_eq!(runtime.state().results.len(), 0);
+        assert_eq!(runtime.state().checks.len(), 0);
+        assert_eq!(runtime.state().inbox[0].status, PassiveEventStatus::Handled);
+        assert_eq!(runtime.next().action, NextAction::SpawnThread);
+        assert_eq!(runtime.next().problem_id.as_deref(), Some("P001"));
+        runtime.validate().expect("valid scaffolded task");
+    }
+
+    #[test]
+    fn scaffold_user_task_from_inbox_rejects_already_handled_item() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: None,
+                summary: "user gave a task".to_string(),
+                payload_ref: Some("turn:task".to_string()),
+                dedupe_key: Some("msg-task".to_string()),
+            })
+            .expect("receive passive event");
+        runtime
+            .acknowledge_inbox_item("IN000", "handled conversationally")
+            .expect("ack inbox");
+
+        let err = runtime
+            .scaffold_user_task_from_inbox(
+                "IN000",
+                "Duplicate task",
+                "# Duplicate task",
+                "Duplicate ticket",
+                "# Duplicate ticket",
+                "duplicate",
+            )
+            .expect_err("handled inbox item should not scaffold task");
+
+        assert!(err.to_string().contains("not inboxed"));
+        assert_eq!(runtime.state().problems.len(), 1);
+        assert_eq!(runtime.state().tickets.len(), 0);
+        runtime.validate().expect("valid after rejected scaffold");
+    }
+
+    #[test]
+    fn create_user_task_from_inbox_rejects_already_handled_item() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: None,
+                summary: "user gave a task".to_string(),
+                payload_ref: Some("turn:task".to_string()),
+                dedupe_key: Some("msg-task".to_string()),
+            })
+            .expect("receive passive event");
+        runtime
+            .acknowledge_inbox_item("IN000", "handled conversationally")
+            .expect("ack inbox");
+        let before_problem_count = runtime.state().problems.len();
+
+        let err = runtime
+            .create_user_task_from_inbox("IN000", "Duplicate task", "# Duplicate", "duplicate")
+            .expect_err("handled inbox item should not create task");
+
+        assert!(err.to_string().contains("not inboxed"));
+        assert_eq!(runtime.state().problems.len(), before_problem_count);
+        assert!(
+            runtime.state().problems["P000"]
+                .child_problem_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn create_user_task_from_inbox_rejects_unknown_inbox_item() {
+        let mut runtime = runtime();
+        let before_problem_count = runtime.state().problems.len();
+
+        let err = runtime
+            .create_user_task_from_inbox("IN404", "Unknown inbox task", "# Unknown", "unknown")
+            .expect_err("unknown inbox item should not create task");
+
+        assert!(err.to_string().contains("unknown inbox item IN404"));
+        assert_eq!(runtime.state().problems.len(), before_problem_count);
+        assert!(
+            runtime.state().problems["P000"]
+                .child_problem_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn create_user_task_from_inbox_rejects_mismatched_passive_event() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: Some("task".to_string()),
+                source: Some("chat".to_string()),
+                summary: "user gave a task".to_string(),
+                payload_ref: Some("turn:task".to_string()),
+                dedupe_key: Some("msg-task".to_string()),
+            })
+            .expect("receive passive event");
+        runtime.state.inbox[0].source = Some("other-channel".to_string());
+        let before_problem_count = runtime.state().problems.len();
+
+        let err = runtime
+            .create_user_task_from_inbox("IN000", "Mismatched task", "# Mismatched", "mismatch")
+            .expect_err("mismatched inbox item should not create task");
+
+        assert!(
+            err.to_string()
+                .contains("does not match passive event PE000")
+        );
+        assert_eq!(runtime.state().problems.len(), before_problem_count);
+        assert!(
+            runtime.state().problems["P000"]
+                .child_problem_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn create_user_task_from_inbox_rejects_missing_passive_event() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: None,
+                summary: "user gave a task".to_string(),
+                payload_ref: Some("turn:task".to_string()),
+                dedupe_key: Some("msg-task".to_string()),
+            })
+            .expect("receive passive event");
+        runtime.state.inbox[0].passive_event_id = "PE999".to_string();
+        let before_problem_count = runtime.state().problems.len();
+
+        let err = runtime
+            .create_user_task_from_inbox("IN000", "Missing event task", "# Missing", "missing")
+            .expect_err("missing passive event should not create task");
+
+        assert!(err.to_string().contains("unknown passive event PE999"));
+        assert_eq!(runtime.state().problems.len(), before_problem_count);
+        assert!(
+            runtime.state().problems["P000"]
+                .child_problem_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_user_task_missing_passive_event_provenance() {
+        let mut runtime = runtime_with_user_task_child();
+        runtime
+            .state
+            .problems
+            .get_mut("P001")
+            .expect("child")
+            .created_from_passive_event_id = None;
+
+        let err = runtime.validate().expect_err("missing passive event");
+
+        assert!(err.to_string().contains("missing passive event"));
+    }
+
+    #[test]
+    fn validate_rejects_user_task_missing_inbox_item_provenance() {
+        let mut runtime = runtime_with_user_task_child();
+        runtime
+            .state
+            .problems
+            .get_mut("P001")
+            .expect("child")
+            .created_from_inbox_item_id = None;
+
+        let err = runtime.validate().expect_err("missing inbox item");
+
+        assert!(err.to_string().contains("missing inbox item"));
+    }
+
+    #[test]
+    fn validate_rejects_user_task_mismatched_source_kind() {
+        let mut runtime = runtime_with_user_task_child();
+        runtime
+            .state
+            .problems
+            .get_mut("P001")
+            .expect("child")
+            .created_from_user_task_kind = Some(PassiveEventKind::Timer);
+
+        let err = runtime.validate().expect_err("mismatched source kind");
+
+        assert!(
+            err.to_string()
+                .contains("does not match passive event kind")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_user_task_mismatched_inbox_event_pair() {
+        let mut runtime = runtime_with_user_task_child();
+        runtime.state.inbox[0].passive_event_id = "PE999".to_string();
+
+        let err = runtime.validate().expect_err("mismatched inbox event");
+
+        assert!(err.to_string().contains("points to PE999"));
+    }
+
+    #[test]
+    fn validate_rejects_unprovenanced_child_problem() {
+        let mut runtime = runtime_with_user_task_child();
+        let child = runtime.state.problems.get_mut("P001").expect("child");
+        child.created_from_passive_event_id = None;
+        child.created_from_inbox_item_id = None;
+        child.created_from_user_task_kind = None;
+
+        let err = runtime.validate().expect_err("unprovenanced child");
+
+        assert!(
+            err.to_string()
+                .contains("has no ticket, check, or user-task provenance")
+        );
+    }
+
+    #[test]
+    fn terminal_thread_with_pending_inbox_is_not_reported_as_none() {
+        let mut runtime = runtime();
+        let ticket = runtime
+            .create_ticket("P000", "Root ticket", "# Ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&ticket, TicketClassification::OneGo, "small")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Problem, "P000", "doing")
+            .expect("problem doing");
+        runtime
+            .set_status(EntityKind::Ticket, &ticket, "executing")
+            .expect("ticket executing");
+        let result = runtime
+            .record_result(&ticket, "Root result", "# Result")
+            .expect("result");
+        runtime
+            .check(
+                "P000",
+                CheckStatus::Success,
+                vec![result],
+                "Root check",
+                "# Check",
+                None,
+            )
+            .expect("check");
+        assert_eq!(runtime.next().action, NextAction::None);
+
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: None,
+                source: None,
+                summary: "user returned after terminal root".to_string(),
+                payload_ref: Some("turn:terminal".to_string()),
+                dedupe_key: Some("terminal-msg".to_string()),
+            })
+            .expect("receive passive event");
+
+        let next = runtime.next();
+        assert_eq!(next.action, NextAction::HandleInbox);
+        assert_eq!(next.disposition, NextDisposition::Runnable);
+        assert!(
+            next.instruction
+                .contains("user returned after terminal root")
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn passive_duplicate_wake_is_idempotent() {
+        let mut runtime = runtime();
+        let input = PassiveEventInput {
+            kind: PassiveEventKind::ExternalSignal,
+            event_key: None,
+            target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+            condition: Some("deploy".to_string()),
+            source: Some("webhook".to_string()),
+            summary: "deploy finished".to_string(),
+            payload_ref: None,
+            dedupe_key: Some("signal-1".to_string()),
+        };
+
+        let first = runtime
+            .receive_passive_event(input.clone())
+            .expect("first event");
+        let second = runtime.receive_passive_event(input).expect("duplicate");
+
+        assert_eq!(first.status, PassiveEventStatus::Inboxed);
+        assert_eq!(second.status, PassiveEventStatus::Duplicate);
+        assert_eq!(second.wake_decision.status, PassiveEventStatus::Duplicate);
+        assert_eq!(
+            second.wake_decision.duplicate_of_event_id.as_deref(),
+            Some(first.event_id.as_str())
+        );
+        assert_eq!(
+            second.duplicate_of_event_id.as_deref(),
+            Some(first.event_id.as_str())
+        );
+        assert_eq!(runtime.state().passive_events.len(), 1);
+        assert_eq!(runtime.state().inbox.len(), 1);
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn passive_matched_event_wakes_waiting_thread() {
+        let mut runtime = runtime();
+        let wait = runtime
+            .wait_for_user_input(
+                Some("reply".to_string()),
+                Some("chat".to_string()),
+                None,
+                "need user reply",
+            )
+            .expect("wait for input");
+
+        assert_eq!(wait.status, WaitStatus::Waiting);
+        assert_eq!(
+            wait.event_key,
+            EventKey::passive(
+                PassiveEventKind::UserInput,
+                Some("reply".to_string()),
+                Some("chat".to_string()),
+                Some(DEFAULT_THREAD_ID.to_string())
+            )
+        );
+        assert_eq!(runtime.next().action, NextAction::WaitIo);
+        assert_eq!(
+            runtime.state().threads[DEFAULT_THREAD_ID].status,
+            ThreadStatus::WaitingIo
+        );
+
+        let receipt = runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: Some("reply".to_string()),
+                source: Some("chat".to_string()),
+                summary: "user replied".to_string(),
+                payload_ref: Some("turn:2".to_string()),
+                dedupe_key: Some("msg-2".to_string()),
+            })
+            .expect("receive matching event");
+
+        assert_eq!(receipt.status, PassiveEventStatus::Matched);
+        assert_eq!(receipt.matched_handle_ids, vec![wait.handle_id.clone()]);
+        assert_eq!(receipt.wake_decision.status, PassiveEventStatus::Matched);
+        assert_eq!(
+            receipt.wake_decision.runnable_threads,
+            vec![RunnableThread {
+                thread_id: DEFAULT_THREAD_ID.to_string(),
+                root_problem_id: "P000".to_string(),
+                wake_reason: format!("handle {} ready", wait.handle_id),
+            }]
+        );
+        assert_eq!(
+            runtime.state().handles[&wait.handle_id].status,
+            IoHandleStatus::Ready
+        );
+        assert_eq!(
+            runtime.state().waits[&wait.wait_id].status,
+            WaitStatus::Ready
+        );
+        assert_eq!(
+            runtime.state().threads[DEFAULT_THREAD_ID].status,
+            ThreadStatus::Running
+        );
+        assert_ne!(runtime.next().action, NextAction::WaitIo);
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn bare_lifecycle_root_can_wait_for_user_input() {
+        let mut runtime = runtime();
+        let wait = runtime
+            .wait_for_user_input(None, Some("chat".to_string()), None, "idle for user input")
+            .expect("bare lifecycle root should be allowed to park");
+
+        assert_eq!(wait.status, WaitStatus::Waiting);
+        assert_eq!(runtime.next().action, NextAction::WaitIo);
+        assert_eq!(
+            runtime.state().threads[DEFAULT_THREAD_ID].status,
+            ThreadStatus::WaitingIo
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn wait_rejects_when_ticket_is_defined() {
+        let mut runtime = runtime();
+        let ticket_id = runtime
+            .create_ticket("P000", "Root ticket", "# Ticket\n\nBody")
+            .expect("ticket");
+
+        let err = runtime
+            .wait_for_user_input(None, Some("chat".to_string()), None, "idle despite work")
+            .expect_err("runnable ticket should block wait");
+
+        assert!(
+            err.to_string()
+                .contains("cannot wait while runnable action")
+                && err.to_string().contains("ClassifyTicket"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            runtime.state().threads[DEFAULT_THREAD_ID].status,
+            ThreadStatus::Running
+        );
+        assert_eq!(runtime.next().action, NextAction::ClassifyTicket);
+        assert_eq!(
+            runtime.next().ticket_id.as_deref(),
+            Some(ticket_id.as_str())
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn next_surfaces_defined_ticket_before_stale_wait_io() {
+        let mut runtime = runtime();
+        let wait = runtime
+            .wait_for_user_input(None, Some("chat".to_string()), None, "idle for user input")
+            .expect("bare lifecycle root should be allowed to park");
+        assert_eq!(runtime.next().action, NextAction::WaitIo);
+
+        let ticket_id = runtime
+            .create_ticket("P000", "Root ticket", "# Ticket\n\nBody")
+            .expect("ticket");
+
+        let next = runtime.next();
+        assert_eq!(next.action, NextAction::ClassifyTicket);
+        assert_eq!(next.ticket_id.as_deref(), Some(ticket_id.as_str()));
+        assert_eq!(
+            runtime.state().waits[&wait.wait_id].status,
+            WaitStatus::Waiting
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn unified_wait_parks_wakes_and_consumes_passive_handle() {
+        let mut runtime = runtime();
+        let parked = runtime
+            .wait(WaitCommand::Park {
+                mode: WaitMode::All,
+                reason: "need chat reply".to_string(),
+                specs: vec![WaitSpec {
+                    kind: WaitSpecKind::UserInput,
+                    event_key: None,
+                    target_thread_id: None,
+                    condition: Some("reply".to_string()),
+                    source: Some("chat".to_string()),
+                    dedupe_key: Some("wait-reply".to_string()),
+                }],
+            })
+            .expect("park wait");
+        let WaitResult::Parked { wait } = parked else {
+            panic!("expected parked wait");
+        };
+        assert_eq!(wait.status, WaitStatus::Waiting);
+        let handle_id = wait.handle_ids[0].clone();
+        assert_eq!(runtime.next().action, NextAction::WaitIo);
+
+        let woke = runtime
+            .wait(WaitCommand::Wake {
+                event: PassiveEventInput {
+                    kind: PassiveEventKind::UserInput,
+                    event_key: None,
+                    target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                    condition: Some("reply".to_string()),
+                    source: Some("chat".to_string()),
+                    summary: "user replied".to_string(),
+                    payload_ref: Some("turn:42".to_string()),
+                    dedupe_key: Some("wait-reply".to_string()),
+                },
+            })
+            .expect("wake wait");
+        let WaitResult::Woke { receipt } = woke else {
+            panic!("expected wake receipt");
+        };
+        assert_eq!(receipt.status, PassiveEventStatus::Matched);
+        assert_eq!(receipt.matched_handle_ids, vec![handle_id.clone()]);
+
+        let consumed = runtime
+            .wait(WaitCommand::Consume {
+                handle_id: handle_id.clone(),
+            })
+            .expect("consume wait");
+        let WaitResult::Consumed { consumed } = consumed else {
+            panic!("expected consumed wait");
+        };
+        assert_eq!(consumed.handle_id, handle_id);
+        assert_eq!(consumed.payload_ref.as_deref(), Some("turn:42"));
+        assert_eq!(consumed.joined_thread, None);
+        assert_eq!(
+            runtime.state().handles[&consumed.handle_id].status,
+            IoHandleStatus::Consumed
+        );
+        assert_eq!(
+            runtime.state().waits[&consumed.wait_id].status,
+            WaitStatus::Consumed
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn unified_wait_cancels_pending_passive_handle() {
+        let mut runtime = runtime();
+        let parked = runtime
+            .wait(WaitCommand::Park {
+                mode: WaitMode::All,
+                reason: "wait for timer".to_string(),
+                specs: vec![WaitSpec {
+                    kind: WaitSpecKind::Timer,
+                    event_key: None,
+                    target_thread_id: None,
+                    condition: Some("poll-window".to_string()),
+                    source: Some("timer".to_string()),
+                    dedupe_key: None,
+                }],
+            })
+            .expect("park wait");
+        let WaitResult::Parked { wait } = parked else {
+            panic!("expected parked wait");
+        };
+        let handle_id = wait.handle_ids[0].clone();
+
+        let cancelled = runtime
+            .wait(WaitCommand::Cancel {
+                handle_id: handle_id.clone(),
+                reason: "no longer needed".to_string(),
+            })
+            .expect("cancel wait");
+        let WaitResult::Cancelled { cancelled } = cancelled else {
+            panic!("expected cancelled wait");
+        };
+        assert_eq!(cancelled.handle_id, handle_id);
+        assert_eq!(
+            runtime.state().handles[&cancelled.handle_id].status,
+            IoHandleStatus::Cancelled
+        );
+        assert_eq!(
+            runtime.state().threads[DEFAULT_THREAD_ID].status,
+            ThreadStatus::Running
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn unified_wait_any_consume_cancels_sibling_handles() {
+        let mut runtime = runtime();
+        let parked = runtime
+            .wait(WaitCommand::Park {
+                mode: WaitMode::Any,
+                reason: "wait for either signal".to_string(),
+                specs: vec![
+                    WaitSpec {
+                        kind: WaitSpecKind::Timer,
+                        event_key: None,
+                        target_thread_id: None,
+                        condition: Some("timer-window".to_string()),
+                        source: Some("timer".to_string()),
+                        dedupe_key: None,
+                    },
+                    WaitSpec {
+                        kind: WaitSpecKind::ExternalSignal,
+                        event_key: None,
+                        target_thread_id: None,
+                        condition: Some("webhook-ready".to_string()),
+                        source: Some("webhook".to_string()),
+                        dedupe_key: None,
+                    },
+                ],
+            })
+            .expect("park any wait");
+        let WaitResult::Parked { wait } = parked else {
+            panic!("expected parked wait");
+        };
+        let timer_handle = wait.handle_ids[0].clone();
+        let webhook_handle = wait.handle_ids[1].clone();
+        runtime
+            .wait(WaitCommand::Wake {
+                event: PassiveEventInput {
+                    kind: PassiveEventKind::Timer,
+                    event_key: None,
+                    target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                    condition: Some("timer-window".to_string()),
+                    source: Some("timer".to_string()),
+                    summary: "timer fired".to_string(),
+                    payload_ref: None,
+                    dedupe_key: None,
+                },
+            })
+            .expect("wake timer handle");
+
+        runtime
+            .wait(WaitCommand::Consume {
+                handle_id: timer_handle.clone(),
+            })
+            .expect("consume any winner");
+
+        assert_eq!(
+            runtime.state().handles[&timer_handle].status,
+            IoHandleStatus::Consumed
+        );
+        assert_eq!(
+            runtime.state().handles[&webhook_handle].status,
+            IoHandleStatus::Cancelled
+        );
+        assert_eq!(
+            runtime.state().waits[&wait.wait_id].status,
+            WaitStatus::Consumed
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn passive_generic_event_key_wait_matches_exact_key() {
+        let mut runtime = runtime();
+        let event_key = EventKey::new(
+            "github.pr.checks",
+            Some("123".to_string()),
+            Some("webhook".to_string()),
+            None,
+        );
+        let wait = runtime
+            .wait_for_event_key(
+                event_key.clone(),
+                Some("github-pr-123-checks".to_string()),
+                "wait for PR checks",
+            )
+            .expect("wait for event key");
+
+        assert_eq!(
+            runtime.state().handles[&wait.handle_id].event_key.as_ref(),
+            Some(&event_key)
+        );
+
+        let receipt = runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::ExternalSignal,
+                event_key: Some(event_key.clone()),
+                target_thread_id: None,
+                condition: None,
+                source: None,
+                summary: "PR checks passed".to_string(),
+                payload_ref: Some("github:pr:123".to_string()),
+                dedupe_key: Some("github-pr-123-checks".to_string()),
+            })
+            .expect("receive matching event key");
+
+        assert_eq!(receipt.status, PassiveEventStatus::Matched);
+        assert_eq!(receipt.matched_handle_ids, vec![wait.handle_id.clone()]);
+        assert_eq!(receipt.wake_decision.event_key, event_key);
+        assert_eq!(
+            receipt.wake_decision.runnable_threads[0].thread_id,
+            DEFAULT_THREAD_ID
+        );
+        assert_eq!(
+            runtime.state().handles[&wait.handle_id].status,
+            IoHandleStatus::Ready
+        );
+        runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn unified_wait_consumes_child_thread_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_context = RuntimeContext::new(dir.path());
+        let mut runtime =
+            QunuxRuntime::load_or_init(root_context.clone(), "Root task", "# Root task")
+                .expect("init");
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&parent_ticket, TicketClassification::Split, "needs child")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "splitting")
+            .expect("splitting");
+        let child_id = runtime
+            .create_problem_from_ticket("P000", &parent_ticket, "Child", "# Child")
+            .expect("child");
+        let spawned = runtime
+            .spawn_thread(
+                &child_id,
+                ContextForkPolicy::FullContext,
+                "Solve child",
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("spawn");
+
+        let child_context =
+            RuntimeContext::with_ids(dir.path(), DEFAULT_PROCESS_ID, &spawned.thread_id)
+                .expect("child context");
+        let mut child_runtime = QunuxRuntime::load(child_context).expect("child load");
+        solve_one_go(&mut child_runtime, &child_id);
+
+        let mut parent_runtime = QunuxRuntime::load(root_context).expect("parent reload");
+        let consumed = parent_runtime
+            .wait(WaitCommand::Consume {
+                handle_id: spawned.handle_id.clone(),
+            })
+            .expect("consume child wait");
+        let WaitResult::Consumed { consumed } = consumed else {
+            panic!("expected consumed child wait");
+        };
+        let joined = consumed.joined_thread.expect("joined child thread");
+        assert_eq!(joined.thread_id, spawned.thread_id);
+        assert_eq!(joined.handle_id, spawned.handle_id);
+        assert_eq!(
+            parent_runtime.state().threads[&spawned.thread_id]
+                .joined_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            parent_runtime.state().handles[&spawned.handle_id].status,
+            IoHandleStatus::Consumed
+        );
+        parent_runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn passive_broad_event_does_not_wake_child_scoped_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_context = RuntimeContext::new(dir.path());
+        let mut runtime =
+            QunuxRuntime::load_or_init(root_context.clone(), "Root task", "# Root task")
+                .expect("init");
+        let parent_ticket = runtime
+            .create_ticket("P000", "Parent ticket", "# Parent ticket")
+            .expect("ticket");
+        runtime
+            .classify_ticket(&parent_ticket, TicketClassification::Split, "needs child")
+            .expect("classify");
+        runtime
+            .set_status(EntityKind::Ticket, &parent_ticket, "splitting")
+            .expect("splitting");
+        let child_id = runtime
+            .create_problem_from_ticket("P000", &parent_ticket, "Child", "# Child")
+            .expect("child");
+        let spawned = runtime
+            .spawn_thread(
+                &child_id,
+                ContextForkPolicy::FullContext,
+                "Solve child",
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("spawn");
+        let child_context =
+            RuntimeContext::with_ids(dir.path(), DEFAULT_PROCESS_ID, &spawned.thread_id)
+                .expect("child context");
+        let mut child_runtime = QunuxRuntime::load(child_context).expect("child load");
+        let child_ticket = child_runtime
+            .create_ticket(&child_id, "Child ticket", "# Child ticket")
+            .expect("child ticket");
+        child_runtime
+            .classify_ticket(&child_ticket, TicketClassification::OneGo, "wait for reply")
+            .expect("child classify");
+        child_runtime
+            .set_status(EntityKind::Problem, &child_id, "doing")
+            .expect("child doing");
+        child_runtime
+            .set_status(EntityKind::Ticket, &child_ticket, "executing")
+            .expect("child executing");
+        let wait = child_runtime
+            .wait_for_user_input(
+                Some("reply".to_string()),
+                Some("chat".to_string()),
+                None,
+                "child needs addressed reply",
+            )
+            .expect("child wait");
+
+        assert_eq!(
+            wait.event_key.target_thread_id.as_deref(),
+            Some(spawned.thread_id.as_str())
+        );
+
+        let mut root_runtime = QunuxRuntime::load(root_context.clone()).expect("root reload");
+        let broad = root_runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: None,
+                condition: Some("reply".to_string()),
+                source: Some("chat".to_string()),
+                summary: "broad user reply".to_string(),
+                payload_ref: Some("turn:broad".to_string()),
+                dedupe_key: Some("broad-reply".to_string()),
+            })
+            .expect("broad event");
+
+        assert_eq!(broad.status, PassiveEventStatus::Inboxed);
+        assert!(broad.matched_handle_ids.is_empty());
+        assert!(broad.wake_decision.runnable_threads.is_empty());
+        assert_eq!(
+            root_runtime.state().handles[&wait.handle_id].status,
+            IoHandleStatus::Pending
+        );
+        assert_eq!(
+            root_runtime.state().threads[&spawned.thread_id].status,
+            ThreadStatus::WaitingIo
+        );
+
+        let targeted = root_runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::UserInput,
+                event_key: None,
+                target_thread_id: Some(spawned.thread_id.clone()),
+                condition: Some("reply".to_string()),
+                source: Some("chat".to_string()),
+                summary: "addressed child reply".to_string(),
+                payload_ref: Some("turn:child".to_string()),
+                dedupe_key: Some("child-reply".to_string()),
+            })
+            .expect("targeted event");
+
+        assert_eq!(targeted.status, PassiveEventStatus::Matched);
+        assert_eq!(targeted.matched_handle_ids, vec![wait.handle_id.clone()]);
+        assert_eq!(
+            targeted.wake_decision.runnable_threads,
+            vec![RunnableThread {
+                thread_id: spawned.thread_id.clone(),
+                root_problem_id: child_id.clone(),
+                wake_reason: format!("handle {} ready", wait.handle_id),
+            }]
+        );
+        assert_eq!(
+            root_runtime.state().handles[&wait.handle_id].status,
+            IoHandleStatus::Ready
+        );
+        assert_eq!(
+            root_runtime.state().threads[&spawned.thread_id].status,
+            ThreadStatus::Running
+        );
+        root_runtime.validate().expect("valid");
+    }
+
+    #[test]
+    fn passive_lost_wake_matches_new_wait_from_inbox() {
+        let mut runtime = runtime();
+        runtime
+            .receive_passive_event(PassiveEventInput {
+                kind: PassiveEventKind::Timer,
+                event_key: None,
+                target_thread_id: Some(DEFAULT_THREAD_ID.to_string()),
+                condition: Some("poll-window".to_string()),
+                source: Some("timer".to_string()),
+                summary: "poll window opened".to_string(),
+                payload_ref: Some("timer:poll-window".to_string()),
+                dedupe_key: Some("timer-1".to_string()),
+            })
+            .expect("early timer event");
+
+        let wait = runtime
+            .wait_for_timer(
+                Some("poll-window".to_string()),
+                Some("timer".to_string()),
+                Some("timer-1".to_string()),
+                "wait for poll window",
+            )
+            .expect("timer wait");
+
+        assert_eq!(wait.status, WaitStatus::Ready);
+        assert_eq!(
+            runtime.state().passive_events[0].status,
+            PassiveEventStatus::Matched
+        );
+        assert_eq!(runtime.state().inbox[0].status, PassiveEventStatus::Matched);
+        assert_eq!(
+            runtime.state().handles[&wait.handle_id].status,
+            IoHandleStatus::Ready
+        );
+        assert_eq!(
+            runtime.state().handles[&wait.handle_id]
+                .payload_ref
+                .as_deref(),
+            Some("timer:poll-window")
+        );
+        assert_eq!(
+            runtime.state().threads[DEFAULT_THREAD_ID].status,
+            ThreadStatus::Running
+        );
+        runtime.validate().expect("valid");
     }
 }

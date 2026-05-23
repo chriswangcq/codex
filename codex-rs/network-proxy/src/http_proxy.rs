@@ -1044,6 +1044,9 @@ mod tests {
     async fn http_connect_accept_blocks_in_limited_mode() {
         let policy = {
             let mut policy = NetworkProxySettings::default();
+            // This test targets CONNECT rejection in limited mode. Avoid ambient DNS rewrites
+            // turning the assertion into a local-address policy test.
+            policy.allow_local_binding = true;
             policy.set_allowed_domains(vec!["example.com".to_string()]);
             policy
         };

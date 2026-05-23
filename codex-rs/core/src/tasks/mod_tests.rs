@@ -1,5 +1,6 @@
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
+use super::needs_qunux_silent_dispatch_fallback;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
@@ -36,6 +37,23 @@ fn test_session_telemetry() -> SessionTelemetry {
         SessionSource::Cli,
     )
     .with_metrics_without_metadata_tags(metrics)
+}
+
+#[test]
+fn qunux_silent_dispatch_fallback_only_applies_to_silent_user_input_dispatch_turns() {
+    assert!(needs_qunux_silent_dispatch_fallback(
+        "qunux-user-input-123",
+        None,
+    ));
+    assert!(needs_qunux_silent_dispatch_fallback(
+        "qunux-user-input-123",
+        Some("   "),
+    ));
+    assert!(!needs_qunux_silent_dispatch_fallback(
+        "qunux-user-input-123",
+        Some("visible reply"),
+    ));
+    assert!(!needs_qunux_silent_dispatch_fallback("ordinary-turn", None,));
 }
 
 fn find_metric<'a>(resource_metrics: &'a ResourceMetrics, name: &str) -> &'a Metric {

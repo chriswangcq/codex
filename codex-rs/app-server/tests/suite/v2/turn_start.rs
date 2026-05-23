@@ -1,13 +1,16 @@
 use anyhow::Result;
+use anyhow::bail;
 use app_test_support::DEFAULT_CLIENT_NAME;
 use app_test_support::McpProcess;
 use app_test_support::create_apply_patch_sse_response;
+use app_test_support::create_empty_completed_sse_response;
 use app_test_support::create_exec_command_sse_response;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::create_qunux_ack_inbox_sse_response;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::format_with_current_shell_display;
 use app_test_support::to_response;
@@ -64,6 +67,10 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
+use codex_qunux::NextAction;
+use codex_qunux::PassiveEventStatus;
+use codex_qunux::QunuxRuntime;
+use codex_qunux::RuntimeContext;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
@@ -72,6 +79,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 use tempfile::TempDir;
+use tokio::time::Instant;
+use tokio::time::sleep;
 use tokio::time::timeout;
 
 use super::analytics::mount_analytics_capture;
@@ -89,6 +98,430 @@ fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     String::from_utf8(req.body.clone())
         .ok()
         .is_some_and(|body| body.contains(text))
+}
+
+async fn wait_for_model_request_after(
+    server: &wiremock::MockServer,
+    start_index: usize,
+    description: &str,
+    predicate: impl Fn(&wiremock::Request) -> bool,
+) -> Result<wiremock::Request> {
+    let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
+    loop {
+        let requests = server
+            .received_requests()
+            .await
+            .expect("failed to fetch received requests");
+        if let Some(request) = requests.into_iter().skip(start_index).find(&predicate) {
+            return Ok(request);
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for model request: {description}");
+        }
+        sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn read_turn_completed_for_thread(
+    mcp: &mut McpProcess,
+    thread_id: &str,
+) -> Result<TurnCompletedNotification> {
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notif = mcp
+                .read_stream_until_notification_message("turn/completed")
+                .await?;
+            let completed: TurnCompletedNotification =
+                serde_json::from_value(notif.params.expect("turn/completed params"))?;
+            if completed.thread_id == thread_id {
+                return Ok::<TurnCompletedNotification, anyhow::Error>(completed);
+            }
+        }
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn turn_start_routes_matching_user_input_to_qunux_dispatch() -> Result<()> {
+    const USER_TEXT: &str = "qunux matched wait unique user payload";
+
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::from([(Feature::Qunux, true)]),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            thread_source: Some(ThreadSource::User),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let _initial_dispatch =
+        wait_for_model_request_after(&server, 0, "initial Qunux auto-dispatch", |request| {
+            body_contains(request, "Qunux detected runnable work")
+        })
+        .await?;
+    read_turn_completed_for_thread(&mut mcp, &thread.id).await?;
+
+    let context = RuntimeContext::for_session(codex_home.path(), thread.id.clone())?;
+    let mut runtime = QunuxRuntime::load(context.clone())?;
+    runtime.wait_for_user_input(None, None, None, "test waits for user input")?;
+    assert_eq!(runtime.next().action, NextAction::WaitIo);
+
+    let request_count_before_user_input = server
+        .received_requests()
+        .await
+        .expect("failed to fetch received requests")
+        .len();
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: USER_TEXT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let dispatch_request = wait_for_model_request_after(
+        &server,
+        request_count_before_user_input,
+        "Qunux dispatch after matched user input",
+        |request| body_contains(request, "Qunux detected runnable work"),
+    )
+    .await?;
+    assert!(
+        !body_contains(&dispatch_request, USER_TEXT),
+        "matched Qunux user input must not fall through as ordinary user chat"
+    );
+
+    let runtime = QunuxRuntime::load(context)?;
+    assert_eq!(runtime.status().passive_events, 1);
+    assert_eq!(runtime.status().pending_inbox_items, 0);
+    let event = runtime
+        .state()
+        .passive_events
+        .last()
+        .expect("expected matched passive event");
+    assert_eq!(event.status, PassiveEventStatus::Matched);
+    assert_eq!(runtime.next().action, NextAction::CreateSolutionTicket);
+    runtime.validate()?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_routes_inboxed_user_input_to_qunux_dispatch() -> Result<()> {
+    const USER_TEXT: &str = "qunux no wait inbox dispatch unique user payload";
+
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::from([(Feature::Qunux, true)]),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            thread_source: Some(ThreadSource::User),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let _initial_dispatch =
+        wait_for_model_request_after(&server, 0, "initial Qunux auto-dispatch", |request| {
+            body_contains(request, "Qunux detected runnable work")
+        })
+        .await?;
+    read_turn_completed_for_thread(&mut mcp, &thread.id).await?;
+
+    let context = RuntimeContext::for_session(codex_home.path(), thread.id.clone())?;
+    let runtime = QunuxRuntime::load(context.clone())?;
+    assert_eq!(runtime.status().passive_events, 0);
+    assert_eq!(runtime.status().pending_inbox_items, 0);
+
+    let request_count_before_user_input = server
+        .received_requests()
+        .await
+        .expect("failed to fetch received requests")
+        .len();
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: USER_TEXT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let dispatch_request = wait_for_model_request_after(
+        &server,
+        request_count_before_user_input,
+        "Qunux dispatch after inboxed user input",
+        |request| body_contains(request, "Qunux detected runnable work"),
+    )
+    .await?;
+    assert!(
+        body_contains(&dispatch_request, "next_action: handle_inbox"),
+        "inboxed Qunux user input must wake the handle_inbox action"
+    );
+    assert!(
+        body_contains(&dispatch_request, "Current Qunux next instruction"),
+        "Qunux dispatch wake must include the concrete next instruction"
+    );
+    assert!(
+        body_contains(&dispatch_request, USER_TEXT),
+        "inboxed Qunux user input details must be present in the model dispatch request"
+    );
+    assert!(
+        body_contains(&dispatch_request, "qunux.ack_inbox"),
+        "handle_inbox wake must remind the agent to acknowledge the inbox item"
+    );
+
+    let runtime = QunuxRuntime::load(context)?;
+    assert_eq!(runtime.status().passive_events, 1);
+    assert_eq!(runtime.status().pending_inbox_items, 1);
+    let event = runtime
+        .state()
+        .passive_events
+        .last()
+        .expect("expected inboxed passive event");
+    assert_eq!(event.status, PassiveEventStatus::Inboxed);
+    assert!(
+        event.summary.contains(USER_TEXT),
+        "inboxed Qunux user input details must be stored on the Qunux event"
+    );
+    assert_eq!(runtime.next().action, NextAction::HandleInbox);
+    runtime.validate()?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn qunux_inboxed_user_input_ack_only_dispatch_emits_visible_fallback() -> Result<()> {
+    const USER_TEXT: &str = "qunux ack only inbox user payload";
+    const FALLBACK_FRAGMENT: &str = "dispatch turn ended without a visible assistant reply";
+
+    let responses = vec![
+        create_final_assistant_message_sse_response("Done")?,
+        create_qunux_ack_inbox_sse_response(
+            "IN000",
+            "claimed handled without visible reply",
+            "ack-inbox-call",
+        )?,
+        create_empty_completed_sse_response()?,
+    ];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::from([(Feature::Qunux, true)]),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            thread_source: Some(ThreadSource::User),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let _initial_dispatch =
+        wait_for_model_request_after(&server, 0, "initial Qunux auto-dispatch", |request| {
+            body_contains(request, "Qunux detected runnable work")
+        })
+        .await?;
+    read_turn_completed_for_thread(&mut mcp, &thread.id).await?;
+
+    let context = RuntimeContext::for_session(codex_home.path(), thread.id.clone())?;
+    let request_count_before_user_input = server
+        .received_requests()
+        .await
+        .expect("failed to fetch received requests")
+        .len();
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: USER_TEXT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let dispatch_request = wait_for_model_request_after(
+        &server,
+        request_count_before_user_input,
+        "Qunux dispatch after inboxed user input",
+        |request| body_contains(request, "next_action: handle_inbox"),
+    )
+    .await?;
+    assert!(body_contains(&dispatch_request, USER_TEXT));
+    assert!(body_contains(&dispatch_request, "state-only"));
+
+    let fallback_text = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let completed_notif = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification = serde_json::from_value(
+                completed_notif
+                    .params
+                    .clone()
+                    .expect("item/completed params"),
+            )?;
+            if completed.thread_id != thread.id {
+                continue;
+            }
+            if let ThreadItem::AgentMessage { text, .. } = completed.item
+                && text.contains(FALLBACK_FRAGMENT)
+            {
+                return Ok::<String, anyhow::Error>(text);
+            }
+        }
+    })
+    .await??;
+    assert!(fallback_text.contains(FALLBACK_FRAGMENT));
+
+    let completed = read_turn_completed_for_thread(&mut mcp, &thread.id).await?;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+
+    let runtime = QunuxRuntime::load(context)?;
+    assert_eq!(runtime.status().pending_inbox_items, 0);
+    assert_eq!(runtime.state().inbox[0].status, PassiveEventStatus::Handled);
+    runtime.validate()?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_falls_back_to_ordinary_chat_when_qunux_is_disabled() -> Result<()> {
+    const USER_TEXT: &str = "qunux disabled fallback unique user payload";
+
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::default(),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            thread_source: Some(ThreadSource::User),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let request_count_before_user_input = server
+        .received_requests()
+        .await
+        .expect("failed to fetch received requests")
+        .len();
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: USER_TEXT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let ordinary_request = wait_for_model_request_after(
+        &server,
+        request_count_before_user_input,
+        "ordinary model request with Qunux disabled",
+        |request| body_contains(request, USER_TEXT),
+    )
+    .await?;
+    assert!(body_contains(&ordinary_request, USER_TEXT));
+    assert!(!codex_home.path().join(".qunux").exists());
+
+    Ok(())
 }
 
 #[tokio::test]

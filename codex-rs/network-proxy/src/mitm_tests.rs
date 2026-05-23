@@ -28,6 +28,8 @@ fn policy_ctx(
 async fn mitm_policy_blocks_disallowed_method_and_records_telemetry() {
     let app_state = Arc::new(network_proxy_state_for_policy({
         let mut network = NetworkProxySettings::default();
+        // This test targets limited-mode method policy, not local/private DNS blocking.
+        network.allow_local_binding = true;
         network.set_allowed_domains(vec!["example.com".to_string()]);
         network
     }));

@@ -900,6 +900,19 @@ mod tests {
         network
     }
 
+    fn network_settings_without_local_resolution_guard(
+        allowed_domains: &[&str],
+        denied_domains: &[&str],
+    ) -> NetworkProxySettings {
+        NetworkProxySettings {
+            // These tests exercise allow/deny matching behavior, not the DNS-rebinding guard.
+            // Some developer networks resolve public-looking hostnames to 198.18.0.0/15 or
+            // private addresses, which is correctly blocked when local binding is disabled.
+            allow_local_binding: true,
+            ..network_settings(allowed_domains, denied_domains)
+        }
+    }
+
     fn network_settings_with_unix_sockets(
         allowed_domains: &[&str],
         denied_domains: &[&str],
@@ -928,7 +941,9 @@ mod tests {
 
     #[tokio::test]
     async fn host_blocked_requires_allowlist_match() {
-        let state = network_proxy_state_for_policy(network_settings(&["example.com"], &[]));
+        let state = network_proxy_state_for_policy(
+            network_settings_without_local_resolution_guard(&["example.com"], &[]),
+        );
 
         assert_eq!(
             state
@@ -947,7 +962,9 @@ mod tests {
 
     #[tokio::test]
     async fn add_allowed_domain_removes_matching_deny_entry() {
-        let state = network_proxy_state_for_policy(network_settings(&[], &["example.com"]));
+        let state = network_proxy_state_for_policy(
+            network_settings_without_local_resolution_guard(&[], &["example.com"]),
+        );
 
         state.add_allowed_domain("ExAmPlE.CoM").await.unwrap();
 
@@ -1182,7 +1199,9 @@ mod tests {
 
     #[tokio::test]
     async fn host_blocked_subdomain_wildcards_exclude_apex() {
-        let state = network_proxy_state_for_policy(network_settings(&["*.openai.com"], &[]));
+        let state = network_proxy_state_for_policy(
+            network_settings_without_local_resolution_guard(&["*.openai.com"], &[]),
+        );
 
         assert_eq!(
             state
@@ -1199,7 +1218,9 @@ mod tests {
 
     #[tokio::test]
     async fn host_blocked_global_wildcard_allowlist_allows_public_hosts_except_denylist() {
-        let state = network_proxy_state_for_policy(network_settings(&["*"], &["evil.example"]));
+        let state = network_proxy_state_for_policy(
+            network_settings_without_local_resolution_guard(&["*"], &["evil.example"]),
+        );
 
         assert_eq!(
             state

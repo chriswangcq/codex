@@ -711,6 +711,37 @@ impl ThreadManager {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn start_thread_with_qunux_context_for_tests(
+        &self,
+        config: Config,
+        session_source: SessionSource,
+        qunux_runtime_context: codex_qunux::RuntimeContext,
+    ) -> CodexResult<NewThread> {
+        let environments = default_thread_environment_selections(
+            self.state.environment_manager.as_ref(),
+            &config.cwd,
+        );
+        Box::pin(self.state.spawn_thread_with_source(
+            config,
+            InitialHistory::New,
+            Arc::clone(&self.state.auth_manager),
+            self.agent_control(),
+            session_source,
+            Some(ThreadSource::Subagent),
+            Vec::new(),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+            /*parent_trace*/ None,
+            environments,
+            /*user_shell_override*/ None,
+            Some(qunux_runtime_context),
+        ))
+        .await
+    }
+
     pub(crate) async fn resume_thread_from_rollout_with_user_shell_override_for_tests(
         &self,
         config: Config,

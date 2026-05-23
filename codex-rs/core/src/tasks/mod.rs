@@ -26,6 +26,8 @@ use crate::hook_runtime::PendingInputHookDisposition;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
+use crate::qunux_dispatch::is_qunux_user_input_dispatch_turn_id;
+use crate::qunux_dispatch::qunux_auto_dispatch_wake;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
@@ -52,6 +54,9 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 
 use codex_features::Feature;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 pub(crate) use compact::CompactTask;
 pub(crate) use regular::RegularTask;
@@ -61,6 +66,12 @@ pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
+const QUNUX_SILENT_USER_INPUT_DISPATCH_FALLBACK: &str = "Qunux received this input, but the dispatch turn ended without a visible assistant reply. I am ready for your next message.";
+
+fn needs_qunux_silent_dispatch_fallback(turn_id: &str, last_agent_message: Option<&str>) -> bool {
+    is_qunux_user_input_dispatch_turn_id(turn_id)
+        && last_agent_message.map(str::trim).is_none_or(str::is_empty)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
@@ -437,30 +448,29 @@ impl Session {
     ///
     /// This helper generates a fresh sub-id for the synthetic turn before delegating to the
     /// explicit-sub-id variant.
-    pub(crate) async fn maybe_start_turn_for_pending_work(self: &Arc<Self>) {
+    pub(crate) async fn maybe_start_turn_for_pending_work(self: &Arc<Self>) -> bool {
         self.maybe_start_turn_for_pending_work_with_sub_id(uuid::Uuid::new_v4().to_string())
-            .await;
+            .await
     }
 
     /// Starts a regular turn with the provided sub-id when pending work should wake an idle
     /// session.
     ///
-    /// The turn is created only when there are queued next-turn items or mailbox mail marked with
-    /// `trigger_turn`, and only if the session is currently idle.
+    /// The turn is created when there are queued next-turn items, mailbox mail marked with
+    /// `trigger_turn`, or runnable Qunux work that can be converted into a synthetic developer
+    /// wake item. Explicit pending input has priority over synthetic Qunux wake turns.
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
-    ) {
-        if !self.has_queued_response_items_for_next_turn().await
-            && !self.has_trigger_turn_mailbox_items().await
-        {
-            return;
+    ) -> bool {
+        if !self.prepare_pending_work_for_idle_turn().await {
+            return false;
         }
 
         {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
-                return;
+                return false;
             }
             *active_turn = Some(ActiveTurn::default());
         }
@@ -470,6 +480,45 @@ impl Session {
             .await;
         self.start_task(turn_context, Vec::new(), RegularTask::new())
             .await;
+        true
+    }
+
+    pub(crate) async fn prepare_pending_work_for_idle_turn(self: &Arc<Self>) -> bool {
+        let has_explicit_pending = self.has_queued_response_items_for_next_turn().await
+            || self.has_trigger_turn_mailbox_items().await;
+        if has_explicit_pending {
+            *self.qunux_auto_dispatch_key.lock().await = None;
+            return true;
+        } else if !self.queue_qunux_auto_dispatch_if_runnable().await {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) async fn queue_qunux_auto_dispatch_if_runnable(self: &Arc<Self>) -> bool {
+        let wake = match qunux_auto_dispatch_wake(self.as_ref()) {
+            Ok(Some(wake)) => wake,
+            Ok(None) => {
+                *self.qunux_auto_dispatch_key.lock().await = None;
+                return false;
+            }
+            Err(err) => {
+                warn!("failed to inspect Qunux auto-dispatch state: {err}");
+                return false;
+            }
+        };
+
+        {
+            let mut last_key = self.qunux_auto_dispatch_key.lock().await;
+            if last_key.as_deref() == Some(wake.key.as_str()) {
+                return false;
+            }
+            *last_key = Some(wake.key);
+        }
+
+        self.queue_response_items_for_next_turn(vec![wake.input])
+            .await;
+        true
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -558,6 +607,7 @@ impl Session {
         turn_context: Arc<TurnContext>,
         last_agent_message: Option<String>,
     ) {
+        let mut last_agent_message = last_agent_message;
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
@@ -741,6 +791,23 @@ impl Session {
             .await
         {
             warn!("failed to apply goal runtime turn-finished event: {err}");
+        }
+        if needs_qunux_silent_dispatch_fallback(&turn_context.sub_id, last_agent_message.as_deref())
+        {
+            let message = QUNUX_SILENT_USER_INPUT_DISPATCH_FALLBACK.to_string();
+            let item = TurnItem::AgentMessage(AgentMessageItem {
+                id: format!("qunux-silent-dispatch-{}", turn_context.sub_id),
+                content: vec![AgentMessageContent::Text {
+                    text: message.clone(),
+                }],
+                phase: None,
+                memory_citation: None,
+            });
+            self.emit_turn_item_started(turn_context.as_ref(), &item)
+                .await;
+            self.emit_turn_item_completed(turn_context.as_ref(), item)
+                .await;
+            last_agent_message = Some(message);
         }
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: turn_context.sub_id.clone(),

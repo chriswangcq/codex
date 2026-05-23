@@ -41,18 +41,20 @@ fn tool_for_operation(operation: QunuxOperation) -> ResponsesApiTool {
             object([], []),
         ),
         QunuxOperation::CreateProblem => (
-            "Create a child problem from a splitting ticket.",
+            "Create a child problem from a source ticket. Use mode=split for plan-time children from a splitting split ticket; use mode=spawn for runtime child problems from an executing one_go ticket.",
             object(
                 [
                     string("parent_id", "Parent problem id, for example P000."),
-                    string(
-                        "from_ticket_id",
-                        "Splitting ticket id that owns the child creation.",
+                    string("from_ticket_id", "Ticket id that owns the child creation."),
+                    string_enum(
+                        "mode",
+                        "Child creation mode: split is plan-time decomposition; spawn is runtime subprogram creation during execution.",
+                        ["split", "spawn"],
                     ),
                     string("title", "Child problem title."),
                     string("body", "Child problem Markdown body."),
                 ],
-                ["parent_id", "from_ticket_id", "title", "body"],
+                ["parent_id", "from_ticket_id", "mode", "title", "body"],
             ),
         ),
         QunuxOperation::CreateTicket => (
@@ -143,12 +145,102 @@ fn tool_for_operation(operation: QunuxOperation) -> ResponsesApiTool {
                 ["problem_id"],
             ),
         ),
+        QunuxOperation::Wait => (
+            "Park the current Qunux thread on typed wait specs. This is the only model-facing wait syscall; wake, consume, cancel, and inspect are runtime/host responsibilities.",
+            object(
+                [
+                    string_enum("mode", "Wait mode.", ["all", "any"]),
+                    string("reason", "Human-readable reason for parking the thread."),
+                    (
+                        "specs",
+                        JsonSchema::array(
+                            wait_spec_schema(),
+                            Some("Wait specs that describe what can wake this thread.".to_string()),
+                        ),
+                    ),
+                ],
+                ["mode", "reason", "specs"],
+            ),
+        ),
+        QunuxOperation::AckInbox => (
+            "Acknowledge that the current Qunux thread has incorporated a pending inbox item into its response, wait, or next legal PTRC action. This is a state-only acknowledgement; it does not send a user-visible chat reply.",
+            object(
+                [
+                    string("inbox_item_id", "Inbox item id, for example IN000."),
+                    string(
+                        "note",
+                        "Brief note describing how the inbox item was handled or incorporated. Do not claim a user-visible reply unless the assistant actually emitted one in this turn.",
+                    ),
+                ],
+                ["inbox_item_id", "note"],
+            ),
+        ),
+        QunuxOperation::IngestUserTask => (
+            "Convert an actionable pending inbox item into an ordinary Qunux child problem. Use this for real user work requests; for small talk, acknowledgements, or meta answers, reply visibly and use ack_inbox instead.",
+            object(
+                [
+                    string("inbox_item_id", "Inbox item id, for example IN000."),
+                    string("title", "Child problem title for the actionable user task."),
+                    string(
+                        "body",
+                        "Child problem Markdown body with problem context and success criteria.",
+                    ),
+                ],
+                ["inbox_item_id", "title", "body"],
+            ),
+        ),
+        QunuxOperation::ScaffoldUserTask => (
+            "Convert an actionable pending inbox item into an ordinary Qunux child problem and its default solution ticket. Use this when the user request is concrete enough to create both the problem body and first ticket body in one syscall; use ingest_user_task when the ticket must be authored separately.",
+            object(
+                [
+                    string("inbox_item_id", "Inbox item id, for example IN000."),
+                    string(
+                        "problem_title",
+                        "Child problem title for the actionable user task.",
+                    ),
+                    string(
+                        "problem_body",
+                        "Child problem Markdown body with problem context and success criteria.",
+                    ),
+                    string(
+                        "ticket_title",
+                        "Default solution ticket title for the child problem.",
+                    ),
+                    string(
+                        "ticket_body",
+                        "Default solution ticket Markdown body with proposed solution, acceptance criteria, verification plan, risks, and assumptions.",
+                    ),
+                    string(
+                        "note",
+                        "Brief note describing why this inbox item became a durable child problem and ticket.",
+                    ),
+                ],
+                [
+                    "inbox_item_id",
+                    "problem_title",
+                    "problem_body",
+                    "ticket_title",
+                    "ticket_body",
+                    "note",
+                ],
+            ),
+        ),
         QunuxOperation::JoinThread => (
             "Join a completed child Qunux thread back into the current parent thread.",
             object(
                 [string(
                     "target_thread_id",
                     "Child Qunux thread id to join, for example QT001.",
+                )],
+                ["target_thread_id"],
+            ),
+        ),
+        QunuxOperation::RecoverThread => (
+            "Recover a failed child Qunux thread by returning its unfinished problem subtree to the current parent thread. Use only when qunux.next returns recover_thread.",
+            object(
+                [string(
+                    "target_thread_id",
+                    "Failed child Qunux thread id to recover, for example QT001.",
                 )],
                 ["target_thread_id"],
             ),
@@ -225,6 +317,96 @@ fn array_of_strings(name: &'static str, description: &'static str) -> (&'static 
     )
 }
 
+fn wait_spec_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".to_string(),
+                JsonSchema::string_enum(
+                    ["user_input", "timer", "external_signal", "event_key"]
+                        .into_iter()
+                        .map(|value| json!(value))
+                        .collect(),
+                    Some("Wait spec kind.".to_string()),
+                ),
+            ),
+            (
+                "event_key".to_string(),
+                event_key_schema("Exact event key for kind=event_key."),
+            ),
+            (
+                "target_thread_id".to_string(),
+                JsonSchema::string(Some(
+                    "Optional target thread id; defaults to the current thread for passive specs."
+                        .to_string(),
+                )),
+            ),
+            (
+                "condition".to_string(),
+                JsonSchema::string(Some(
+                    "Resource/condition to match, for example a user reply condition or timer window."
+                        .to_string(),
+                )),
+            ),
+            (
+                "source".to_string(),
+                JsonSchema::string(Some(
+                    "Optional source to match, for example chat, timer, github, or webhook."
+                        .to_string(),
+                )),
+            ),
+            (
+                "dedupe_key".to_string(),
+                JsonSchema::string(Some(
+                    "Optional idempotency key expected from the matching wake event.".to_string(),
+                )),
+            ),
+        ]),
+        Some(vec!["kind".to_string()]),
+        Some(false.into()),
+    )
+}
+
+fn event_key_schema(description: &'static str) -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".to_string(),
+                JsonSchema::string(Some(
+                    "Event kind, for example user.input, timer, external.signal, or github.checks.completed."
+                        .to_string(),
+                )),
+            ),
+            (
+                "resource".to_string(),
+                JsonSchema::string(Some("Optional resource/condition key.".to_string())),
+            ),
+            (
+                "source".to_string(),
+                JsonSchema::string(Some("Optional event source.".to_string())),
+            ),
+            (
+                "target_thread_id".to_string(),
+                JsonSchema::string(Some("Optional target Qunux thread id.".to_string())),
+            ),
+        ]),
+        Some(vec!["kind".to_string()]),
+        Some(false.into()),
+    )
+    .with_description(description)
+}
+
+trait JsonSchemaDescriptionExt {
+    fn with_description(self, description: &'static str) -> Self;
+}
+
+impl JsonSchemaDescriptionExt for JsonSchema {
+    fn with_description(mut self, description: &'static str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,7 +450,11 @@ mod tests {
 
     #[test]
     fn target_thread_resource_schemas_use_target_thread_id() {
-        for operation in [QunuxOperation::JoinThread, QunuxOperation::ThreadStatus] {
+        for operation in [
+            QunuxOperation::JoinThread,
+            QunuxOperation::RecoverThread,
+            QunuxOperation::ThreadStatus,
+        ] {
             let ToolSpec::Namespace(namespace) = create_qunux_tool(operation) else {
                 panic!("expected namespace spec");
             };
@@ -340,5 +526,60 @@ mod tests {
         assert!(bootstrap_description.contains("signals"));
         assert!(bootstrap_description.contains("evidence"));
         assert!(bootstrap_description.contains("escalation"));
+    }
+
+    #[test]
+    fn wait_schema_is_park_only_agent_syscall() {
+        let ToolSpec::Namespace(namespace) = create_qunux_tool(QunuxOperation::Wait) else {
+            panic!("expected namespace spec");
+        };
+        let ResponsesApiNamespaceTool::Function(tool) = namespace.tools.first().expect("tool");
+        let properties = tool
+            .parameters
+            .properties
+            .as_ref()
+            .expect("object properties");
+        let required = tool.parameters.required.as_ref().expect("required fields");
+
+        assert_eq!(tool.name, "wait");
+        assert!(tool.description.contains("Park the current Qunux thread"));
+        assert!(!properties.contains_key("op"));
+        assert!(!properties.contains_key("handle_id"));
+        assert!(!properties.contains_key("event"));
+        assert!(properties.contains_key("mode"));
+        assert!(properties.contains_key("reason"));
+        assert!(properties.contains_key("specs"));
+        assert_eq!(
+            required,
+            &vec![
+                "mode".to_string(),
+                "reason".to_string(),
+                "specs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn ack_inbox_schema_warns_that_ack_is_state_only() {
+        let ToolSpec::Namespace(namespace) = create_qunux_tool(QunuxOperation::AckInbox) else {
+            panic!("expected namespace spec");
+        };
+        let ResponsesApiNamespaceTool::Function(tool) = namespace.tools.first().expect("tool");
+        let properties = tool
+            .parameters
+            .properties
+            .as_ref()
+            .expect("object properties");
+        let note_description = properties["note"]
+            .description
+            .as_deref()
+            .expect("note description");
+
+        assert!(tool.description.contains("state-only"));
+        assert!(
+            tool.description
+                .contains("does not send a user-visible chat reply")
+        );
+        assert!(note_description.contains("Do not claim a user-visible reply"));
     }
 }

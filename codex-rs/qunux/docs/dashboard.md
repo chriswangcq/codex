@@ -6,10 +6,10 @@ file that can be opened locally when you need to understand a Qunux process
 without invoking the model or mutating state.
 
 This page is not the product UI and does not replace the Codex CLI. The product
-UI is the native Codex TUI cockpit: when Qunux is enabled, the old chat-first
-main surface is replaced by a terminal-native Agent OS cockpit fed by
-runtime-pushed `qunux/snapshot` notifications. The HTML dashboard is an offline
-debug artifact for inspecting persisted snapshots.
+UI includes the native Codex TUI cockpit as an attachable runtime view alongside
+the transcript and composer. It is fed by runtime-pushed `qunux/snapshot`
+notifications. The HTML dashboard is an offline debug artifact for inspecting
+persisted snapshots.
 
 ## Generate
 
@@ -43,8 +43,8 @@ node codex-rs/qunux/scripts/render-dashboard.mjs \
 
 ## Boundary
 
-The dashboard is diagnostic UI, not a runtime controller and not the primary
-native TUI cockpit.
+The dashboard is diagnostic UI, not a runtime controller and not the native TUI
+cockpit.
 
 It does not:
 

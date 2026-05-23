@@ -264,6 +264,8 @@ use codex_core::ExternalGoalPreviousStatus;
 use codex_core::ExternalGoalSet;
 use codex_core::ForkSnapshot;
 use codex_core::NewThread;
+use codex_core::QunuxUserInputDelivery;
+use codex_core::QunuxUserInputDeliveryStatus;
 #[cfg(test)]
 use codex_core::SessionMeta;
 use codex_core::StartThreadOptions;

@@ -895,6 +895,7 @@ impl ChatWidget {
     fn on_qunux_snapshot(&mut self, notification: QunuxSnapshotNotification) {
         self.qunux_snapshot = Some(QunuxCockpitSnapshot::new(
             notification.process_id,
+            Some(notification.qunux_thread_id),
             notification.state_path,
             notification.snapshot,
         ));
@@ -8838,8 +8839,28 @@ impl ChatWidget {
 
     fn as_renderable(&self) -> RenderableItem<'_> {
         let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
+        let active_cell_renderable = match &self.transcript.active_cell {
+            Some(cell) => RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
+                child: cell.as_ref(),
+                top: 1,
+                right: active_cell_right_reserve,
+            })),
+            None => RenderableItem::Owned(Box::new(())),
+        };
+        let active_hook_cell_renderable = match &self.active_hook_cell {
+            Some(cell) if cell.should_render() => {
+                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
+                    child: cell,
+                    top: 1,
+                    right: active_cell_right_reserve,
+                }))
+            }
+            _ => RenderableItem::Owned(Box::new(())),
+        };
         if self.config.features.enabled(Feature::Qunux) {
             let mut flex = FlexRenderable::new();
+            flex.push(/*flex*/ 1, active_cell_renderable);
+            flex.push(/*flex*/ 0, active_hook_cell_renderable);
             flex.push(
                 /*flex*/ 1,
                 RenderableItem::Owned(Box::new(QunuxCockpitRenderable::new(
@@ -8860,24 +8881,6 @@ impl ChatWidget {
             return RenderableItem::Owned(Box::new(flex));
         }
 
-        let active_cell_renderable = match &self.transcript.active_cell {
-            Some(cell) => RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
-                child: cell.as_ref(),
-                top: 1,
-                right: active_cell_right_reserve,
-            })),
-            None => RenderableItem::Owned(Box::new(())),
-        };
-        let active_hook_cell_renderable = match &self.active_hook_cell {
-            Some(cell) if cell.should_render() => {
-                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
-                    child: cell,
-                    top: 1,
-                    right: active_cell_right_reserve,
-                }))
-            }
-            _ => RenderableItem::Owned(Box::new(())),
-        };
         let mut flex = FlexRenderable::new();
         flex.push(/*flex*/ 1, active_cell_renderable);
         flex.push(/*flex*/ 0, active_hook_cell_renderable);

@@ -292,6 +292,43 @@ impl TurnRequestProcessor {
             .await
     }
 
+    async fn maybe_route_qunux_user_input(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread: &CodexThread,
+        mapped_items: &[CoreInputItem],
+    ) -> Result<Option<TurnStartResponse>, JSONRPCErrorError> {
+        let Some(delivery) = qunux_delivery_for_user_input(request_id, mapped_items) else {
+            return Ok(None);
+        };
+
+        let status = thread
+            .deliver_qunux_user_input(delivery)
+            .await
+            .map_err(|err| {
+                internal_error(format!("failed to route user input through Qunux: {err}"))
+            })?;
+
+        let Some(turn_id) = qunux_dispatch_turn_id_from_delivery_status(status)? else {
+            return Ok(None);
+        };
+        self.outgoing
+            .record_request_turn_id(request_id, &turn_id)
+            .await;
+        Ok(Some(TurnStartResponse {
+            turn: Turn {
+                id: turn_id,
+                items: vec![],
+                items_view: TurnItemsView::NotLoaded,
+                error: None,
+                status: TurnStatus::InProgress,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            },
+        }))
+    }
+
     fn input_too_large_error(actual_chars: usize) -> JSONRPCErrorError {
         let mut error = invalid_params(format!(
             "Input exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters."
@@ -447,6 +484,16 @@ impl TurnRequestProcessor {
                 })
                 .await
                 .map_err(|err| invalid_request(format!("invalid turn context override: {err}")))?;
+        }
+
+        if let Some(response) = self
+            .maybe_route_qunux_user_input(&request_id, thread.as_ref(), &mapped_items)
+            .await
+            .inspect_err(|error| {
+                self.track_error_response(&request_id, error, /*error_type*/ None);
+            })?
+        {
+            return Ok(response);
         }
 
         // Start the turn by submitting the user input. Return its submission id as turn_id.
@@ -1107,6 +1154,237 @@ impl TurnRequestProcessor {
             raw_events_enabled,
         )
         .await
+    }
+}
+
+fn qunux_delivery_for_user_input(
+    request_id: &ConnectionRequestId,
+    mapped_items: &[CoreInputItem],
+) -> Option<QunuxUserInputDelivery> {
+    if mapped_items.is_empty() {
+        return None;
+    }
+    let request_ref = format!(
+        "app-server-turn:{}:{}",
+        request_id.connection_id.0, request_id.request_id
+    );
+    Some(QunuxUserInputDelivery {
+        summary: summarize_qunux_user_input(mapped_items),
+        payload_ref: Some(request_ref.clone()),
+        dedupe_key: Some(request_ref),
+        // Leave condition/source broad so ordinary user-input waits match. More
+        // specific routing should use explicit event keys from runtime tools.
+        condition: None,
+        source: None,
+    })
+}
+
+fn qunux_dispatch_turn_id_from_delivery_status(
+    status: QunuxUserInputDeliveryStatus,
+) -> Result<Option<String>, JSONRPCErrorError> {
+    match status {
+        QunuxUserInputDeliveryStatus::Matched {
+            dispatch_turn_id: Some(turn_id),
+            ..
+        }
+        | QunuxUserInputDeliveryStatus::Inboxed {
+            dispatch_turn_id: Some(turn_id),
+            ..
+        } => Ok(Some(turn_id)),
+        QunuxUserInputDeliveryStatus::Matched {
+            dispatch_turn_id: None,
+            ..
+        } => Err(internal_error(
+            "Qunux user input matched a wait, but no dispatch turn was started",
+        )),
+        QunuxUserInputDeliveryStatus::Inboxed {
+            dispatch_turn_id: None,
+            ..
+        } => Err(internal_error(
+            "Qunux user input was inboxed, but no dispatch turn was started",
+        )),
+        QunuxUserInputDeliveryStatus::Unavailable
+        | QunuxUserInputDeliveryStatus::Duplicate { .. } => Ok(None),
+    }
+}
+
+fn summarize_qunux_user_input(mapped_items: &[CoreInputItem]) -> String {
+    const MAX_QUNUX_USER_INPUT_SUMMARY_CHARS: usize = 12_000;
+    const MAX_REMOTE_IMAGE_REF_CHARS: usize = 240;
+
+    let mut parts = Vec::new();
+    for (index, item) in mapped_items.iter().enumerate() {
+        match item {
+            CoreInputItem::Text { text, .. } => {
+                let text = text.trim();
+                if !text.is_empty() {
+                    parts.push(format!("text[{index}]={text}"));
+                }
+            }
+            CoreInputItem::Image { image_url } => {
+                parts.push(format!(
+                    "remote_image[{index}]={}",
+                    truncate_chars(image_url, MAX_REMOTE_IMAGE_REF_CHARS)
+                ));
+            }
+            CoreInputItem::LocalImage { path } => {
+                parts.push(format!("local_image[{index}]={}", path.display()));
+            }
+            CoreInputItem::Skill { name, path } => {
+                parts.push(format!(
+                    "skill[{index}] name={name} path={}",
+                    path.display()
+                ));
+            }
+            CoreInputItem::Mention { name, path } => {
+                parts.push(format!("mention[{index}] name={name} path={path}"));
+            }
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        "user input".to_string()
+    } else {
+        truncate_chars(
+            &format!("user input:\n- {}", parts.join("\n- ")),
+            MAX_QUNUX_USER_INPUT_SUMMARY_CHARS,
+        )
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_app_server_protocol::RequestId;
+    use std::path::PathBuf;
+
+    fn request_id() -> ConnectionRequestId {
+        ConnectionRequestId {
+            connection_id: ConnectionId(7),
+            request_id: RequestId::String("req-42".to_string()),
+        }
+    }
+
+    #[test]
+    fn qunux_delivery_is_absent_for_empty_turn_input() {
+        assert!(qunux_delivery_for_user_input(&request_id(), &[]).is_none());
+    }
+
+    #[test]
+    fn qunux_delivery_uses_broad_matching_and_request_dedupe() {
+        let items = vec![
+            CoreInputItem::Text {
+                text: "  hello from the user  ".to_string(),
+                text_elements: Vec::new(),
+            },
+            CoreInputItem::Skill {
+                name: "solve-complex-problems".to_string(),
+                path: PathBuf::from("/tmp/SKILL.md"),
+            },
+            CoreInputItem::Mention {
+                name: "thing".to_string(),
+                path: "app://thing".to_string(),
+            },
+        ];
+
+        let delivery =
+            qunux_delivery_for_user_input(&request_id(), &items).expect("delivery expected");
+
+        assert_eq!(
+            delivery.payload_ref.as_deref(),
+            Some("app-server-turn:7:req-42")
+        );
+        assert_eq!(
+            delivery.dedupe_key.as_deref(),
+            Some("app-server-turn:7:req-42")
+        );
+        assert_eq!(delivery.condition, None);
+        assert_eq!(delivery.source, None);
+        assert!(delivery.summary.contains("text[0]=hello from the user"));
+        assert!(
+            delivery
+                .summary
+                .contains("skill[1] name=solve-complex-problems path=/tmp/SKILL.md")
+        );
+        assert!(
+            delivery
+                .summary
+                .contains("mention[2] name=thing path=app://thing")
+        );
+    }
+
+    #[test]
+    fn qunux_delivery_summarizes_non_text_inputs() {
+        let items = vec![
+            CoreInputItem::Image {
+                image_url: "data:image/png;base64,abc".to_string(),
+            },
+            CoreInputItem::LocalImage {
+                path: PathBuf::from("/tmp/image.png"),
+            },
+        ];
+
+        let delivery =
+            qunux_delivery_for_user_input(&request_id(), &items).expect("delivery expected");
+
+        assert!(
+            delivery
+                .summary
+                .contains("remote_image[0]=data:image/png;base64,abc")
+        );
+        assert!(delivery.summary.contains("local_image[1]=/tmp/image.png"));
+    }
+
+    #[test]
+    fn qunux_delivery_preserves_normal_length_text() {
+        let text = "x".repeat(500);
+        let items = vec![CoreInputItem::Text {
+            text: text.clone(),
+            text_elements: Vec::new(),
+        }];
+
+        let delivery =
+            qunux_delivery_for_user_input(&request_id(), &items).expect("delivery expected");
+
+        assert!(delivery.summary.contains(&text));
+    }
+
+    #[test]
+    fn qunux_inboxed_without_dispatch_does_not_fall_back() {
+        let result =
+            qunux_dispatch_turn_id_from_delivery_status(QunuxUserInputDeliveryStatus::Inboxed {
+                event_id: "PE000".to_string(),
+                inbox_item_id: Some("IN000".to_string()),
+                dispatch_turn_id: None,
+            });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn qunux_unavailable_and_duplicate_still_fall_back() {
+        assert!(
+            qunux_dispatch_turn_id_from_delivery_status(QunuxUserInputDeliveryStatus::Unavailable)
+                .expect("unavailable should not error")
+                .is_none()
+        );
+        assert!(
+            qunux_dispatch_turn_id_from_delivery_status(QunuxUserInputDeliveryStatus::Duplicate {
+                event_id: "PE000".to_string(),
+            },)
+            .expect("duplicate should not error")
+            .is_none()
+        );
     }
 }
 

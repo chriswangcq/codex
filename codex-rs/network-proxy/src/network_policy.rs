@@ -609,7 +609,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_host_policy_emits_domain_event_for_decider_allow_override() {
-        let state = network_proxy_state_for_policy(NetworkProxySettings::default());
+        let state = network_proxy_state_for_policy(NetworkProxySettings {
+            // This test is about decider override for normal domain allowlisting, not the
+            // DNS-rebinding guard. Some networks resolve example.com to non-public ranges.
+            allow_local_binding: true,
+            ..NetworkProxySettings::default()
+        });
         let calls = Arc::new(AtomicUsize::new(0));
         let decider: Arc<dyn NetworkPolicyDecider> = Arc::new({
             let calls = calls.clone();
@@ -722,7 +727,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_host_policy_emits_domain_event_for_decider_ask() {
-        let state = network_proxy_state_for_policy(NetworkProxySettings::default());
+        let state = network_proxy_state_for_policy(NetworkProxySettings {
+            // Keep the baseline reason as not_allowed so the decider path is exercised
+            // deterministically even on networks that rewrite public hostnames.
+            allow_local_binding: true,
+            ..NetworkProxySettings::default()
+        });
         let decider: Arc<dyn NetworkPolicyDecider> =
             Arc::new(|_req| async { NetworkDecision::ask(REASON_NOT_ALLOWED) });
         let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {

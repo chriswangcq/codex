@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "processId": {
+      "description": "Stable Qunux process identity for the current Codex session.",
+      "type": "string"
+    },
+    "qunuxThreadId": {
+      "description": "Qunux logical thread that produced or owns the snapshot.",
+      "type": "string"
+    },
+    "snapshot": {
+      "description": "Runtime snapshot payload. Currently mirrors the persisted Qunux closure state."
+    },
+    "statePath": {
+      "description": "Optional persisted snapshot path for debug/offline fallback.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "threadId": {
+      "description": "Codex thread that should receive and render this snapshot.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "processId",
+    "qunuxThreadId",
+    "snapshot",
+    "threadId"
+  ],
+  "title": "QunuxSnapshotNotification",
+  "type": "object"
+}

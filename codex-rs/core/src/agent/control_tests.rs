@@ -1,5 +1,7 @@
 use super::*;
 use crate::CodexThread;
+use crate::QunuxUserInputDelivery;
+use crate::QunuxUserInputDeliveryStatus;
 use crate::StateDbHandle;
 use crate::ThreadManager;
 use crate::agent::agent_status_from_event;
@@ -31,6 +33,9 @@ use codex_qunux::ContextForkPolicy;
 use codex_qunux::EntityKind;
 use codex_qunux::IoEventKind;
 use codex_qunux::IoHandleStatus;
+use codex_qunux::NextAction;
+use codex_qunux::PassiveEventInput;
+use codex_qunux::PassiveEventKind;
 use codex_qunux::QunuxRuntime;
 use codex_qunux::RuntimeContext;
 use codex_qunux::ThreadStatus;
@@ -81,6 +86,35 @@ fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
         }],
         phase,
     }
+}
+
+fn park_child_runtime_on_user_input(
+    child_runtime: &mut QunuxRuntime,
+    child_problem_id: &str,
+    reason: &str,
+) {
+    let child_ticket_id = child_runtime
+        .create_ticket(child_problem_id, "Await user input", "# Await user input")
+        .expect("child wait ticket");
+    child_runtime
+        .classify_ticket(
+            &child_ticket_id,
+            TicketClassification::OneGo,
+            "wait for user input",
+        )
+        .expect("classify child wait ticket");
+    child_runtime
+        .set_status(EntityKind::Problem, child_problem_id, "doing")
+        .expect("child problem doing");
+    child_runtime
+        .set_status(EntityKind::Ticket, &child_ticket_id, "executing")
+        .expect("child ticket executing");
+    child_runtime
+        .wait_for_user_input(None, None, None, reason)
+        .expect("park child on user input");
+    child_runtime
+        .validate()
+        .expect("child runtime should remain valid after parking");
 }
 
 fn spawn_agent_call(call_id: &str) -> ResponseItem {
@@ -374,6 +408,18 @@ async fn send_input_errors_when_thread_missing() {
         )
         .await
         .expect_err("send_input should fail for missing thread");
+    assert_matches!(err, CodexErr::ThreadNotFound(id) if id == thread_id);
+}
+
+#[tokio::test]
+async fn wake_qunux_dispatch_errors_when_thread_missing() {
+    let harness = AgentControlHarness::new().await;
+    let thread_id = ThreadId::new();
+    let err = harness
+        .control
+        .wake_qunux_dispatch(thread_id, "qunux-test-dispatch".to_string())
+        .await
+        .expect_err("wake should fail for missing thread");
     assert_matches!(err, CodexErr::ThreadNotFound(id) if id == thread_id);
 }
 
@@ -965,6 +1011,264 @@ async fn qunux_child_completion_auto_joins_done_child() {
             && event.handle_id.as_deref() == Some(spawned.handle_id.as_str())
             && event.thread_id.as_deref() == Some(spawned.thread_id.as_str())
     }));
+}
+
+#[tokio::test]
+async fn wake_qunux_dispatch_starts_live_child_pending_work() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let parent_context = RuntimeContext::for_session(
+        harness.config.cwd.to_path_buf(),
+        parent_thread_id.to_string(),
+    )
+    .expect("parent Qunux context");
+    let mut runtime =
+        QunuxRuntime::load_or_init(parent_context.clone(), "Root task", "# Root task")
+            .expect("init Qunux runtime");
+    let ticket_id = runtime
+        .create_ticket("P000", "Split work", "# Split work")
+        .expect("ticket");
+    runtime
+        .classify_ticket(&ticket_id, TicketClassification::Split, "spawn child")
+        .expect("classify");
+    runtime
+        .set_status(EntityKind::Ticket, &ticket_id, "splitting")
+        .expect("ticket splitting");
+    let child_problem_id = runtime
+        .create_problem_from_ticket("P000", &ticket_id, "Child work", "# Child work")
+        .expect("child problem");
+    let spawned = runtime
+        .spawn_thread(
+            &child_problem_id,
+            ContextForkPolicy::FullContext,
+            "bootstrap child".to_string(),
+            Some(harness.config.cwd.to_string_lossy().to_string()),
+            Some(
+                harness
+                    .config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "test-model".to_string()),
+            ),
+            vec!["qunux".to_string()],
+        )
+        .expect("spawn Qunux thread");
+    let child_qunux_context = RuntimeContext::with_ids(
+        harness.config.cwd.to_path_buf(),
+        parent_context.process_id.clone(),
+        spawned.thread_id.clone(),
+    )
+    .expect("child Qunux context")
+    .with_parent_actor_session_id(parent_thread_id.to_string())
+    .expect("parent actor binding");
+    let mut child_runtime =
+        QunuxRuntime::load(child_qunux_context.clone()).expect("load child runtime");
+    park_child_runtime_on_user_input(
+        &mut child_runtime,
+        &spawned.root_problem_id,
+        "test parks child before actor startup",
+    );
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::Qunux);
+
+    let child = harness
+        .manager
+        .start_thread_with_qunux_context_for_tests(
+            child_config,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            child_qunux_context.clone(),
+        )
+        .await
+        .expect("child spawn should succeed");
+    let child_thread_id = child.thread_id;
+    let child_thread = child.thread;
+    let mut child_runtime = QunuxRuntime::load(child_qunux_context).expect("reload child runtime");
+    child_runtime
+        .receive_passive_event(PassiveEventInput {
+            kind: PassiveEventKind::UserInput,
+            event_key: None,
+            target_thread_id: Some(spawned.thread_id.clone()),
+            condition: None,
+            source: Some("test".to_string()),
+            summary: "test user input".to_string(),
+            payload_ref: Some("turn:test".to_string()),
+            dedupe_key: Some("turn:test".to_string()),
+        })
+        .expect("wake child runtime");
+    assert_ne!(child_runtime.next().action, NextAction::WaitIo);
+
+    let before_ops = harness.manager.captured_ops().len();
+    let started = harness
+        .control
+        .wake_qunux_dispatch(child_thread_id, "qunux-child-dispatch-test".to_string())
+        .await
+        .expect("child wake should be accepted");
+    assert!(started, "child Qunux dispatch turn should start");
+    assert_eq!(
+        harness.manager.captured_ops().len(),
+        before_ops,
+        "Qunux dispatch wake must not send an ordinary child Op"
+    );
+
+    child_thread
+        .codex
+        .session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+}
+
+#[tokio::test]
+async fn deliver_qunux_user_input_routes_child_match_to_child_actor() {
+    let harness = AgentControlHarness::new().await;
+    let mut parent_config = harness.config.clone();
+    let _ = parent_config.features.enable(Feature::Qunux);
+    let parent = harness
+        .manager
+        .start_thread(parent_config)
+        .await
+        .expect("start parent thread");
+    let parent_thread_id = parent.thread_id;
+    let parent_thread = parent.thread;
+    let parent_context = parent_thread
+        .codex
+        .session
+        .services
+        .qunux_runtime_context
+        .clone()
+        .expect("parent Qunux context");
+
+    let mut runtime = QunuxRuntime::load(parent_context.clone()).expect("load parent runtime");
+    let ticket_id = runtime
+        .create_ticket("P000", "Split work", "# Split work")
+        .expect("ticket");
+    runtime
+        .classify_ticket(&ticket_id, TicketClassification::Split, "spawn child")
+        .expect("classify");
+    runtime
+        .set_status(EntityKind::Ticket, &ticket_id, "splitting")
+        .expect("ticket splitting");
+    let child_problem_id = runtime
+        .create_problem_from_ticket("P000", &ticket_id, "Child work", "# Child work")
+        .expect("child problem");
+    let spawned = runtime
+        .spawn_thread(
+            &child_problem_id,
+            ContextForkPolicy::FullContext,
+            "bootstrap child".to_string(),
+            Some(harness.config.cwd.to_string_lossy().to_string()),
+            Some(
+                harness
+                    .config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "test-model".to_string()),
+            ),
+            vec!["qunux".to_string()],
+        )
+        .expect("spawn Qunux thread");
+    let child_qunux_context = RuntimeContext::with_ids(
+        harness.config.cwd.to_path_buf(),
+        parent_context.process_id.clone(),
+        spawned.thread_id.clone(),
+    )
+    .expect("child Qunux context")
+    .with_parent_actor_session_id(parent_thread_id.to_string())
+    .expect("parent actor binding");
+    let mut child_runtime =
+        QunuxRuntime::load(child_qunux_context.clone()).expect("load child runtime");
+    park_child_runtime_on_user_input(
+        &mut child_runtime,
+        &spawned.root_problem_id,
+        "test parks child before parent delivery",
+    );
+
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::Qunux);
+    let child = harness
+        .manager
+        .start_thread_with_qunux_context_for_tests(
+            child_config,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            child_qunux_context,
+        )
+        .await
+        .expect("child thread should start");
+    let child_thread = child.thread;
+    let child_actor_id = child.thread_id.to_string();
+    let mut parent_runtime =
+        QunuxRuntime::load(parent_context.clone()).expect("reload parent runtime");
+    parent_runtime
+        .bind_thread_actor(&spawned.thread_id, child_actor_id.clone())
+        .expect("bind child actor for delivery test");
+    let parent_runtime = QunuxRuntime::load(parent_context.clone()).expect("reload parent runtime");
+    assert_eq!(
+        parent_runtime.target_thread_id_for_passive_event_kind(PassiveEventKind::UserInput),
+        spawned.thread_id,
+        "parent runtime should route user input to the child pending wait"
+    );
+    let route = parent_runtime
+        .thread_actor_route(&spawned.thread_id)
+        .expect("child route");
+    assert_eq!(
+        route.bound_actor_id(),
+        Some(child_actor_id.as_str()),
+        "child thread should be bound to the child Codex actor"
+    );
+
+    let before_ops = harness.manager.captured_ops().len();
+    let status = parent_thread
+        .deliver_qunux_user_input(QunuxUserInputDelivery {
+            summary: "user answered child wait".to_string(),
+            payload_ref: Some("turn:parent-delivery".to_string()),
+            dedupe_key: Some("turn:parent-delivery".to_string()),
+            condition: None,
+            source: None,
+        })
+        .await
+        .expect("parent delivery should route to child");
+
+    let status_debug = format!("{status:?}");
+    let QunuxUserInputDeliveryStatus::Matched {
+        runnable_thread_ids,
+        dispatch_turn_id,
+        ..
+    } = status
+    else {
+        panic!("expected matched child delivery, got {status_debug}");
+    };
+    assert_eq!(runnable_thread_ids, vec![spawned.thread_id.clone()]);
+    assert!(
+        dispatch_turn_id.is_some(),
+        "matched child delivery should start a child dispatch turn"
+    );
+    assert_eq!(
+        harness.manager.captured_ops().len(),
+        before_ops,
+        "matched child delivery must not send an ordinary child Op"
+    );
+
+    child_thread
+        .codex
+        .session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+    parent_thread
+        .codex
+        .session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
 }
 
 #[tokio::test]

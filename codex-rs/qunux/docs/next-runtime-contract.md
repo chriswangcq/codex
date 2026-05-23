@@ -27,7 +27,7 @@ The current mapping is:
 | disposition | actions |
 | --- | --- |
 | `runnable` | `create_solution_ticket`, `define_ticket`, `classify_ticket`, `execute_ticket`, `split_ticket`, `spawn_thread`, `join_thread`, `recover_thread`, `record_result`, `check_success` |
-| `io_wait` | `wait_thread` |
+| `io_wait` | `wait_thread`, `wait_io` |
 | `terminal` | `none` |
 
 This field is part of the runtime protocol so tools and dashboards do not need
@@ -43,6 +43,12 @@ It returns the current scoped frontier for the calling Qunux thread:
 - a runnable action when the thread can make progress,
 - an IO-wait action when progress depends on a handle/event,
 - `none` when the scoped subtree is closed.
+
+`recover_thread` is runnable, not IO-wait. A failed child actor is already a
+completed IO fact; the parent should not poll the dead actor. Recovery consumes
+the failed child-thread wait, marks the failed thread as recovered, returns the
+unfinished subtree to the parent thread, and lets the parent choose the next
+legal PTRC move such as spawning a replacement child.
 
 This pure surface is useful for tests, renderers, dashboards, and debugging.
 It may return `io_wait` directly because those consumers need to see why a
@@ -66,7 +72,15 @@ the same pure `next()` frontier. When pure `next()` returns `io_wait`, preflight
 parks the current agent loop on the relevant logical IO source when it knows how
 to do so.
 
-Today the supported IO wait is a child-thread wait:
+Today the supported IO waits are:
+
+- passive IO waits (`wait_io`) for user input, timer, or external-signal
+  handles. Dispatch preflight parks the agent loop and does not build model
+  context while the thread is waiting.
+- child-thread waits (`wait_thread`) for parent threads waiting on forked Qunux
+  child agents.
+
+For child-thread waits, preflight:
 
 1. resolve the target Qunux child thread,
 2. require a bound Codex actor id,

@@ -30,6 +30,34 @@ pub fn create_final_assistant_message_sse_response(message: &str) -> anyhow::Res
     ]))
 }
 
+pub fn create_empty_completed_sse_response() -> anyhow::Result<String> {
+    Ok(responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_completed("resp-1"),
+    ]))
+}
+
+pub fn create_qunux_ack_inbox_sse_response(
+    inbox_item_id: &str,
+    note: &str,
+    call_id: &str,
+) -> anyhow::Result<String> {
+    let tool_call_arguments = serde_json::to_string(&json!({
+        "inbox_item_id": inbox_item_id,
+        "note": note,
+    }))?;
+    Ok(responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_function_call_with_namespace(
+            call_id,
+            "qunux",
+            "ack_inbox",
+            &tool_call_arguments,
+        ),
+        responses::ev_completed("resp-1"),
+    ]))
+}
+
 pub fn create_apply_patch_sse_response(
     patch_content: &str,
     call_id: &str,

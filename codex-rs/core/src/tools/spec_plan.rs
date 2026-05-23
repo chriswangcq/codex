@@ -88,6 +88,7 @@ pub fn build_tool_registry_builder(
         &handlers,
         params.extension_tool_bundles,
         config.search_tool && !all_deferred_tools.is_empty(),
+        &all_deferred_tools,
     ) {
         builder.register_any_handler(handler);
     }
@@ -148,6 +149,7 @@ fn build_code_mode_handlers(
     handlers: &[Arc<dyn AnyToolHandler>],
     extension_tool_bundles: &[codex_tool_api::ToolBundle],
     deferred_tools_available: bool,
+    deferred_tools: &HashSet<ToolName>,
 ) -> Vec<Arc<dyn AnyToolHandler>> {
     if !config.code_mode_enabled {
         return vec![];
@@ -162,9 +164,14 @@ fn build_code_mode_handlers(
             .iter()
             .filter_map(|bundle| extension_tool_spec(bundle.spec()).ok()),
     );
-    let namespace_descriptions = code_mode_namespace_descriptions(&code_mode_nested_tool_specs);
+    let code_mode_prompt_tool_specs = code_mode_nested_tool_specs
+        .iter()
+        .cloned()
+        .filter_map(|spec| filter_deferred_tools_from_code_mode_prompt(spec, deferred_tools))
+        .collect::<Vec<_>>();
+    let namespace_descriptions = code_mode_namespace_descriptions(&code_mode_prompt_tool_specs);
     let mut enabled_tools =
-        collect_code_mode_exec_prompt_tool_definitions(code_mode_nested_tool_specs.iter());
+        collect_code_mode_exec_prompt_tool_definitions(code_mode_prompt_tool_specs.iter());
     enabled_tools
         .sort_by(|left, right| compare_code_mode_tools(left, right, &namespace_descriptions));
 
@@ -180,6 +187,46 @@ fn build_code_mode_handlers(
         )),
         Arc::new(CodeModeWaitHandler),
     ]
+}
+
+fn filter_deferred_tools_from_code_mode_prompt(
+    spec: ToolSpec,
+    deferred_tools: &HashSet<ToolName>,
+) -> Option<ToolSpec> {
+    if deferred_tools.is_empty() {
+        return Some(spec);
+    }
+
+    match spec {
+        ToolSpec::Function(tool) => {
+            if deferred_tools.contains(&ToolName::plain(tool.name.as_str())) {
+                None
+            } else {
+                Some(ToolSpec::Function(tool))
+            }
+        }
+        ToolSpec::Freeform(tool) => {
+            if deferred_tools.contains(&ToolName::plain(tool.name.as_str())) {
+                None
+            } else {
+                Some(ToolSpec::Freeform(tool))
+            }
+        }
+        ToolSpec::Namespace(mut namespace) => {
+            let namespace_name = namespace.name.clone();
+            namespace.tools.retain(|tool| match tool {
+                ResponsesApiNamespaceTool::Function(tool) => !deferred_tools.contains(
+                    &ToolName::namespaced(namespace_name.as_str(), tool.name.as_str()),
+                ),
+            });
+            if namespace.tools.is_empty() {
+                None
+            } else {
+                Some(ToolSpec::Namespace(namespace))
+            }
+        }
+        spec => Some(spec),
+    }
 }
 
 fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {

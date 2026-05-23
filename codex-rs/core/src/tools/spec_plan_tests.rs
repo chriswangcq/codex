@@ -461,25 +461,149 @@ fn qunux_tools_require_qunux_feature() {
     assert_eq!(
         namespace_function_names(&tools, "qunux"),
         vec![
+            "ack_inbox",
             "check",
             "classify_ticket",
             "create_problem",
             "create_ticket",
             "current",
+            "ingest_user_task",
             "join_thread",
             "list_threads",
             "next",
+            "recover_thread",
             "render",
             "result",
+            "scaffold_user_task",
             "set_status",
             "spawn_thread",
             "status",
             "thread_status",
             "validate",
+            "wait",
         ]
     );
     assert!(registry.has_handler(&ToolName::namespaced("qunux", "next")));
     assert!(registry.has_handler(&ToolName::namespaced("qunux", "check")));
+}
+
+#[test]
+fn qunux_ingest_user_task_schema_requires_content_fields() {
+    let model_info = model_info();
+    let available_models = Vec::new();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::Qunux);
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        permission_profile: &PermissionProfile::Disabled,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    );
+    let namespace_tool = find_tool(&tools, "qunux");
+    let ToolSpec::Namespace(namespace) = namespace_tool else {
+        panic!("expected qunux namespace tool");
+    };
+    let ingest_tool = namespace
+        .tools
+        .iter()
+        .find_map(|tool| match tool {
+            ResponsesApiNamespaceTool::Function(tool) if tool.name == "ingest_user_task" => {
+                Some(tool)
+            }
+            _ => None,
+        })
+        .expect("ingest_user_task tool");
+    let (properties, required) = expect_object_schema(&ingest_tool.parameters);
+
+    assert!(properties.contains_key("inbox_item_id"));
+    assert!(properties.contains_key("title"));
+    assert!(properties.contains_key("body"));
+    assert_eq!(
+        required.cloned().unwrap_or_default(),
+        vec!["inbox_item_id", "title", "body"]
+    );
+}
+
+#[test]
+fn qunux_scaffold_user_task_schema_requires_problem_and_ticket_fields() {
+    let model_info = model_info();
+    let available_models = Vec::new();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::Qunux);
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        permission_profile: &PermissionProfile::Disabled,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    );
+    let namespace_tool = find_tool(&tools, "qunux");
+    let ToolSpec::Namespace(namespace) = namespace_tool else {
+        panic!("expected qunux namespace tool");
+    };
+    let scaffold_tool = namespace
+        .tools
+        .iter()
+        .find_map(|tool| match tool {
+            ResponsesApiNamespaceTool::Function(tool) if tool.name == "scaffold_user_task" => {
+                Some(tool)
+            }
+            _ => None,
+        })
+        .expect("scaffold_user_task tool");
+    let (properties, required) = expect_object_schema(&scaffold_tool.parameters);
+
+    for field in [
+        "inbox_item_id",
+        "problem_title",
+        "problem_body",
+        "ticket_title",
+        "ticket_body",
+        "note",
+    ] {
+        assert!(properties.contains_key(field), "missing {field}");
+    }
+    for identity_field in [
+        "process_id",
+        "thread_id",
+        "owner_thread_id",
+        "actor_thread_id",
+    ] {
+        assert!(
+            !properties.contains_key(identity_field),
+            "must not expose {identity_field}"
+        );
+    }
+    assert_eq!(
+        required.cloned().unwrap_or_default(),
+        vec![
+            "inbox_item_id",
+            "problem_title",
+            "problem_body",
+            "ticket_title",
+            "ticket_body",
+            "note",
+        ]
+    );
 }
 
 #[test]

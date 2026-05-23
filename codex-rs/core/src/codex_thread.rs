@@ -7,6 +7,7 @@ use crate::session::SessionSettingsUpdate;
 use crate::session::SteerInputError;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
@@ -34,6 +35,7 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
+use codex_qunux::QunuxRuntime;
 use codex_thread_store::StoredThread;
 use codex_thread_store::StoredThreadHistory;
 use codex_thread_store::ThreadMetadataPatch;
@@ -96,6 +98,51 @@ pub struct CodexThreadTurnContextOverrides {
     pub personality: Option<Personality>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QunuxUserInputDelivery {
+    pub summary: String,
+    pub payload_ref: Option<String>,
+    pub dedupe_key: Option<String>,
+    pub condition: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QunuxUserInputDeliveryStatus {
+    Unavailable,
+    Inboxed {
+        event_id: String,
+        inbox_item_id: Option<String>,
+        dispatch_turn_id: Option<String>,
+    },
+    Matched {
+        event_id: String,
+        runnable_thread_ids: Vec<String>,
+        dispatch_turn_id: Option<String>,
+    },
+    Duplicate {
+        event_id: String,
+    },
+}
+
+impl QunuxUserInputDeliveryStatus {
+    pub fn matched_wait(&self) -> bool {
+        matches!(self, Self::Matched { .. })
+    }
+
+    pub fn dispatch_turn_id(&self) -> Option<&str> {
+        match self {
+            Self::Inboxed {
+                dispatch_turn_id, ..
+            }
+            | Self::Matched {
+                dispatch_turn_id, ..
+            } => dispatch_turn_id.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 pub struct CodexThread {
     pub(crate) codex: Codex,
     pub(crate) session_source: SessionSource,
@@ -124,6 +171,128 @@ impl CodexThread {
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.codex.submit(op).await
+    }
+
+    pub async fn deliver_qunux_user_input(
+        &self,
+        delivery: QunuxUserInputDelivery,
+    ) -> CodexResult<QunuxUserInputDeliveryStatus> {
+        let offer = crate::qunux_dispatch::offer_user_input_to_qunux(
+            self.codex.session.as_ref(),
+            crate::qunux_dispatch::QunuxUserInputEvent {
+                summary: delivery.summary,
+                payload_ref: delivery.payload_ref,
+                dedupe_key: delivery.dedupe_key,
+                condition: delivery.condition,
+                source: delivery.source,
+            },
+        )?;
+
+        let status = match offer {
+            crate::qunux_dispatch::QunuxUserInputOffer::Unavailable => {
+                QunuxUserInputDeliveryStatus::Unavailable
+            }
+            crate::qunux_dispatch::QunuxUserInputOffer::Inboxed {
+                event_id,
+                inbox_item_id,
+            } => {
+                *self.codex.session.qunux_auto_dispatch_key.lock().await = None;
+                let dispatch_turn_id =
+                    crate::qunux_dispatch::new_qunux_user_input_dispatch_turn_id();
+                let started = self
+                    .codex
+                    .session
+                    .maybe_start_turn_for_pending_work_with_sub_id(dispatch_turn_id.clone())
+                    .await;
+                QunuxUserInputDeliveryStatus::Inboxed {
+                    event_id,
+                    inbox_item_id,
+                    dispatch_turn_id: started.then_some(dispatch_turn_id),
+                }
+            }
+            crate::qunux_dispatch::QunuxUserInputOffer::Matched {
+                event_id,
+                runnable_thread_ids,
+            } => {
+                let dispatch_turn_id = self
+                    .start_qunux_dispatch_for_matched_threads(&runnable_thread_ids)
+                    .await?;
+                QunuxUserInputDeliveryStatus::Matched {
+                    event_id,
+                    runnable_thread_ids,
+                    dispatch_turn_id,
+                }
+            }
+            crate::qunux_dispatch::QunuxUserInputOffer::Duplicate { event_id } => {
+                QunuxUserInputDeliveryStatus::Duplicate { event_id }
+            }
+        };
+        Ok(status)
+    }
+
+    async fn start_qunux_dispatch_for_matched_threads(
+        &self,
+        runnable_thread_ids: &[String],
+    ) -> CodexResult<Option<String>> {
+        let context = self
+            .codex
+            .session
+            .services
+            .qunux_runtime_context
+            .clone()
+            .ok_or_else(|| {
+                CodexErr::Fatal(
+                    "Qunux user input matched a wait, but this session has no Qunux runtime context"
+                        .to_string(),
+                )
+            })?;
+        let runtime = QunuxRuntime::load(context).map_err(|err| {
+            CodexErr::Fatal(format!(
+                "failed to load Qunux runtime for matched user-input dispatch: {err}"
+            ))
+        })?;
+
+        let mut first_started_turn_id = None;
+        for qunux_thread_id in runnable_thread_ids {
+            let route = runtime.thread_actor_route(qunux_thread_id).map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "failed to resolve Qunux thread {qunux_thread_id} for matched user-input dispatch: {err}"
+                ))
+            })?;
+            let dispatch_turn_id = crate::qunux_dispatch::new_qunux_user_input_dispatch_turn_id();
+            let started = if route.is_current_thread {
+                // A passive event is a fresh wake source. The runnable next action may be
+                // textually identical to the last auto-dispatch key, so clear the de-dupe key
+                // before attempting to start the dispatch turn.
+                *self.codex.session.qunux_auto_dispatch_key.lock().await = None;
+                self.codex
+                    .session
+                    .maybe_start_turn_for_pending_work_with_sub_id(dispatch_turn_id.clone())
+                    .await
+            } else {
+                let actor_id = route.bound_actor_id().ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "Qunux thread {qunux_thread_id} matched user input but has no bound Codex actor"
+                    ))
+                })?;
+                let actor_thread_id = ThreadId::try_from(actor_id).map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "Qunux thread {qunux_thread_id} has invalid bound Codex actor id {actor_id}: {err}"
+                    ))
+                })?;
+                self.codex
+                    .session
+                    .services
+                    .agent_control
+                    .wake_qunux_dispatch(actor_thread_id, dispatch_turn_id.clone())
+                    .await?
+            };
+
+            if started && first_started_turn_id.is_none() {
+                first_started_turn_id = Some(dispatch_turn_id);
+            }
+        }
+        Ok(first_started_turn_id)
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -566,5 +735,152 @@ fn pending_message_input_item(message: &ResponseItem) -> CodexResult<ResponseInp
         _ => Err(CodexErr::InvalidRequest(
             "append_message only supports ResponseItem::Message".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::completed_session_loop_termination;
+    use crate::session::tests::make_session_and_context;
+    use codex_protocol::SessionId;
+    use codex_protocol::protocol::TurnAbortReason;
+    use codex_qunux::NextAction;
+    use codex_qunux::QunuxRuntime;
+    use codex_qunux::RuntimeContext;
+    use codex_qunux::ThreadStatus;
+    use core_test_support::TempDirExt;
+    use tokio::sync::watch;
+
+    async fn codex_thread_for_test(mut runtime_context: RuntimeContext) -> CodexThread {
+        let (mut session, _turn_context) = make_session_and_context().await;
+        let thread_id = session.thread_id();
+        runtime_context.thread_id = codex_qunux::DEFAULT_THREAD_ID.to_string();
+        session.services.qunux_runtime_context = Some(runtime_context);
+        let config = session.get_config().await;
+        let (tx_sub, _rx_sub) = async_channel::bounded(4);
+        let (_tx_event, rx_event) = async_channel::unbounded();
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let session_configured = SessionConfiguredEvent {
+            session_id: SessionId::from(thread_id),
+            thread_id,
+            forked_from_id: None,
+            thread_source: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: PermissionProfile::default(),
+            active_permission_profile: None,
+            cwd: config.cwd.clone(),
+            reasoning_effort: None,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: None,
+        };
+        let codex = Codex {
+            tx_sub,
+            rx_event,
+            agent_status,
+            session: Arc::new(session),
+            session_loop_termination: completed_session_loop_termination(),
+        };
+        CodexThread::new(codex, session_configured, None, SessionSource::Exec)
+    }
+
+    #[tokio::test]
+    async fn deliver_qunux_user_input_matches_wait_and_starts_dispatch_turn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let context = RuntimeContext::for_session(temp_dir.abs(), "actor-1").expect("context");
+        let mut runtime =
+            QunuxRuntime::load_or_init(context.clone(), "Root", "# Root").expect("runtime");
+        runtime
+            .wait_for_user_input(None, None, None, "need any user reply")
+            .expect("park on user input");
+        assert_eq!(runtime.next().action, NextAction::WaitIo);
+
+        let thread = codex_thread_for_test(context.clone()).await;
+        let status = thread
+            .deliver_qunux_user_input(QunuxUserInputDelivery {
+                summary: "user answered".to_string(),
+                payload_ref: Some("turn:codex-thread".to_string()),
+                dedupe_key: Some("turn:codex-thread".to_string()),
+                condition: None,
+                source: None,
+            })
+            .await
+            .expect("delivery should succeed");
+
+        let QunuxUserInputDeliveryStatus::Matched {
+            runnable_thread_ids,
+            dispatch_turn_id,
+            ..
+        } = status
+        else {
+            panic!("expected matched delivery");
+        };
+        assert_eq!(runnable_thread_ids, vec!["QT000".to_string()]);
+        let dispatch_turn_id = dispatch_turn_id.expect("dispatch turn id");
+        assert!(crate::qunux_dispatch::is_qunux_user_input_dispatch_turn_id(
+            &dispatch_turn_id
+        ));
+
+        let runtime = QunuxRuntime::load(context).expect("runtime reload");
+        assert_eq!(
+            runtime.current().status.thread_status,
+            ThreadStatus::Running
+        );
+        assert_ne!(runtime.next().action, NextAction::WaitIo);
+
+        thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deliver_qunux_user_input_inboxes_and_starts_dispatch_turn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let context = RuntimeContext::for_session(temp_dir.abs(), "actor-1").expect("context");
+        QunuxRuntime::load_or_init(context.clone(), "Root", "# Root").expect("runtime");
+
+        let thread = codex_thread_for_test(context.clone()).await;
+        let status = thread
+            .deliver_qunux_user_input(QunuxUserInputDelivery {
+                summary: "user asked for new work".to_string(),
+                payload_ref: Some("turn:codex-thread-inbox".to_string()),
+                dedupe_key: Some("turn:codex-thread-inbox".to_string()),
+                condition: None,
+                source: None,
+            })
+            .await
+            .expect("delivery should succeed");
+
+        let QunuxUserInputDeliveryStatus::Inboxed {
+            event_id,
+            inbox_item_id,
+            dispatch_turn_id,
+        } = status
+        else {
+            panic!("expected inboxed delivery");
+        };
+        assert_eq!(event_id, "PE000");
+        assert_eq!(inbox_item_id.as_deref(), Some("IN000"));
+        let dispatch_turn_id = dispatch_turn_id.expect("dispatch turn id");
+        assert!(crate::qunux_dispatch::is_qunux_user_input_dispatch_turn_id(
+            &dispatch_turn_id
+        ));
+
+        let runtime = QunuxRuntime::load(context).expect("runtime reload");
+        assert_eq!(runtime.next().action, NextAction::HandleInbox);
+
+        thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
     }
 }

@@ -706,6 +706,25 @@ impl AgentControl {
         result
     }
 
+    /// Start an internal Qunux dispatch turn on an existing agent thread.
+    ///
+    /// This is intentionally not implemented as `send_input`: passive Qunux wakes are scheduler
+    /// work for the child session, not ordinary user-visible chat messages to that child.
+    pub(crate) async fn wake_qunux_dispatch(
+        &self,
+        agent_id: ThreadId,
+        dispatch_turn_id: String,
+    ) -> CodexResult<bool> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        *thread.codex.session.qunux_auto_dispatch_key.lock().await = None;
+        Ok(thread
+            .codex
+            .session
+            .maybe_start_turn_for_pending_work_with_sub_id(dispatch_turn_id)
+            .await)
+    }
+
     /// Append a prebuilt message to an existing agent thread outside the normal user-input path.
     #[cfg(test)]
     pub(crate) async fn append_message(

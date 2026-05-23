@@ -9,6 +9,8 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_qunux::DEFAULT_ROOT_PROBLEM_BODY;
+use codex_qunux::DEFAULT_ROOT_PROBLEM_TITLE;
 use codex_qunux::DEFAULT_THREAD_ID;
 use codex_qunux::QunuxRuntime;
 use codex_qunux::RuntimeContext;
@@ -38,6 +40,7 @@ pub(crate) struct Session {
     pub(super) mailbox: Mailbox,
     pub(super) mailbox_rx: Mutex<MailboxReceiver>,
     pub(super) idle_pending_input: Mutex<Vec<ResponseInputItem>>, // TODO (jif) merge with mailbox!
+    pub(crate) qunux_auto_dispatch_key: Mutex<Option<String>>,
     pub(crate) goal_runtime: GoalRuntimeState,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -862,8 +865,8 @@ impl Session {
                 if let Some(context) = context.as_ref() {
                     let mut runtime = QunuxRuntime::load_or_init(
                         context.clone(),
-                        "Qunux root task",
-                        "# Qunux root task\n\nNative Codex Qunux process.",
+                        DEFAULT_ROOT_PROBLEM_TITLE,
+                        DEFAULT_ROOT_PROBLEM_BODY,
                     )?;
                     if let Some(actor_session_id) = context.actor_session_id.as_ref() {
                         let needs_bind = runtime
@@ -977,6 +980,7 @@ impl Session {
                 mailbox,
                 mailbox_rx: Mutex::new(mailbox_rx),
                 idle_pending_input: Mutex::new(Vec::new()),
+                qunux_auto_dispatch_key: Mutex::new(None),
                 goal_runtime: GoalRuntimeState::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
@@ -1143,6 +1147,12 @@ impl Session {
             {
                 let mut state = sess.state.lock().await;
                 state.set_pending_session_start_source(Some(session_start_source));
+            }
+            if config.features.enabled(Feature::Qunux) {
+                let sess_for_qunux = Arc::clone(&sess);
+                tokio::spawn(async move {
+                    sess_for_qunux.maybe_start_turn_for_pending_work().await;
+                });
             }
 
             Ok(sess)

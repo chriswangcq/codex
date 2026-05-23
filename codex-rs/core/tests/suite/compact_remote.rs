@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -2697,6 +2698,10 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.model_auto_compact_token_limit = Some(200);
+                config
+                    .mcp_servers
+                    .set(HashMap::new())
+                    .expect("test should be able to disable MCP servers");
             }),
     )
     .await?;

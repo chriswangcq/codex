@@ -22,11 +22,35 @@ async fn qunux_snapshot_notification_updates_cockpit_snapshot() {
 
     let snapshot = chat.qunux_snapshot.as_ref().expect("stored snapshot");
     assert_eq!(snapshot.process_id, "QP-live");
+    assert_eq!(snapshot.qunux_thread_id.as_deref(), Some("QT-live"));
     assert_eq!(
         snapshot.state_path.as_deref(),
         Some("/tmp/.qunux/processes/QP-live/closure.json")
     );
     assert_eq!(snapshot.state["main_thread_id"], "QT-live");
+}
+
+#[tokio::test]
+async fn qunux_rendering_preserves_active_transcript_cell() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config
+        .features
+        .enable(Feature::Qunux)
+        .expect("enable qunux");
+
+    handle_turn_started(&mut chat, "turn-1");
+    begin_exec(&mut chat, "call-1", "echo visible-active-cell");
+
+    let rendered = render_bottom_popup(&chat, /*width*/ 100);
+
+    assert!(
+        rendered.contains("visible-active-cell"),
+        "Qunux cockpit must not hide the active transcript cell:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Qunux Agent OS Cockpit"),
+        "Qunux cockpit should still render:\n{rendered}"
+    );
 }
 
 #[tokio::test]
