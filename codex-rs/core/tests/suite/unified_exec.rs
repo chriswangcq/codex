@@ -49,6 +49,12 @@ use regex_lite::Regex;
 use serde_json::Value;
 use serde_json::json;
 use tokio::time::Duration;
+use wiremock::Mock;
+use wiremock::Request;
+use wiremock::Respond;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -2171,6 +2177,286 @@ async fn write_stdin_returns_exit_metadata_and_clears_session() -> Result<()> {
         exit_chunk.chars().all(|c| c.is_ascii_hexdigit()),
         "chunk id should be hexadecimal: {exit_chunk}"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_monitor_output_starts_a_follow_up_turn() -> Result<()> {
+    skip_if_target_windows!(Ok(()), "uses a POSIX shell command");
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let args = serde_json::json!({
+        "command": "sleep 1; printf 'deployment-ready\\n'; sleep 2",
+        "description": "deployment readiness",
+        "timeout_ms": 10_000,
+        "persistent": false,
+    });
+    let responses = vec![
+        sse(vec![
+            ev_response_created("resp-monitor-start"),
+            ev_function_call("monitor-start", "monitor", &serde_json::to_string(&args)?),
+            ev_completed("resp-monitor-start"),
+        ]),
+        sse(vec![
+            ev_assistant_message("msg-monitor-started", "monitor attached"),
+            ev_completed("resp-monitor-attached"),
+        ]),
+        sse(vec![
+            ev_assistant_message("msg-monitor-event", "deployment is ready"),
+            ev_completed("resp-monitor-event"),
+        ]),
+    ];
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    submit_unified_exec_turn(&test, "monitor the deployment", PermissionProfile::Disabled).await?;
+
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            matches!(
+                event,
+                EventMsg::AgentMessage(message) if message.message == "deployment is ready"
+            )
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let follow_up = requests[2].body_json();
+    let input = follow_up["input"]
+        .as_array()
+        .expect("follow-up request input array");
+    assert!(input.iter().any(|item| {
+        item["content"].as_array().is_some_and(|content| {
+            content.iter().any(|part| {
+                part["text"].as_str().is_some_and(|text| {
+                    text.contains("<task-notification>")
+                        && text.contains("Monitor event: \"deployment readiness\"")
+                        && text.contains("<event>deployment-ready</event>")
+                })
+            })
+        })
+    }));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_monitor_timeout_survives_output_streams_closing_before_process_exit() -> Result<()>
+{
+    skip_if_target_windows!(Ok(()), "uses POSIX file-descriptor redirection");
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let pid_path = test.workspace_path("closed-monitor-streams.pid");
+    let command = format!(
+        "printf '%s' $$ > '{}'; exec 1>&- 2>&-; exec sleep 3000",
+        pid_path.to_string_lossy()
+    );
+    let args = serde_json::json!({
+        "command": command,
+        "description": "closed output streams",
+        "timeout_ms": 1_000,
+        "persistent": false,
+    });
+    let responses = vec![
+        sse(vec![
+            ev_response_created("resp-monitor-start"),
+            ev_function_call("monitor-start", "monitor", &serde_json::to_string(&args)?),
+            ev_completed("resp-monitor-start"),
+        ]),
+        sse(vec![
+            ev_assistant_message("msg-monitor-started", "monitor attached"),
+            ev_completed("resp-monitor-attached"),
+        ]),
+        sse(vec![
+            ev_assistant_message("msg-monitor-timeout", "timeout handled"),
+            ev_completed("resp-monitor-timeout"),
+        ]),
+    ];
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    submit_unified_exec_turn(&test, "watch a quiet process", PermissionProfile::Disabled).await?;
+
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            matches!(
+                event,
+                EventMsg::AgentMessage(message) if message.message == "timeout handled"
+            )
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    let pid = wait_for_pid_file(&pid_path).await?;
+    wait_for_process_exit(&pid).await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let follow_up = requests[2].body_json();
+    let follow_up_text = follow_up["input"]
+        .as_array()
+        .expect("follow-up request input array")
+        .iter()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(follow_up_text.contains("[Monitor timed out — re-arm if needed.]"));
+    assert!(!follow_up_text.contains(" stream ended"));
+    assert!(!follow_up_text.contains(" ended without producing output"));
+    assert!(!follow_up_text.contains(" script failed"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_stop_terminates_a_persistent_command_monitor_by_task_id() -> Result<()> {
+    skip_if_target_windows!(Ok(()), "uses a POSIX shell command");
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    struct TaskStopResponder {
+        calls: std::sync::atomic::AtomicUsize,
+        monitor_arguments: String,
+    }
+
+    impl Respond for TaskStopResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            use std::sync::atomic::Ordering;
+
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = match call {
+                0 => vec![
+                    ev_response_created("resp-monitor-persistent"),
+                    ev_function_call("monitor-persistent", "monitor", &self.monitor_arguments),
+                    ev_completed("resp-monitor-persistent"),
+                ],
+                1 => {
+                    let body: Value = serde_json::from_slice(&request.body)
+                        .expect("monitor continuation request should be JSON");
+                    let output = body["input"]
+                        .as_array()
+                        .and_then(|items| {
+                            items.iter().find(|item| {
+                                item["type"] == "function_call_output"
+                                    && item["call_id"] == "monitor-persistent"
+                            })
+                        })
+                        .and_then(extract_output_text)
+                        .expect("monitor start output should be present");
+                    let task_id = Regex::new(r"Monitor started \(task ([0-9a-z]{9}), persistent")
+                        .expect("valid task id regex")
+                        .captures(output)
+                        .and_then(|captures| captures.get(1))
+                        .map(|capture| capture.as_str())
+                        .expect("monitor output should contain a task id");
+                    let args = json!({ "task_id": task_id });
+                    vec![
+                        ev_response_created("resp-task-stop"),
+                        ev_function_call(
+                            "task-stop",
+                            "task_stop",
+                            &serde_json::to_string(&args)
+                                .expect("task_stop arguments should serialize"),
+                        ),
+                        ev_completed("resp-task-stop"),
+                    ]
+                }
+                2 => vec![
+                    ev_response_created("resp-task-stopped"),
+                    ev_assistant_message("msg-task-stopped", "monitor stopped"),
+                    ev_completed("resp-task-stopped"),
+                ],
+                _ => panic!("unexpected Responses call {call}"),
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse(events))
+        }
+    }
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let pid_path = test.workspace_path("monitor.pid");
+    let pid_path_str = pid_path.to_string_lossy();
+    let command = format!("printf '%s' $$ > '{pid_path_str}' && exec sleep 3000");
+    let monitor_args = json!({
+        "command": command,
+        "description": "persistent process",
+        "persistent": true,
+    });
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(TaskStopResponder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            monitor_arguments: serde_json::to_string(&monitor_args)?,
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    submit_unified_exec_turn(
+        &test,
+        &serde_json::to_string(&monitor_args)?,
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            matches!(
+                event,
+                EventMsg::AgentMessage(message) if message.message == "monitor stopped"
+            )
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    let pid = wait_for_pid_file(&pid_path).await?;
+    wait_for_process_exit(&pid).await?;
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let task_stop_output = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| body["input"].as_array().cloned())
+        .flatten()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "task-stop")
+        .and_then(|item| extract_output_text(&item).map(str::to_string))
+        .expect("task_stop output should be sent back to the model");
+    assert!(task_stop_output.contains("Successfully stopped task: b"));
+    assert!(task_stop_output.contains("\"task_type\":\"local_bash\""));
 
     Ok(())
 }

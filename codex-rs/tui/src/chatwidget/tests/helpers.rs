@@ -832,6 +832,8 @@ pub(super) fn begin_exec_with_source(
         process_id: None,
         plugin_id: None,
         script_path: None,
+        monitor: None,
+        monitor_termination_reason: None,
         source,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions,
@@ -857,6 +859,8 @@ pub(super) fn begin_unified_exec_startup(
         process_id: Some(process_id.to_string()),
         plugin_id: None,
         script_path: None,
+        monitor: None,
+        monitor_termination_reason: None,
         source: ExecCommandSource::UnifiedExecStartup,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions: Vec::new(),
@@ -866,6 +870,59 @@ pub(super) fn begin_unified_exec_startup(
     };
     handle_exec_begin(chat, item.clone());
     item
+}
+
+pub(super) fn begin_monitor(
+    chat: &mut ChatWidget,
+    call_id: &str,
+    process_id: &str,
+    command: &str,
+    description: &str,
+    task_id: &str,
+    timeout_ms: u64,
+) -> AppServerThreadItem {
+    let command = vec!["bash".to_string(), "-lc".to_string(), command.to_string()];
+    let item = AppServerThreadItem::CommandExecution {
+        id: call_id.to_string(),
+        command: codex_shell_command::parse_command::shlex_join(&command),
+        cwd: chat.config.cwd.clone().into(),
+        process_id: Some(process_id.to_string()),
+        plugin_id: None,
+        script_path: None,
+        monitor: Some(AppServerCommandMonitorInfo {
+            task_id: task_id.to_string(),
+            description: description.to_string(),
+            timeout_ms,
+            persistent: false,
+        }),
+        monitor_termination_reason: None,
+        source: ExecCommandSource::UnifiedExecStartup,
+        status: AppServerCommandExecutionStatus::InProgress,
+        command_actions: Vec::new(),
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+    };
+    handle_exec_begin(chat, item.clone());
+    item
+}
+
+pub(super) fn command_output_delta(chat: &mut ChatWidget, call_id: &str, delta: &str) {
+    chat.handle_server_notification(
+        ServerNotification::CommandExecutionOutputDelta(
+            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                thread_id: thread_id(chat),
+                turn_id: chat
+                    .turn_lifecycle
+                    .last_turn_id
+                    .clone()
+                    .unwrap_or_else(|| "turn-1".to_string()),
+                item_id: call_id.to_string(),
+                delta: delta.to_string(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
 }
 
 pub(super) fn handle_exec_begin(chat: &mut ChatWidget, item: AppServerThreadItem) {
@@ -1071,6 +1128,8 @@ pub(super) fn end_exec(
         process_id,
         plugin_id,
         script_path,
+        monitor,
+        monitor_termination_reason,
         source,
         command_actions,
         ..
@@ -1087,6 +1146,8 @@ pub(super) fn end_exec(
             process_id,
             plugin_id,
             script_path,
+            monitor,
+            monitor_termination_reason,
             source,
             status: if exit_code == 0 {
                 AppServerCommandExecutionStatus::Completed

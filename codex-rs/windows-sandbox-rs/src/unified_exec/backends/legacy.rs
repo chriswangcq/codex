@@ -189,8 +189,13 @@ fn terminate_job_or_process(
     job: &JobObject,
     process_handle: &Arc<StdMutex<Option<HANDLE>>>,
     logs_base_dir: Option<&Path>,
-) {
-    if let Err(job_err) = job.terminate() {
+    mode: codex_utils_pty::ProcessTerminationMode,
+) -> std::io::Result<()> {
+    let result = match mode {
+        codex_utils_pty::ProcessTerminationMode::Regular => job.terminate(),
+        codex_utils_pty::ProcessTerminationMode::Force => job.force_terminate(),
+    };
+    if let Err(job_err) = result {
         log_note(
             &format!("legacy spawn failed to terminate process tree: {job_err}"),
             logs_base_dir,
@@ -207,7 +212,14 @@ fn terminate_job_or_process(
                 logs_base_dir,
             );
         }
+        if mode == codex_utils_pty::ProcessTerminationMode::Force {
+            // Falling back to TerminateProcess can stop the root, but it cannot
+            // prove that the rest of the job was terminated. Checked force
+            // termination must therefore preserve the process-tree error.
+            return Err(job_err);
+        }
     }
+    Ok(())
 }
 
 fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()> {
@@ -422,7 +434,12 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
         let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
         if wait_res == WAIT_TIMEOUT {
-            terminate_job_or_process(&job_for_wait, &wait_handle, wait_logs_base_dir.as_deref());
+            let _ = terminate_job_or_process(
+                &job_for_wait,
+                &wait_handle,
+                wait_logs_base_dir.as_deref(),
+                codex_utils_pty::ProcessTerminationMode::Force,
+            );
         } else if let Err(err) = job_for_wait.preserve_descendants() {
             log_note(
                 &format!("legacy spawn failed to preserve descendants after root exit: {err}"),
@@ -454,9 +471,14 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         let job = Arc::clone(&job);
         let process_handle = Arc::clone(&process_handle);
         let logs_base_dir = common.logs_base_dir;
-        Some(Box::new(move || {
-            terminate_job_or_process(&job, &process_handle, logs_base_dir.as_deref());
-        }) as Box<dyn FnMut() + Send + Sync>)
+        Some(Box::new(move |mode| {
+            terminate_job_or_process(&job, &process_handle, logs_base_dir.as_deref(), mode)
+        })
+            as Box<
+                dyn FnMut(codex_utils_pty::ProcessTerminationMode) -> std::io::Result<()>
+                    + Send
+                    + Sync,
+            >)
     };
 
     let driver = ProcessDriver {

@@ -21,6 +21,7 @@ use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::CommandMonitorInfo;
 use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::EnvironmentConnectionNotification;
@@ -98,6 +99,7 @@ use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
+use codex_protocol::protocol::GuardianAssessmentAction;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::ReviewDecision;
@@ -279,9 +281,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                     command,
                     cwd,
                     command_actions,
+                    monitor,
                     ..
                 }) => Some((
                     id,
+                    monitor,
                     CommandExecutionCompletionItem {
                         plugin_id,
                         script_path,
@@ -297,8 +301,12 @@ pub(crate) async fn apply_bespoke_event_handling(
             } else {
                 assessment.turn_id.clone()
             };
+            let is_execve_review =
+                matches!(&assessment.action, GuardianAssessmentAction::Execve { .. });
             if assessment.status == codex_protocol::protocol::GuardianAssessmentStatus::InProgress
-                && let Some((target_item_id, completion_item)) = pending_command_execution.as_ref()
+                && !is_execve_review
+                && let Some((target_item_id, monitor, completion_item)) =
+                    pending_command_execution.as_ref()
             {
                 start_command_execution_item(
                     &conversation_id,
@@ -309,7 +317,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     completion_item.command.clone(),
                     completion_item.cwd.clone(),
                     completion_item.command_actions.clone(),
-                    CommandExecutionSource::Agent,
+                    monitor.clone(),
                     &outgoing,
                     &thread_state,
                 )
@@ -332,8 +340,26 @@ pub(crate) async fn apply_bespoke_event_handling(
                 codex_protocol::protocol::GuardianAssessmentStatus::InProgress
                 | codex_protocol::protocol::GuardianAssessmentStatus::Approved => None,
             };
+            // An execve review belongs to a subcommand of the target command item. Core owns both
+            // ends of the parent item's lifecycle, so Guardian must not synthesize either end for
+            // that same ID. This mirrors the approval-id correlation used by user-reviewed execve
+            // calls.
+            let suppress_execve_completion = if completion_status.is_some()
+                && is_execve_review
+                && let Some((target_item_id, ..)) = pending_command_execution.as_ref()
+            {
+                thread_state
+                    .lock()
+                    .await
+                    .turn_summary
+                    .command_execution_started
+                    .contains(target_item_id)
+            } else {
+                false
+            };
             if let Some(completion_status) = completion_status
-                && let Some((target_item_id, completion_item)) = pending_command_execution
+                && !suppress_execve_completion
+                && let Some((target_item_id, monitor, completion_item)) = pending_command_execution
             {
                 complete_command_execution_item(
                     &conversation_id,
@@ -341,7 +367,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     target_item_id,
                     completion_item,
                     /*process_id*/ None,
-                    CommandExecutionSource::Agent,
+                    monitor,
                     completion_status,
                     &outgoing,
                     &thread_state,
@@ -602,6 +628,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 environment_id,
                 started_at_ms,
                 command,
+                monitor,
                 cwd,
                 reason,
                 network_approval_context,
@@ -616,6 +643,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .cloned()
                 .map(|parsed| V2ParsedCommand::from_core_with_cwd(parsed, &cwd))
                 .collect::<Vec<_>>();
+            let monitor = monitor.map(CommandMonitorInfo::from);
             let presentation = if let Some(network_approval_context) =
                 network_approval_context.map(V2NetworkApprovalContext::from)
             {
@@ -660,7 +688,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     completion_item.command.clone(),
                     completion_item.cwd.clone(),
                     completion_item.command_actions.clone(),
-                    CommandExecutionSource::Agent,
+                    monitor.clone(),
                     &outgoing,
                     &thread_state,
                 )
@@ -707,6 +735,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     approval_id,
                     call_id,
                     completion_item,
+                    monitor,
                     pending_request_id,
                     rx,
                     conversation,
@@ -1358,7 +1387,7 @@ async fn start_command_execution_item(
     command: String,
     cwd: LegacyAppPathString,
     command_actions: Vec<V2ParsedCommand>,
-    source: CommandExecutionSource,
+    monitor: Option<CommandMonitorInfo>,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) -> bool {
@@ -1370,6 +1399,11 @@ async fn start_command_execution_item(
             .insert(item_id.clone())
     };
     if first_start {
+        let source = if monitor.is_some() {
+            CommandExecutionSource::UnifiedExecStartup
+        } else {
+            CommandExecutionSource::Agent
+        };
         let notification = ItemStartedNotification {
             thread_id: conversation_id.to_string(),
             turn_id,
@@ -1381,6 +1415,8 @@ async fn start_command_execution_item(
                 command,
                 cwd,
                 process_id: None,
+                monitor,
+                monitor_termination_reason: None,
                 source,
                 status: CommandExecutionStatus::InProgress,
                 command_actions,
@@ -1403,7 +1439,7 @@ async fn complete_command_execution_item(
     item_id: String,
     completion_item: CommandExecutionCompletionItem,
     process_id: Option<String>,
-    source: CommandExecutionSource,
+    monitor: Option<CommandMonitorInfo>,
     status: CommandExecutionStatus,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
@@ -1418,6 +1454,11 @@ async fn complete_command_execution_item(
         return;
     }
 
+    let source = if monitor.is_some() {
+        CommandExecutionSource::UnifiedExecStartup
+    } else {
+        CommandExecutionSource::Agent
+    };
     let item = ThreadItem::CommandExecution {
         id: item_id,
         plugin_id: completion_item.plugin_id,
@@ -1425,6 +1466,8 @@ async fn complete_command_execution_item(
         command: completion_item.command,
         cwd: completion_item.cwd,
         process_id,
+        monitor,
+        monitor_termination_reason: None,
         source,
         status,
         command_actions: completion_item.command_actions,
@@ -1970,6 +2013,7 @@ async fn on_command_execution_request_approval_response(
     approval_id: Option<String>,
     item_id: String,
     completion_item: Option<CommandExecutionCompletionItem>,
+    monitor: Option<CommandMonitorInfo>,
     pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
@@ -2072,7 +2116,7 @@ async fn on_command_execution_request_approval_response(
             item_id.clone(),
             completion_item,
             /*process_id*/ None,
-            CommandExecutionSource::Agent,
+            monitor,
             status,
             &outgoing,
             &thread_state,
@@ -2327,6 +2371,7 @@ mod tests {
             target_item_id: Some(id.to_string()),
             plugin_id: Some("sample@openai-curated".to_string()),
             script_path: Some("scripts/run.py".to_string()),
+            monitor: None,
             turn_id: turn_id.to_string(),
             started_at_ms: 1_000,
             completed_at_ms: (!matches!(status, GuardianAssessmentStatus::InProgress))
@@ -2348,6 +2393,25 @@ mod tests {
             }))
             .expect("guardian action"),
         }
+    }
+
+    fn guardian_execve_assessment(
+        id: &str,
+        turn_id: &str,
+        status: GuardianAssessmentStatus,
+        monitor: codex_protocol::protocol::CommandMonitorInfo,
+    ) -> GuardianAssessmentEvent {
+        let mut assessment = guardian_command_assessment(id, turn_id, status);
+        assessment.monitor = Some(monitor);
+        assessment.action = serde_json::from_value(json!({
+            "type": "execve",
+            "source": "unified_exec",
+            "program": "/usr/bin/rm",
+            "argv": ["/usr/bin/rm", "-f", format!("/tmp/{id}.sqlite")],
+            "cwd": test_path_buf("/tmp"),
+        }))
+        .expect("guardian execve action");
+        assessment
     }
 
     struct GuardianAssessmentTestContext {
@@ -2396,6 +2460,7 @@ mod tests {
                 target_item_id: Some("item-1".to_string()),
                 plugin_id: None,
                 script_path: None,
+                monitor: None,
                 turn_id: String::new(),
                 started_at_ms: 1_000,
                 completed_at_ms: None,
@@ -2444,6 +2509,7 @@ mod tests {
                 target_item_id: Some("item-2".to_string()),
                 plugin_id: None,
                 script_path: None,
+                monitor: None,
                 turn_id: "turn-from-assessment".to_string(),
                 started_at_ms: 1_000,
                 completed_at_ms: Some(1_042),
@@ -2500,6 +2566,7 @@ mod tests {
                 target_item_id: None,
                 plugin_id: None,
                 script_path: None,
+                monitor: None,
                 turn_id: "turn-from-assessment".to_string(),
                 started_at_ms: 1_000,
                 completed_at_ms: Some(1_042),
@@ -2546,6 +2613,12 @@ mod tests {
             ThreadId::new(),
         );
         let completion_item = command_execution_completion_item("printf hi");
+        let monitor = CommandMonitorInfo {
+            task_id: "b123monitor".to_string(),
+            description: "watch logs".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        };
 
         let first_start = start_command_execution_item(
             &conversation_id,
@@ -2556,7 +2629,7 @@ mod tests {
             completion_item.command.clone(),
             completion_item.cwd.clone(),
             completion_item.command_actions.clone(),
-            CommandExecutionSource::Agent,
+            Some(monitor.clone()),
             &outgoing,
             &thread_state,
         )
@@ -2577,7 +2650,9 @@ mod tests {
                         command: completion_item.command.clone(),
                         cwd: completion_item.cwd.clone(),
                         process_id: None,
-                        source: CommandExecutionSource::Agent,
+                        monitor: Some(monitor.clone()),
+                        monitor_termination_reason: None,
+                        source: CommandExecutionSource::UnifiedExecStartup,
                         status: CommandExecutionStatus::InProgress,
                         command_actions: completion_item.command_actions.clone(),
                         aggregated_output: None,
@@ -2598,7 +2673,7 @@ mod tests {
             completion_item.command.clone(),
             completion_item.cwd.clone(),
             completion_item.command_actions.clone(),
-            CommandExecutionSource::Agent,
+            Some(monitor),
             &outgoing,
             &thread_state,
         )
@@ -2609,8 +2684,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_command_execution_item_emits_declined_once_for_pending_command() -> Result<()>
-    {
+    async fn complete_command_execution_item_preserves_monitor_identity_and_emits_once()
+    -> Result<()> {
         let conversation_id = ThreadId::new();
         let thread_state = new_thread_state();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -2624,6 +2699,12 @@ mod tests {
             ThreadId::new(),
         );
         let completion_item = command_execution_completion_item("printf hi");
+        let monitor = CommandMonitorInfo {
+            task_id: "b123monitor".to_string(),
+            description: "watch logs".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        };
 
         start_command_execution_item(
             &conversation_id,
@@ -2634,12 +2715,28 @@ mod tests {
             completion_item.command.clone(),
             completion_item.cwd.clone(),
             completion_item.command_actions.clone(),
-            CommandExecutionSource::Agent,
+            Some(monitor.clone()),
             &outgoing,
             &thread_state,
         )
         .await;
         let _started = recv_broadcast_notification(&mut rx).await?;
+        let expected_item = ThreadItem::CommandExecution {
+            id: "cmd-1".to_string(),
+            plugin_id: completion_item.plugin_id.clone(),
+            script_path: completion_item.script_path.clone(),
+            command: completion_item.command.clone(),
+            cwd: completion_item.cwd.clone(),
+            process_id: None,
+            monitor: Some(monitor.clone()),
+            monitor_termination_reason: None,
+            source: CommandExecutionSource::UnifiedExecStartup,
+            status: CommandExecutionStatus::Declined,
+            command_actions: completion_item.command_actions.clone(),
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        };
 
         complete_command_execution_item(
             &conversation_id,
@@ -2647,7 +2744,7 @@ mod tests {
             "cmd-1".to_string(),
             completion_item,
             /*process_id*/ None,
-            CommandExecutionSource::Agent,
+            Some(monitor.clone()),
             CommandExecutionStatus::Declined,
             &outgoing,
             &thread_state,
@@ -2657,20 +2754,7 @@ mod tests {
         let completed = recv_broadcast_notification(&mut rx).await?;
         match completed {
             ServerNotification::ItemCompleted(payload) => {
-                let ThreadItem::CommandExecution {
-                    id,
-                    plugin_id,
-                    script_path,
-                    status,
-                    ..
-                } = payload.item
-                else {
-                    bail!("expected command execution completion");
-                };
-                assert_eq!(id, "cmd-1");
-                assert_eq!(plugin_id.as_deref(), Some("sample@openai-curated"));
-                assert_eq!(script_path.as_deref(), Some("scripts/run.py"));
-                assert_eq!(status, CommandExecutionStatus::Declined);
+                assert_eq!(payload.item, expected_item);
             }
             other => bail!("unexpected message: {other:?}"),
         }
@@ -2681,7 +2765,7 @@ mod tests {
             "cmd-1".to_string(),
             command_execution_completion_item("printf hi"),
             /*process_id*/ None,
-            CommandExecutionSource::Agent,
+            Some(monitor),
             CommandExecutionStatus::Declined,
             &outgoing,
             &thread_state,
@@ -2695,7 +2779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guardian_command_execution_notifications_wrap_review_lifecycle() -> Result<()> {
+    async fn guardian_command_and_execve_notifications_wrap_review_lifecycle() -> Result<()> {
         let codex_home = TempDir::new()?;
         let config = load_default_config_for_test(&codex_home).await;
         let thread_manager = Arc::new(
@@ -2806,12 +2890,20 @@ mod tests {
             "approved review should not complete the command item"
         );
 
+        let monitor = codex_protocol::protocol::CommandMonitorInfo {
+            task_id: "bguardian".to_string(),
+            description: "watch guardian command".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        };
+        let mut denied_started = guardian_command_assessment(
+            "cmd-guardian-denied",
+            "turn-guardian-denied",
+            GuardianAssessmentStatus::InProgress,
+        );
+        denied_started.monitor = Some(monitor.clone());
         guardian_context
-            .apply_guardian_assessment_event(guardian_command_assessment(
-                "cmd-guardian-denied",
-                "turn-guardian-denied",
-                GuardianAssessmentStatus::InProgress,
-            ))
+            .apply_guardian_assessment_event(denied_started)
             .await;
         let fourth = recv_broadcast_notification(&mut rx).await?;
         match fourth {
@@ -2821,6 +2913,8 @@ mod tests {
                     id,
                     plugin_id,
                     script_path,
+                    monitor: item_monitor,
+                    source,
                     status,
                     ..
                 } = payload.item
@@ -2830,6 +2924,8 @@ mod tests {
                 assert_eq!(id, "cmd-guardian-denied");
                 assert_eq!(plugin_id.as_deref(), Some("sample@openai-curated"));
                 assert_eq!(script_path.as_deref(), Some("scripts/run.py"));
+                assert_eq!(item_monitor, Some((&monitor).into()));
+                assert_eq!(source, CommandExecutionSource::UnifiedExecStartup);
                 assert_eq!(status, CommandExecutionStatus::InProgress);
             }
             other => bail!("unexpected message: {other:?}"),
@@ -2850,12 +2946,14 @@ mod tests {
             other => bail!("unexpected message: {other:?}"),
         }
 
+        let mut denied_completed = guardian_command_assessment(
+            "cmd-guardian-denied",
+            "turn-guardian-denied",
+            GuardianAssessmentStatus::Denied,
+        );
+        denied_completed.monitor = Some(monitor.clone());
         guardian_context
-            .apply_guardian_assessment_event(guardian_command_assessment(
-                "cmd-guardian-denied",
-                "turn-guardian-denied",
-                GuardianAssessmentStatus::Denied,
-            ))
+            .apply_guardian_assessment_event(denied_completed)
             .await;
         let sixth = recv_broadcast_notification(&mut rx).await?;
         match sixth {
@@ -2877,6 +2975,8 @@ mod tests {
                     id,
                     plugin_id,
                     script_path,
+                    monitor: item_monitor,
+                    source,
                     status,
                     ..
                 } = payload.item
@@ -2886,6 +2986,8 @@ mod tests {
                 assert_eq!(id, "cmd-guardian-denied");
                 assert_eq!(plugin_id.as_deref(), Some("sample@openai-curated"));
                 assert_eq!(script_path.as_deref(), Some("scripts/run.py"));
+                assert_eq!(item_monitor, Some((&monitor).into()));
+                assert_eq!(source, CommandExecutionSource::UnifiedExecStartup);
                 assert_eq!(status, CommandExecutionStatus::Declined);
             }
             other => bail!("unexpected message: {other:?}"),
@@ -2909,6 +3011,105 @@ mod tests {
                     payload.review.status,
                     GuardianApprovalReviewStatus::InProgress
                 );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        let execve_item_id = "cmd-guardian-execve-monitor-denied";
+        let execve_turn_id = "turn-guardian-execve-monitor-denied";
+        let execve_monitor = codex_protocol::protocol::CommandMonitorInfo {
+            task_id: "bexecve2".to_string(),
+            description: "watch execve guardian command".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        };
+        let execve_monitor_v2 = CommandMonitorInfo::from(&execve_monitor);
+        let execve_parent = command_execution_completion_item("watch deployment");
+        assert!(
+            start_command_execution_item(
+                &conversation_id,
+                execve_turn_id.to_string(),
+                execve_item_id.to_string(),
+                execve_parent.plugin_id.clone(),
+                execve_parent.script_path.clone(),
+                execve_parent.command.clone(),
+                execve_parent.cwd.clone(),
+                execve_parent.command_actions.clone(),
+                Some(execve_monitor_v2.clone()),
+                &outgoing,
+                &thread_state,
+            )
+            .await
+        );
+        let parent_started = recv_broadcast_notification(&mut rx).await?;
+        assert!(matches!(parent_started, ServerNotification::ItemStarted(_)));
+
+        guardian_context
+            .apply_guardian_assessment_event(guardian_execve_assessment(
+                execve_item_id,
+                execve_turn_id,
+                GuardianAssessmentStatus::InProgress,
+                execve_monitor.clone(),
+            ))
+            .await;
+        let execve_review_started = recv_broadcast_notification(&mut rx).await?;
+        match execve_review_started {
+            ServerNotification::ItemGuardianApprovalReviewStarted(payload) => {
+                assert_eq!(payload.target_item_id.as_deref(), Some(execve_item_id));
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        guardian_context
+            .apply_guardian_assessment_event(guardian_execve_assessment(
+                execve_item_id,
+                execve_turn_id,
+                GuardianAssessmentStatus::Denied,
+                execve_monitor,
+            ))
+            .await;
+        let execve_review_completed = recv_broadcast_notification(&mut rx).await?;
+        match execve_review_completed {
+            ServerNotification::ItemGuardianApprovalReviewCompleted(payload) => {
+                assert_eq!(payload.target_item_id.as_deref(), Some(execve_item_id));
+                assert_eq!(payload.review.status, GuardianApprovalReviewStatus::Denied);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "execve denial must not synthesize a terminal item for the parent command"
+        );
+
+        complete_command_execution_item(
+            &conversation_id,
+            execve_turn_id.to_string(),
+            execve_item_id.to_string(),
+            execve_parent,
+            Some("42".to_string()),
+            Some(execve_monitor_v2.clone()),
+            CommandExecutionStatus::Failed,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+        let parent_completed = recv_broadcast_notification(&mut rx).await?;
+        match parent_completed {
+            ServerNotification::ItemCompleted(payload) => {
+                let ThreadItem::CommandExecution {
+                    id,
+                    monitor,
+                    source,
+                    status,
+                    ..
+                } = payload.item
+                else {
+                    bail!("expected command execution completion");
+                };
+                assert_eq!(id, execve_item_id);
+                assert_eq!(monitor, Some(execve_monitor_v2));
+                assert_eq!(source, CommandExecutionSource::UnifiedExecStartup);
+                assert_eq!(status, CommandExecutionStatus::Failed);
             }
             other => bail!("unexpected message: {other:?}"),
         }

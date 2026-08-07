@@ -110,6 +110,69 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     })
 }
 
+pub(crate) fn create_monitor_tool(include_environment_id: bool) -> ToolSpec {
+    let mut properties = BTreeMap::from([
+        (
+            "command".to_string(),
+            JsonSchema::string(Some("Shell command to run and monitor.".to_string())),
+        ),
+        (
+            "description".to_string(),
+            JsonSchema::string(Some("Short label shown for monitor events.".to_string())),
+        ),
+        (
+            "timeout_ms".to_string(),
+            JsonSchema::number(Some("Maximum lifetime in milliseconds from 1000 to 3600000. Defaults to 300000 and is ignored when persistent is true.".to_string())),
+        ),
+        (
+            "persistent".to_string(),
+            JsonSchema::boolean(Some("Run until explicitly stopped or the session ends, ignoring timeout_ms. Defaults to false.".to_string())),
+        ),
+    ]);
+    if include_environment_id {
+        properties.insert(
+            "environment_id".to_string(),
+            JsonSchema::string(Some(
+                "Local execution environment in which to run the monitor.".to_string(),
+            )),
+        );
+    }
+    ToolSpec::Function(ResponsesApiTool {
+        name: "monitor".to_string(),
+        description: "Run a command in the background and react to each line of stdout as an event. The command uses the same permissions and sandbox as shell commands. Do not poll or sleep after starting a monitor; events wake Codex automatically.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["command".to_string(), "description".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: Some(monitor_output_schema()),
+    })
+}
+
+fn monitor_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "taskId": {
+                "type": "string",
+                "description": "Identifier used by task_stop and monitor notifications."
+            },
+            "timeoutMs": {
+                "type": "number",
+                "description": "Effective deadline in milliseconds, or 0 for a persistent monitor."
+            },
+            "persistent": {
+                "type": "boolean",
+                "description": "Whether the monitor runs until explicitly stopped or the session ends."
+            }
+        },
+        "required": ["taskId", "timeoutMs", "persistent"],
+        "additionalProperties": false
+    })
+}
+
 pub fn create_write_stdin_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (

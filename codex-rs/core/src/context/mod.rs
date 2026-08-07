@@ -6,6 +6,7 @@ mod available_plugins_instructions;
 mod contextual_user_message;
 mod current_time_reminder;
 mod environment_context;
+pub(crate) use environment_context::push_xml_escaped_text;
 mod environments_instructions;
 mod guardian_followup_review_reminder;
 mod hook_additional_context;

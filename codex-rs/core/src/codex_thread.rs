@@ -206,11 +206,23 @@ struct OutOfBandElicitations {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct BackgroundTerminalOutput {
+    pub tail: Vec<u8>,
+    pub bytes_total: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct BackgroundTerminalInfo {
     pub item_id: String,
     pub process_id: String,
     pub command: String,
     pub cwd: PathUri,
+    pub monitor: Option<codex_protocol::protocol::CommandMonitorInfo>,
+    /// A raw combined stdout/stderr snapshot for command monitors. Ordinary
+    /// background shells do not expose a lifetime output snapshot because
+    /// polling them drains their process buffer.
+    pub output: Option<BackgroundTerminalOutput>,
 }
 
 /// Conduit for the bidirectional stream of messages that compose a thread

@@ -75,6 +75,8 @@ export type { CommandExecutionRequestApprovalResponse } from "./CommandExecution
 export type { CommandExecutionSource } from "./CommandExecutionSource";
 export type { CommandExecutionStatus } from "./CommandExecutionStatus";
 export type { CommandMigration } from "./CommandMigration";
+export type { CommandMonitorInfo } from "./CommandMonitorInfo";
+export type { CommandMonitorTerminationReason } from "./CommandMonitorTerminationReason";
 export type { ComputerUseRequirements } from "./ComputerUseRequirements";
 export type { Config } from "./Config";
 export type { ConfigBatchWriteParams } from "./ConfigBatchWriteParams";

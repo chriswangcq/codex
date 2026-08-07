@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests/exec_flow.rs
+expression: "lines_to_single_string(&ps[0])"
+---
+/ps
+
+Monitors
+
+  • Monitor(pixel event probe) · task b0nftx2ad · timeout 300s
+    ↳ ready
+      second

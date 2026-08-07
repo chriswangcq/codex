@@ -114,6 +114,48 @@ fn exec_command_tool_can_hide_shell_parameter() {
 }
 
 #[test]
+fn monitor_tool_matches_command_contract() {
+    let tool = create_monitor_tool(/*include_environment_id*/ false);
+    let serialized = serde_json::to_value(&tool).expect("monitor spec should serialize");
+    let ToolSpec::Function(function) = &tool else {
+        panic!("monitor should be a function tool");
+    };
+
+    assert_eq!(serialized["name"], "monitor");
+    assert_eq!(
+        serialized["parameters"]["required"],
+        serde_json::json!(["command", "description"])
+    );
+    assert_eq!(
+        serialized["parameters"]["additionalProperties"],
+        serde_json::Value::Bool(false)
+    );
+    assert_eq!(
+        function.output_schema.as_ref(),
+        Some(&monitor_output_schema())
+    );
+    assert_eq!(
+        function
+            .output_schema
+            .as_ref()
+            .expect("monitor output schema")["required"],
+        serde_json::json!(["taskId", "timeoutMs", "persistent"])
+    );
+}
+
+#[test]
+fn monitor_tool_exposes_environment_selector_only_when_needed() {
+    assert!(!has_parameter(
+        &create_monitor_tool(/*include_environment_id*/ false),
+        "environment_id"
+    ));
+    assert!(has_parameter(
+        &create_monitor_tool(/*include_environment_id*/ true),
+        "environment_id"
+    ));
+}
+
+#[test]
 fn write_stdin_tool_matches_expected_spec() {
     let tool = create_write_stdin_tool();
 

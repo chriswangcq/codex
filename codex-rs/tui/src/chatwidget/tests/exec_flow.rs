@@ -291,6 +291,100 @@ async fn unified_exec_begin_restores_working_status_snapshot() {
 }
 
 #[tokio::test]
+async fn monitor_lifecycle_renders_events_and_footer() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    let begin = begin_monitor(
+        &mut chat,
+        "monitor-call-1",
+        "401",
+        "printf 'ready\\nsecond\\npartial'",
+        "pixel event probe",
+        "b0nftx2ad",
+        300_000,
+    );
+    assert_eq!(
+        chat.bottom_pane.background_process_summary().as_deref(),
+        Some("1 monitor · ↓ to manage")
+    );
+    let started = drain_insert_history(&mut rx);
+    assert_eq!(started.len(), 1);
+    assert_chatwidget_snapshot!(
+        "monitor_started_history",
+        lines_to_single_string(&started[0])
+    );
+
+    command_output_delta(&mut chat, "monitor-call-1", "ready\nsecond\n");
+    let events = drain_insert_history(&mut rx);
+    assert_eq!(events.len(), 1);
+    let rendered_events = events
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        rendered_events.matches("⏺ Monitor event").count(),
+        1,
+        "one authoritative output delta must remain one monitor event cell"
+    );
+    assert_chatwidget_snapshot!("monitor_output_events", rendered_events);
+
+    chat.add_ps_output();
+    let ps = drain_insert_history(&mut rx);
+    assert_eq!(ps.len(), 1);
+    assert_chatwidget_snapshot!("monitor_ps_output", lines_to_single_string(&ps[0]));
+
+    end_exec(
+        &mut chat,
+        begin,
+        "ready\nsecond\nsecret from stderr\n",
+        "",
+        /*exit_code*/ 0,
+    );
+    let completed = drain_insert_history(&mut rx);
+    assert!(
+        completed.is_empty(),
+        "monitor end must not render aggregate output"
+    );
+    assert_eq!(chat.bottom_pane.background_process_summary(), None);
+}
+
+#[tokio::test]
+async fn down_opens_single_monitor_details_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    begin_monitor(
+        &mut chat,
+        "monitor-call-1",
+        "401",
+        "tail -f app.log",
+        "deployment readiness",
+        "task-monitor-1",
+        300_000,
+    );
+    command_output_delta(&mut chat, "monitor-call-1", "ready\nhealthy\n");
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert!(chat.has_active_view());
+
+    let width = 80;
+    let height = chat.desired_height(width);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("create terminal");
+    terminal
+        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+        .expect("render monitor details");
+    assert_chatwidget_snapshot!(
+        "single_monitor_manage_details",
+        normalized_backend_snapshot(terminal.backend())
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!chat.has_active_view());
+}
+
+#[tokio::test]
 async fn exec_history_cell_shows_working_then_completed() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -366,6 +460,8 @@ async fn exec_end_without_begin_uses_event_command() {
             process_id: None,
             plugin_id: None,
             script_path: None,
+            monitor: None,
+            monitor_termination_reason: None,
             source: ExecCommandSource::Agent,
             status: AppServerCommandExecutionStatus::Completed,
             command_actions,
@@ -703,12 +799,13 @@ async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
 async fn unified_exec_wait_status_header_updates_on_late_command_display() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
-    chat.unified_exec_processes.push(UnifiedExecProcessSummary {
-        key: "proc-1".to_string(),
-        call_id: "call-1".to_string(),
-        command_display: "sleep 5".to_string(),
-        recent_chunks: Vec::new(),
-    });
+    chat.unified_exec_processes
+        .push(UnifiedExecProcessSummary::new(
+            "proc-1".to_string(),
+            "call-1".to_string(),
+            "sleep 5".to_string(),
+            /*monitor*/ None,
+        ));
 
     terminal_interaction(&mut chat, "call-1", "proc-1", "");
 
@@ -1398,6 +1495,48 @@ async fn turn_complete_keeps_unified_exec_processes() {
     );
 
     let _ = drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn turn_complete_footer_includes_running_monitor() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+
+    let exec = begin_exec_with_source(
+        &mut chat,
+        "call-1",
+        "echo preparing",
+        ExecCommandSource::Agent,
+    );
+    end_exec(&mut chat, exec, "preparing\n", "", /*exit_code*/ 0);
+    begin_monitor(
+        &mut chat,
+        "monitor-call-1",
+        "401",
+        "tail -f app.log",
+        "deployment readiness",
+        "task-monitor-1",
+        300_000,
+    );
+    complete_assistant_message(
+        &mut chat,
+        "msg-final",
+        "The monitor is still running.",
+        Some(MessagePhase::FinalAnswer),
+    );
+    handle_turn_completed(&mut chat, "turn-1", Some(61_000));
+
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("Baked for 1m 01s · 1 monitor still running"),
+        "expected running monitor in the existing turn footer, got:\n{combined}"
+    );
+    assert_chatwidget_snapshot!("turn_complete_footer_running_monitor", combined);
 }
 
 #[tokio::test]

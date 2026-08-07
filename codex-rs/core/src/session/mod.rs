@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -202,6 +203,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
+mod command_monitor;
 mod config_lock;
 pub(crate) mod context_window;
 mod extension_metrics;
@@ -237,6 +239,8 @@ use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
 use self::session::SessionConfiguration;
+#[cfg(test)]
+use self::session::SessionRuntimeGate;
 pub(crate) use self::session::SessionSettingsUpdate;
 #[cfg(test)]
 use self::turn::AssistantMessageStreamParsers;
@@ -2306,6 +2310,7 @@ impl Session {
         approval_id: Option<String>,
         environment_id: Option<String>,
         command: Vec<String>,
+        monitor: Option<codex_protocol::protocol::CommandMonitorInfo>,
         cwd: AbsolutePathBuf,
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
@@ -2370,6 +2375,7 @@ impl Session {
             environment_id,
             started_at_ms: now_unix_timestamp_ms(),
             command,
+            monitor,
             cwd,
             reason,
             network_approval_context,

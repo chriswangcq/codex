@@ -191,6 +191,10 @@ pub struct GuardianAssessmentEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub script_path: Option<String>,
+    /// Command monitor metadata, when the reviewed item is a monitor task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub monitor: Option<crate::protocol::CommandMonitorInfo>,
     /// Turn ID that this assessment belongs to.
     /// Uses `#[serde(default)]` for backwards compatibility.
     #[serde(default)]
@@ -259,6 +263,10 @@ pub struct ExecApprovalRequestEvent {
     pub started_at_ms: i64,
     /// The command to be executed.
     pub command: Vec<String>,
+    /// Command monitor metadata, when this approval belongs to a monitor task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub monitor: Option<crate::protocol::CommandMonitorInfo>,
     /// The command's working directory.
     pub cwd: AbsolutePathBuf,
     /// Optional human-readable reason for the approval (e.g. retry without sandbox).
@@ -474,5 +482,38 @@ mod tests {
                 cwd: test_path_buf("/tmp").abs(),
             }
         );
+    }
+
+    #[test]
+    fn exec_approval_request_defaults_legacy_monitor_metadata() {
+        let event: ExecApprovalRequestEvent = serde_json::from_value(serde_json::json!({
+            "call_id": "call-1",
+            "turn_id": "turn-1",
+            "started_at_ms": 0,
+            "command": ["echo", "hello"],
+            "cwd": test_path_buf("/tmp"),
+            "parsed_cmd": [],
+        }))
+        .expect("legacy exec approval request");
+
+        assert_eq!(event.monitor, None);
+    }
+
+    #[test]
+    fn guardian_assessment_defaults_legacy_monitor_metadata() {
+        let event: GuardianAssessmentEvent = serde_json::from_value(serde_json::json!({
+            "id": "review-1",
+            "turn_id": "turn-1",
+            "status": "in_progress",
+            "action": {
+                "type": "command",
+                "source": "unified_exec",
+                "command": "tail -f app.log",
+                "cwd": test_path_buf("/tmp"),
+            },
+        }))
+        .expect("legacy guardian assessment");
+
+        assert_eq!(event.monitor, None);
     }
 }

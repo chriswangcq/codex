@@ -150,8 +150,17 @@ impl ChatWidget {
                 (!self.turn_runtime_metrics.is_empty()).then_some(self.turn_runtime_metrics);
             let show_work_separator = self.transcript.had_work_activity
                 && (self.transcript.needs_final_message_separator || runtime_metrics.is_some());
-            if show_work_separator || runtime_metrics.is_some() {
-                let elapsed_seconds = if show_work_separator {
+            let monitor_count = self
+                .unified_exec_processes
+                .iter()
+                .filter(|process| process.monitor_info().is_some())
+                .count();
+            let shell_count = self
+                .unified_exec_processes
+                .len()
+                .saturating_sub(monitor_count);
+            if show_work_separator || runtime_metrics.is_some() || monitor_count > 0 {
+                let elapsed_seconds = if show_work_separator || monitor_count > 0 {
                     duration_ms
                         .and_then(|duration_ms| u64::try_from(duration_ms).ok())
                         .map(|duration_ms| duration_ms / 1_000)
@@ -163,10 +172,14 @@ impl ChatWidget {
                 } else {
                     None
                 };
-                self.add_to_history(history_cell::FinalMessageSeparator::new(
-                    elapsed_seconds,
-                    runtime_metrics,
-                ));
+                let separator =
+                    history_cell::FinalMessageSeparator::new(elapsed_seconds, runtime_metrics);
+                let separator = if monitor_count > 0 {
+                    separator.with_background_processes(shell_count, monitor_count)
+                } else {
+                    separator
+                };
+                self.add_to_history(separator);
             }
             self.turn_runtime_metrics = RuntimeMetricsSummary::default();
             self.transcript.needs_final_message_separator = false;

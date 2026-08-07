@@ -5889,6 +5889,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         mcp_prewarm_task: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        session_runtime_gate: SessionRuntimeGate::default(),
         pending_user_message_admissions: Default::default(),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -8108,6 +8109,7 @@ where
         mcp_prewarm_task: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        session_runtime_gate: SessionRuntimeGate::default(),
         pending_user_message_admissions: Default::default(),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -10633,6 +10635,26 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
         (Vec::<TurnInput>::new(), None),
         sess.input_queue.get_pending_input(&sess.active_turn).await
     );
+}
+
+#[tokio::test]
+async fn try_start_monitor_turn_if_idle_wakes_plan_mode() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let mut collaboration_mode = sess.collaboration_mode().await;
+    collaboration_mode.mode = ModeKind::Plan;
+    {
+        let mut state = sess.state.lock().await;
+        state.session_configuration.collaboration_mode = collaboration_mode;
+    }
+
+    let item = TurnInput::ResponseItem(user_message("monitor event"));
+    sess.try_start_monitor_turn_if_idle(vec![item])
+        .await
+        .expect("monitor notifications should wake plan mode");
+
+    assert!(sess.active_turn.lock().await.is_some());
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]

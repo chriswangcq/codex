@@ -653,9 +653,164 @@ fn final_message_separator_includes_worked_label_after_one_minute() {
 }
 
 #[test]
+fn final_message_separator_running_monitors_snapshot() {
+    let cell = FinalMessageSeparator::new(Some(61), /*runtime_metrics*/ None)
+        .with_background_processes(/*shell_count*/ 0, /*monitor_count*/ 2);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn final_message_separator_short_monitor_turn_snapshot() {
+    let cell = FinalMessageSeparator::new(Some(9), /*runtime_metrics*/ None)
+        .with_background_processes(/*shell_count*/ 0, /*monitor_count*/ 1)
+        .with_monitor_duration_verb("Baked");
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    assert!(rendered.contains("Baked for 9s · 1 monitor still running"));
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn final_message_separator_mixed_background_processes_snapshot() {
+    let cell = FinalMessageSeparator::new(Some(61), /*runtime_metrics*/ None)
+        .with_background_processes(/*shell_count*/ 1, /*monitor_count*/ 2);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
 fn ps_output_empty_snapshot() {
     let cell = new_unified_exec_processes_output(Vec::new());
     let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn monitor_started_snapshot() {
+    let cell = new_monitor_started(
+        "pixel event probe".to_string(),
+        "b0nftx2ad".to_string(),
+        300_000,
+        /*persistent*/ false,
+    );
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn monitor_started_narrow_snapshot() {
+    let cell = new_monitor_started(
+        "deployment readiness watcher".to_string(),
+        "b0nftx2ad".to_string(),
+        300_000,
+        /*persistent*/ false,
+    );
+    let rendered = render_lines(&cell.display_lines(/*width*/ 28)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn monitor_started_persistent_snapshot() {
+    let cell = new_monitor_started(
+        "server readiness".to_string(),
+        "srv7k2".to_string(),
+        /*timeout_ms*/ 0,
+        /*persistent*/ true,
+    );
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn monitor_completed_with_aggregate_snapshot() {
+    let cell = new_monitor_completed(
+        "pixel event probe".to_string(),
+        "b0nftx2ad".to_string(),
+        codex_app_server_protocol::CommandExecutionStatus::Completed,
+        None,
+        Some("ready\nsecret from stderr\n".to_string()),
+        Some(0),
+    );
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    assert!(rendered.contains("Monitor completed"));
+    assert!(rendered.contains("ready"));
+    assert!(rendered.contains("secret from stderr"));
+    assert!(!rendered.contains("Monitor started"));
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn controlled_monitor_termination_hides_synthetic_signal_exit() {
+    let timed_out = new_monitor_completed(
+        "timeout probe".to_string(),
+        "btimeout1".to_string(),
+        codex_app_server_protocol::CommandExecutionStatus::Failed,
+        Some(codex_app_server_protocol::CommandMonitorTerminationReason::TimedOut),
+        None,
+        Some(137),
+    );
+    let timed_out = render_lines(&timed_out.display_lines(/*width*/ 80)).join("\n");
+    assert!(timed_out.contains("Monitor timed out · task btimeout1"));
+    assert!(!timed_out.contains("Monitor failed"));
+    assert!(!timed_out.contains("exit 137"));
+
+    let stopped = new_monitor_completed(
+        "stop probe".to_string(),
+        "bstopped1".to_string(),
+        codex_app_server_protocol::CommandExecutionStatus::Failed,
+        Some(codex_app_server_protocol::CommandMonitorTerminationReason::UserStopped),
+        None,
+        Some(137),
+    );
+    let stopped = render_lines(&stopped.display_lines(/*width*/ 80)).join("\n");
+    assert!(stopped.contains("Monitor stopped · task bstopped1"));
+    assert!(!stopped.contains("Monitor failed"));
+    assert!(!stopped.contains("exit 137"));
+}
+
+#[test]
+fn monitor_timeout_format_matches_claude_seconds_display() {
+    assert_eq!(format_monitor_timeout(1_000), "1s");
+    assert_eq!(format_monitor_timeout(1_001), "1.001s");
+    assert_eq!(format_monitor_timeout(1_250), "1.25s");
+    assert_eq!(format_monitor_timeout(1_500), "1.5s");
+    assert_eq!(format_monitor_timeout(300_000), "300s");
+}
+
+#[test]
+fn monitor_event_snapshot() {
+    let cell = new_monitor_event(
+        "pixel event probe".to_string(),
+        "ready to deploy".to_string(),
+    );
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn monitor_event_multiline_batch_snapshot() {
+    let cell = new_monitor_event("pixel event probe".to_string(), "ready\nsecond".to_string());
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    assert_eq!(rendered.matches("⏺ Monitor event").count(), 1);
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn monitor_event_sanitizes_ansi_and_tabs_at_narrow_width() {
+    let cell = new_monitor_event(
+        "\x1b[35m部署\x1b[0m\t🚀".to_string(),
+        "\x1b[31mFAILED\x1b[0m\t节点🚨".to_string(),
+    );
+    let rendered = render_lines(&cell.display_lines(/*width*/ 32)).join("\n");
+
+    assert!(!rendered.contains('\x1b'));
+    assert!(rendered.contains("部署    🚀"));
+    assert!(rendered.contains("FAILED    节点🚨"));
     insta::assert_snapshot!(rendered);
 }
 
@@ -740,13 +895,51 @@ fn ps_output_multiline_snapshot() {
         UnifiedExecProcessDetails {
             command_display: "echo hello\nand then some extra text".to_string(),
             recent_chunks: vec!["hello".to_string(), "done".to_string()],
+            kind: UnifiedExecProcessKindDetails::BackgroundTerminal,
         },
         UnifiedExecProcessDetails {
             command_display: "rg \"foo\" src".to_string(),
             recent_chunks: vec!["src/main.rs:12:foo".to_string()],
+            kind: UnifiedExecProcessKindDetails::BackgroundTerminal,
         },
     ]);
     let rendered = render_lines(&cell.display_lines(/*width*/ 40)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn ps_output_monitor_snapshot() {
+    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
+        command_display: "printf 'ready\\n'".to_string(),
+        recent_chunks: vec!["ready".to_string()],
+        kind: UnifiedExecProcessKindDetails::Monitor {
+            description: "pixel event probe".to_string(),
+            task_id: "b0nftx2ad".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        },
+    }]);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 72)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn ps_output_monitor_sanitizes_ansi_and_tabs_at_narrow_width() {
+    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
+        command_display: "printf ready".to_string(),
+        recent_chunks: vec!["\x1b[32mREADY\x1b[0m\t东京🎉".to_string()],
+        kind: UnifiedExecProcessKindDetails::Monitor {
+            description: "\x1b[35m部署\x1b[0m\t🚀".to_string(),
+            task_id: "task-七".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        },
+    }]);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 30)).join("\n");
+
+    assert!(!rendered.contains('\x1b'));
+    assert!(rendered.contains("部署    🚀"));
+    assert!(rendered.contains("READY    东京🎉"));
     insta::assert_snapshot!(rendered);
 }
 
@@ -778,6 +971,7 @@ fn ps_output_long_command_snapshot() {
             "rg \"foo\" src --glob '**/*.rs' --max-count 1000 --no-ignore --hidden --follow --glob '!target/**'",
         ),
         recent_chunks: vec!["searching...".to_string()],
+        kind: UnifiedExecProcessKindDetails::BackgroundTerminal,
     }]);
     let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
     insta::assert_snapshot!(rendered);
@@ -788,6 +982,7 @@ fn ps_output_halfwidth_sound_marks_snapshot() {
     let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
         command_display: "echo ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ".to_string(),
         recent_chunks: vec!["output ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ".to_string()],
+        kind: UnifiedExecProcessKindDetails::BackgroundTerminal,
     }]);
     let rendered = render_lines(&cell.display_lines(/*width*/ 24)).join("\n");
     insta::assert_snapshot!(rendered);
@@ -800,6 +995,7 @@ fn ps_output_many_sessions_snapshot() {
             .map(|idx| UnifiedExecProcessDetails {
                 command_display: format!("command {idx}"),
                 recent_chunks: Vec::new(),
+                kind: UnifiedExecProcessKindDetails::BackgroundTerminal,
             })
             .collect(),
     );
@@ -815,6 +1011,7 @@ fn ps_output_chunk_leading_whitespace_snapshot() {
             "  indented first".to_string(),
             "    more indented".to_string(),
         ],
+        kind: UnifiedExecProcessKindDetails::BackgroundTerminal,
     }]);
     let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
     insta::assert_snapshot!(rendered);

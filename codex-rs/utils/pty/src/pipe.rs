@@ -13,6 +13,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -80,6 +81,26 @@ impl ChildTerminator for PipeChildTerminator {
             Ok(())
         }
     }
+
+    fn force_kill(&mut self, root_exited: bool) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            match &self.windows {
+                WindowsChildTerminator::Job(job) => job.force_terminate(),
+                WindowsChildTerminator::Process(pid) if !root_exited => kill_process(*pid),
+                WindowsChildTerminator::Process(_) => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "cannot safely force-terminate a post-exit Windows process without Job Object containment",
+                )),
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = root_exited;
+            self.kill()
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -100,19 +121,21 @@ fn kill_process(pid: u32) -> io::Result<()> {
     }
 }
 
-async fn read_output_stream<R>(mut reader: R, output_tx: mpsc::Sender<Vec<u8>>)
+async fn read_output_stream<R>(mut reader: R, output_tx: mpsc::Sender<Vec<u8>>) -> bool
 where
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; 8_192];
     loop {
         match reader.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => return true,
             Ok(n) => {
-                let _ = output_tx.send(buf[..n].to_vec()).await;
+                if output_tx.send(buf[..n].to_vec()).await.is_err() {
+                    return false;
+                }
             }
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => return false,
         }
     }
 }
@@ -235,15 +258,11 @@ async fn spawn_process_with_stdin_mode(
 
     let stdout_handle = stdout.map(|stdout| {
         let stdout_tx = stdout_tx.clone();
-        tokio::spawn(async move {
-            read_output_stream(BufReader::new(stdout), stdout_tx).await;
-        })
+        tokio::spawn(async move { read_output_stream(BufReader::new(stdout), stdout_tx).await })
     });
     let stderr_handle = stderr.map(|stderr| {
         let stderr_tx = stderr_tx.clone();
-        tokio::spawn(async move {
-            read_output_stream(BufReader::new(stderr), stderr_tx).await;
-        })
+        tokio::spawn(async move { read_output_stream(BufReader::new(stderr), stderr_tx).await })
     });
     let mut reader_abort_handles = Vec::new();
     if let Some(handle) = stdout_handle.as_ref() {
@@ -253,12 +272,17 @@ async fn spawn_process_with_stdin_mode(
         reader_abort_handles.push(handle.abort_handle());
     }
     let reader_handle = tokio::spawn(async move {
+        let mut completed = true;
         if let Some(handle) = stdout_handle {
-            let _ = handle.await;
+            completed &= matches!(handle.await, Ok(true));
         }
         if let Some(handle) = stderr_handle {
-            let _ = handle.await;
+            completed &= matches!(handle.await, Ok(true));
         }
+        assert!(
+            completed,
+            "pipe output reader task did not complete normally"
+        );
     });
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
@@ -266,6 +290,8 @@ async fn spawn_process_with_stdin_mode(
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
+    let exit_notify = Arc::new(Notify::new());
+    let wait_exit_notify = Arc::clone(&exit_notify);
     #[cfg(windows)]
     let wait_job = match &windows_terminator {
         WindowsChildTerminator::Job(job) => Some(Arc::clone(job)),
@@ -286,10 +312,11 @@ async fn spawn_process_with_stdin_mode(
             }
             Err(_) => -1,
         };
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {
             *guard = Some(code);
         }
+        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_exit_notify.notify_waiters();
         let _ = exit_tx.send(code);
     });
 
@@ -307,6 +334,7 @@ async fn spawn_process_with_stdin_mode(
         wait_handle,
         exit_status,
         exit_code,
+        exit_notify,
         /*pty_handles*/ None,
         /*resizer*/ None,
     );

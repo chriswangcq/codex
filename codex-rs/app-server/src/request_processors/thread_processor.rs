@@ -1919,15 +1919,7 @@ impl ThreadRequestProcessor {
             .list_background_terminals()
             .await
             .into_iter()
-            .map(|terminal| ThreadBackgroundTerminal {
-                item_id: terminal.item_id,
-                process_id: terminal.process_id,
-                command: terminal.command,
-                cwd: terminal.cwd.into(),
-                os_pid: None,
-                cpu_percent: None,
-                rss_kb: None,
-            })
+            .map(background_terminal_to_v2)
             .collect::<Vec<_>>();
 
         let (data, next_cursor) = paginate_background_terminals(&terminals, cursor, limit)?;
@@ -4634,6 +4626,28 @@ impl ThreadRequestProcessor {
         }
 
         Ok((items, next_cursor))
+    }
+}
+
+fn background_terminal_to_v2(
+    terminal: codex_core::BackgroundTerminalInfo,
+) -> ThreadBackgroundTerminal {
+    ThreadBackgroundTerminal {
+        item_id: terminal.item_id,
+        process_id: terminal.process_id,
+        command: terminal.command,
+        cwd: terminal.cwd.into(),
+        monitor: terminal.monitor.map(Into::into),
+        output: terminal.output.map(|output| {
+            codex_app_server_protocol::ThreadBackgroundTerminalOutput {
+                tail: String::from_utf8_lossy(&output.tail).into_owned(),
+                bytes_total: output.bytes_total,
+                truncated: output.truncated,
+            }
+        }),
+        os_pid: None,
+        cpu_percent: None,
+        rss_kb: None,
     }
 }
 

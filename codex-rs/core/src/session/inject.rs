@@ -21,7 +21,13 @@ impl Session {
         &self,
         input: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
+        if self.is_session_runtime_closing() {
+            return Err(input);
+        }
         let mut active = self.active_turn.lock().await;
+        if self.is_session_runtime_closing() {
+            return Err(input);
+        }
         match active.as_mut() {
             Some(active_turn) => {
                 self.input_queue
@@ -48,8 +54,37 @@ impl Session {
         self: &Arc<Self>,
         input: Vec<TurnInput>,
     ) -> Result<(), TryStartTurnIfIdleError> {
+        self.try_start_turn_if_idle_with_policy(input, /*allow_plan_without_user_input*/ false)
+            .await
+    }
+
+    /// Starts an idle turn for a model-visible monitor notification.
+    ///
+    /// Monitor events are external process events rather than speculative
+    /// extension work, so they must wake the model in Plan mode just as they do
+    /// in the default collaboration mode. All other idle-work gates still
+    /// apply, including pending user turns and an already-active task.
+    pub(crate) async fn try_start_monitor_turn_if_idle(
+        self: &Arc<Self>,
+        input: Vec<TurnInput>,
+    ) -> Result<(), TryStartTurnIfIdleError> {
+        self.try_start_turn_if_idle_with_policy(input, /*allow_plan_without_user_input*/ true)
+            .await
+    }
+
+    async fn try_start_turn_if_idle_with_policy(
+        self: &Arc<Self>,
+        input: Vec<TurnInput>,
+        allow_plan_without_user_input: bool,
+    ) -> Result<(), TryStartTurnIfIdleError> {
         if input.is_empty() {
             return Ok(());
+        }
+        if self.is_session_runtime_closing() {
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                input,
+            ));
         }
         let has_user_input = input.iter().any(
             |item| matches!(item, TurnInput::UserInput { content, .. } if !content.is_empty()),
@@ -60,7 +95,10 @@ impl Session {
                 input,
             ));
         }
-        if !has_user_input && self.collaboration_mode().await.mode == ModeKind::Plan {
+        if !allow_plan_without_user_input
+            && !has_user_input
+            && self.collaboration_mode().await.mode == ModeKind::Plan
+        {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
                 input,
@@ -69,14 +107,22 @@ impl Session {
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            let turn_state = self
+                .try_run_while_session_runtime_open(|| {
+                    if active_turn.is_some() {
+                        return None;
+                    }
+                    let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+                    Some(Arc::clone(&active_turn.turn_state))
+                })
+                .flatten();
+            let Some(turn_state) = turn_state else {
                 return Err(TryStartTurnIfIdleError::new(
                     TryStartTurnIfIdleRejectionReason::Busy,
                     input,
                 ));
-            }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
+            };
+            turn_state
         };
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
@@ -91,7 +137,8 @@ impl Session {
         let turn_context = self
             .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
             .await;
-        if !has_user_input && turn_context.mode == ModeKind::Plan {
+        if !allow_plan_without_user_input && !has_user_input && turn_context.mode == ModeKind::Plan
+        {
             self.clear_reserved_idle_turn(&turn_state).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
@@ -111,9 +158,12 @@ impl Session {
         }
         let still_reserved = {
             let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+            self.try_run_while_session_runtime_open(|| {
+                active_turn.as_ref().is_some_and(|active_turn| {
+                    active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+                })
             })
+            .unwrap_or(false)
         };
         if !still_reserved {
             self.clear_reserved_idle_turn(&turn_state).await;
@@ -140,14 +190,22 @@ impl Session {
                 .await;
             Vec::new()
         };
-        self.start_task(
-            turn_context,
-            task_input,
-            RegularTask::new(),
-            input_persisted_sender,
-            MailboxParentProvenance::Ignore,
-        )
-        .await;
+        if !self
+            .start_task(
+                turn_context,
+                task_input,
+                RegularTask::new(),
+                input_persisted_sender,
+                MailboxParentProvenance::Ignore,
+            )
+            .await
+        {
+            self.clear_reserved_idle_turn(&turn_state).await;
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                original_input,
+            ));
+        }
         if let Some(receiver) = input_persisted_receiver {
             return receiver
                 .await
@@ -175,9 +233,15 @@ impl Session {
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) {
+        if self.is_session_runtime_closing() {
+            return;
+        }
         let Err(items) = self.inject_if_running(items).await else {
             return;
         };
+        if self.is_session_runtime_closing() {
+            return;
+        }
         let default_turn_context;
         let turn_context = match current_turn_context {
             Some(turn_context) => turn_context,

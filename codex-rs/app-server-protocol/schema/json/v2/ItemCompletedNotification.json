@@ -199,6 +199,41 @@
       ],
       "type": "string"
     },
+    "CommandMonitorInfo": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "persistent": {
+          "type": "boolean"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "timeoutMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "description",
+        "persistent",
+        "taskId",
+        "timeoutMs"
+      ],
+      "type": "object"
+    },
+    "CommandMonitorTerminationReason": {
+      "enum": [
+        "timedOut",
+        "userStopped",
+        "sessionShutdown",
+        "capacity",
+        "stopped"
+      ],
+      "type": "string"
+    },
     "DynamicToolCallOutputContentItem": {
       "oneOf": [
         {
@@ -768,6 +803,28 @@
             },
             "id": {
               "type": "string"
+            },
+            "monitor": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandMonitorInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "monitorTerminationReason": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandMonitorTerminationReason"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "pluginId": {
               "default": null,

@@ -1,0 +1,11 @@
+---
+source: tui/src/bottom_pane/background_processes_view.rs
+expression: "render_view(&view(Vec::new()), 70)"
+---
+
+  Background
+  No active processes
+
+  No tasks currently running
+
+  ↑/↓ select · Enter view · x stop · Esc close

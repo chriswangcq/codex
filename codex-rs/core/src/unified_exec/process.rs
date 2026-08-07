@@ -1,17 +1,22 @@
 #![allow(clippy::module_inception)]
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use codex_exec_server::ExecOutputStream;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::ProcessSignal as ExecServerProcessSignal;
@@ -35,6 +40,9 @@ use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+const MONITOR_OUTPUT_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(500);
+const MONITOR_CAPTURE_CHANNEL_CAPACITY: usize = 128;
+pub(crate) const TERMINATE_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     /// Returns file descriptors that must stay open across the child `exec()`.
     ///
@@ -57,25 +65,252 @@ pub(crate) struct NoopSpawnLifecycle;
 impl SpawnLifecycle for NoopSpawnLifecycle {}
 
 pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
+
+#[derive(Clone)]
+pub(crate) struct MonitorStreamOutput {
+    combined: OutputBuffer,
+    stdout: OutputBuffer,
+    stderr: OutputBuffer,
+}
+
+impl MonitorStreamOutput {
+    pub(crate) fn new(combined: OutputBuffer) -> Self {
+        Self {
+            combined,
+            stdout: Arc::new(Mutex::new(HeadTailBuffer::default())),
+            stderr: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        }
+    }
+
+    async fn push_chunk(&self, bytes: Vec<u8>, is_stdout: bool) {
+        let buffer = if is_stdout {
+            &self.stdout
+        } else {
+            &self.stderr
+        };
+        buffer.lock().await.push_chunk(bytes);
+    }
+
+    pub(crate) async fn snapshot(&self) -> (String, String, String) {
+        let stdout = self.stdout.lock().await.to_bytes_with_omission_marker();
+        let stderr = self.stderr.lock().await.to_bytes_with_omission_marker();
+        let combined = self.combined.lock().await.to_bytes_with_omission_marker();
+        (
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+            String::from_utf8_lossy(&combined).into_owned(),
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MonitorOutputChunk {
+    Output { bytes: Vec<u8>, is_stdout: bool },
+    StdoutClosed,
+    ArchiveGap,
+}
+
+const MONITOR_CAPTURE_GAP_CLEAN: u8 = 0;
+const MONITOR_CAPTURE_GAP_PENDING: u8 = 1;
+const MONITOR_CAPTURE_GAP_REPORTED: u8 = 2;
+
+#[derive(Debug, Default)]
+struct MonitorCaptureGap {
+    state: AtomicU8,
+}
+
+impl MonitorCaptureGap {
+    fn record(&self) {
+        let _ = self.state.compare_exchange(
+            MONITOR_CAPTURE_GAP_CLEAN,
+            MONITOR_CAPTURE_GAP_PENDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn take_marker(&self) -> bool {
+        self.state
+            .compare_exchange(
+                MONITOR_CAPTURE_GAP_PENDING,
+                MONITOR_CAPTURE_GAP_REPORTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MonitorCaptureSender {
+    sender: mpsc::Sender<MonitorOutputChunk>,
+    gap: Arc<MonitorCaptureGap>,
+}
+
+pub(crate) struct MonitorCaptureReceiver {
+    receiver: mpsc::Receiver<MonitorOutputChunk>,
+    gap: Arc<MonitorCaptureGap>,
+}
+
+#[cfg(test)]
+impl MonitorCaptureSender {
+    pub(crate) async fn send(
+        &self,
+        chunk: MonitorOutputChunk,
+    ) -> Result<(), mpsc::error::SendError<MonitorOutputChunk>> {
+        self.sender.send(chunk).await
+    }
+}
+
+pub(crate) fn monitor_capture_channel(
+    capacity: usize,
+) -> (MonitorCaptureSender, MonitorCaptureReceiver) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    let gap = Arc::new(MonitorCaptureGap::default());
+    (
+        MonitorCaptureSender {
+            sender,
+            gap: Arc::clone(&gap),
+        },
+        MonitorCaptureReceiver { receiver, gap },
+    )
+}
+
+impl MonitorCaptureReceiver {
+    pub(crate) fn try_recv(&mut self) -> Result<MonitorOutputChunk, mpsc::error::TryRecvError> {
+        match self.receiver.try_recv() {
+            Ok(chunk) => Ok(chunk),
+            Err(_) if self.gap.take_marker() => Ok(MonitorOutputChunk::ArchiveGap),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<MonitorOutputChunk> {
+        match self.receiver.try_recv() {
+            Ok(chunk) => return Some(chunk),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return self
+                    .gap
+                    .take_marker()
+                    .then_some(MonitorOutputChunk::ArchiveGap);
+            }
+        }
+        if self.gap.take_marker() {
+            return Some(MonitorOutputChunk::ArchiveGap);
+        }
+        match self.receiver.recv().await {
+            Some(chunk) => Some(chunk),
+            None => self
+                .gap
+                .take_marker()
+                .then_some(MonitorOutputChunk::ArchiveGap),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_full(&self) -> bool {
+        self.receiver.capacity() == 0
+    }
+}
+
+async fn send_monitor_capture(
+    monitor_capture: &Arc<StdMutex<Option<MonitorCaptureSender>>>,
+    monitor_stop_pending: &Arc<AtomicUsize>,
+    monitor_stop_pending_notify: &Arc<Notify>,
+    chunk: MonitorOutputChunk,
+) {
+    let capture = monitor_capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .cloned();
+    let Some(capture) = capture else {
+        return;
+    };
+
+    loop {
+        if monitor_stop_pending.load(Ordering::Acquire) != 0 {
+            // Once a stop starts, process termination must not depend on the
+            // archive consumer making room in this bounded channel. Preserve
+            // an explicit, once-per-monitor gap signal if output cannot fit.
+            if matches!(
+                capture.sender.try_send(chunk),
+                Err(mpsc::error::TrySendError::Full(_))
+            ) {
+                capture.gap.record();
+            }
+            return;
+        }
+
+        let stop_changed = monitor_stop_pending_notify.notified();
+        tokio::pin!(stop_changed);
+        stop_changed.as_mut().enable();
+        if monitor_stop_pending.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+
+        tokio::select! {
+            permit = capture.sender.reserve() => {
+                if let Ok(permit) = permit {
+                    permit.send(chunk);
+                }
+                return;
+            }
+            _ = &mut stop_changed => {}
+        }
+    }
+}
+
 /// Shared output state exposed to polling and streaming consumers.
 #[derive(Clone)]
 pub(crate) struct OutputHandles {
     pub(crate) output_buffer: OutputBuffer,
     pub(crate) output_notify: Arc<Notify>,
+    pub(crate) monitor_capture: Arc<StdMutex<Option<MonitorCaptureSender>>>,
+    pub(crate) monitor_capture_rx: Arc<StdMutex<Option<MonitorCaptureReceiver>>>,
+    pub(crate) monitor_stream_output: Option<MonitorStreamOutput>,
     pub(crate) output_closed: Arc<AtomicBool>,
     pub(crate) output_closed_notify: Arc<Notify>,
     pub(crate) cancellation_token: CancellationToken,
 }
 
+impl OutputHandles {
+    pub(crate) fn take_monitor_capture(&self) -> Option<MonitorCaptureReceiver> {
+        self.monitor_capture_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
 struct OutputTaskGuard {
     output_closed: Arc<AtomicBool>,
     output_closed_notify: Arc<Notify>,
+    output_task_finished: Arc<AtomicBool>,
+    output_task_finished_notify: Arc<Notify>,
+    monitor_capture: Arc<StdMutex<Option<MonitorCaptureSender>>>,
+    completed: bool,
+}
+
+impl OutputTaskGuard {
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
 }
 
 impl Drop for OutputTaskGuard {
     fn drop(&mut self) {
-        self.output_closed.store(true, Ordering::Release);
+        self.monitor_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if self.completed {
+            self.output_closed.store(true, Ordering::Release);
+        }
+        self.output_task_finished.store(true, Ordering::Release);
         self.output_closed_notify.notify_waiters();
+        self.output_task_finished_notify.notify_waiters();
     }
 }
 
@@ -96,8 +331,29 @@ pub(crate) struct UnifiedExecProcess {
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
+    output_task_finished: Arc<AtomicBool>,
+    output_task_finished_notify: Arc<Notify>,
+    monitor_stop_pending: Arc<AtomicUsize>,
+    monitor_stop_pending_notify: Arc<Notify>,
     sandbox_type: SandboxType,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
+}
+
+pub(crate) struct MonitorStopGuard {
+    process: Arc<UnifiedExecProcess>,
+}
+
+impl Drop for MonitorStopGuard {
+    fn drop(&mut self) {
+        if self
+            .process
+            .monitor_stop_pending
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.process.monitor_stop_pending_notify.notify_waiters();
+        }
+    }
 }
 
 impl std::fmt::Debug for UnifiedExecProcess {
@@ -115,15 +371,30 @@ impl UnifiedExecProcess {
         process_handle: ProcessHandle,
         sandbox_type: SandboxType,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
+        capture_monitor_output: bool,
     ) -> Self {
+        let (monitor_capture, monitor_capture_rx) = if capture_monitor_output {
+            let (tx, rx) = monitor_capture_channel(MONITOR_CAPTURE_CHANNEL_CAPACITY);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
+        let monitor_stream_output =
+            capture_monitor_output.then(|| MonitorStreamOutput::new(Arc::clone(&output_buffer)));
         let output = OutputHandles {
-            output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+            output_buffer,
             output_notify: Arc::new(Notify::new()),
+            monitor_capture: Arc::new(StdMutex::new(monitor_capture)),
+            monitor_capture_rx: Arc::new(StdMutex::new(monitor_capture_rx)),
+            monitor_stream_output,
             output_closed: Arc::new(AtomicBool::new(false)),
             output_closed_notify: Arc::new(Notify::new()),
             cancellation_token: CancellationToken::new(),
         };
         let output_drained = Arc::new(Notify::new());
+        let output_task_finished = Arc::new(AtomicBool::new(false));
+        let output_task_finished_notify = Arc::new(Notify::new());
         let (output_tx, _) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
@@ -136,6 +407,10 @@ impl UnifiedExecProcess {
             state_tx,
             state_rx,
             output_task: None,
+            output_task_finished,
+            output_task_finished_notify,
+            monitor_stop_pending: Arc::new(AtomicUsize::new(0)),
+            monitor_stop_pending_notify: Arc::new(Notify::new()),
             sandbox_type,
             _spawn_lifecycle: spawn_lifecycle,
         }
@@ -174,8 +449,16 @@ impl UnifiedExecProcess {
         self.output_tx.subscribe()
     }
 
-    pub(super) fn cancellation_token(&self) -> CancellationToken {
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.output.cancellation_token.clone()
+    }
+
+    pub(crate) fn close_monitor_capture(&self) {
+        self.output
+            .monitor_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     pub(super) fn output_drained_notify(&self) -> Arc<Notify> {
@@ -186,7 +469,7 @@ impl UnifiedExecProcess {
         Arc::clone(&self.interaction_lock)
     }
 
-    pub(super) fn has_exited(&self) -> bool {
+    pub(crate) fn has_exited(&self) -> bool {
         let state = self.state_rx.borrow().clone();
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => state.has_exited || process_handle.has_exited(),
@@ -194,7 +477,21 @@ impl UnifiedExecProcess {
         }
     }
 
-    pub(super) fn exit_code(&self) -> Option<i32> {
+    pub(crate) fn output_task_finished(&self) -> bool {
+        self.output_task_finished.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn output_completed_normally(&self) -> bool {
+        let core_output_closed = self.output.output_closed.load(Ordering::Acquire);
+        match &self.process_handle {
+            ProcessHandle::Local(process_handle) => {
+                core_output_closed && process_handle.output_closed()
+            }
+            ProcessHandle::ExecServer(_) => core_output_closed,
+        }
+    }
+
+    pub(crate) fn exit_code(&self) -> Option<i32> {
         let state = self.state_rx.borrow().clone();
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
@@ -207,7 +504,40 @@ impl UnifiedExecProcess {
     fn finish_termination(&self) {
         self.output.cancellation_token.cancel();
         if let Some(output_task) = &self.output_task {
-            output_task.abort();
+            let monitor_capture_active = self
+                .output
+                .monitor_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            if monitor_capture_active {
+                let abort_handle = output_task.abort_handle();
+                let output_task_finished = Arc::clone(&self.output_task_finished);
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        tokio::time::sleep(MONITOR_OUTPUT_DRAIN_GRACE_PERIOD).await;
+                        if !output_task_finished.load(Ordering::Acquire) {
+                            abort_handle.abort();
+                        }
+                    });
+                } else {
+                    abort_handle.abort();
+                }
+            } else {
+                output_task.abort();
+            }
+        }
+    }
+
+    async fn wait_for_output_task_finished(&self) {
+        loop {
+            let notified = self.output_task_finished_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.output_task_finished() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -216,15 +546,22 @@ impl UnifiedExecProcess {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
-                tokio::spawn(async move {
-                    let _ = process_handle.terminate().await;
-                });
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = process_handle.terminate().await;
+                    });
+                }
             }
         }
         self.finish_termination();
     }
 
-    pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+    /// Requests termination using the historical background-terminal contract:
+    /// a remote process is considered stopped once its executor acknowledges the
+    /// request. Command monitors use [`Self::terminate_confirmed`] instead because
+    /// they must retain ownership until both process exit and output closure are
+    /// observed.
+    pub(crate) async fn terminate_acknowledged(&self) -> Result<(), UnifiedExecError> {
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -232,6 +569,88 @@ impl UnifiedExecProcess {
                     .terminate()
                     .await
                     .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
+            }
+        }
+        self.signal_exit(self.exit_code());
+        self.finish_termination();
+        Ok(())
+    }
+
+    pub(crate) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+        match &self.process_handle {
+            ProcessHandle::Local(process_handle) => {
+                tokio::time::timeout(TERMINATE_CONFIRMATION_TIMEOUT, async {
+                    process_handle
+                        .try_request_terminate()
+                        .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
+                    process_handle.wait_for_exit().await;
+                    #[cfg(windows)]
+                    process_handle.release_pty_handles_after_root_exit().await;
+                    process_handle.wait_for_output_closed().await;
+                    self.wait_for_output_task_finished().await;
+                    process_handle
+                        .confirm_termination()
+                        .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
+                    Ok::<(), UnifiedExecError>(())
+                })
+                .await
+                .map_err(|_| {
+                    UnifiedExecError::process_failed(
+                        "timed out waiting for process termination and output closure".to_string(),
+                    )
+                })??;
+            }
+            ProcessHandle::ExecServer(process_handle) => {
+                tokio::time::timeout(TERMINATE_CONFIRMATION_TIMEOUT, async {
+                    if let Some(message) = self.failure_message() {
+                        return Err(UnifiedExecError::process_failed(message));
+                    }
+                    let mut state_rx = self.state_rx.clone();
+                    let terminate_request = process_handle.terminate();
+                    tokio::pin!(terminate_request);
+                    let mut terminate_acknowledged = false;
+                    loop {
+                        let output_closed_notified = self.output.output_closed_notify.notified();
+                        tokio::pin!(output_closed_notified);
+                        output_closed_notified.as_mut().enable();
+                        let state = state_rx.borrow().clone();
+                        if let Some(message) = state.failure_message {
+                            return Err(UnifiedExecError::process_failed(message));
+                        }
+                        if terminate_acknowledged
+                            && state.has_exited
+                            && self.output_completed_normally()
+                            && self.output_task_finished()
+                        {
+                            break;
+                        }
+                        tokio::select! {
+                            result = terminate_request.as_mut(), if !terminate_acknowledged => {
+                                result.map_err(|err| {
+                                    UnifiedExecError::process_failed(err.to_string())
+                                })?;
+                                terminate_acknowledged = true;
+                            }
+                            changed = state_rx.changed() => {
+                                if changed.is_err() {
+                                    return Err(UnifiedExecError::process_failed(
+                                        "exec-server process state stream closed before termination was confirmed"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            _ = &mut output_closed_notified => {}
+                        }
+                    }
+                    Ok::<(), UnifiedExecError>(())
+                })
+                .await
+                .map_err(|_| {
+                    UnifiedExecError::process_failed(
+                        "timed out waiting for confirmed process termination and output closure"
+                            .to_string(),
+                    )
+                })??;
             }
         }
         self.signal_exit(self.exit_code());
@@ -268,8 +687,32 @@ impl UnifiedExecProcess {
         self.sandbox_type
     }
 
-    pub(super) fn failure_message(&self) -> Option<String> {
+    pub(crate) fn failure_message(&self) -> Option<String> {
         self.state_rx.borrow().failure_message.clone()
+    }
+
+    pub(crate) fn begin_monitor_stop(self: &Arc<Self>) -> MonitorStopGuard {
+        self.monitor_stop_pending.fetch_add(1, Ordering::AcqRel);
+        self.monitor_stop_pending_notify.notify_waiters();
+        MonitorStopGuard {
+            process: Arc::clone(self),
+        }
+    }
+
+    pub(crate) async fn wait_for_monitor_stop_resolution(&self) {
+        loop {
+            let notified = self.monitor_stop_pending_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.monitor_stop_pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn is_monitor_stop_pending(&self) -> bool {
+        self.monitor_stop_pending.load(Ordering::Acquire) != 0
     }
 
     pub(super) async fn check_for_sandbox_denial(&self) -> Result<(), UnifiedExecError> {
@@ -331,6 +774,7 @@ impl UnifiedExecProcess {
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
+        capture_monitor_output: bool,
     ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
@@ -338,16 +782,21 @@ impl UnifiedExecProcess {
             stderr_rx,
             mut exit_rx,
         } = spawned;
-        let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
+            capture_monitor_output,
         );
         managed.output_task = Some(Self::spawn_local_output_task(
-            output_rx,
+            stdout_rx,
+            stderr_rx,
             managed.output_handles().clone(),
             managed.output_tx.clone(),
+            Arc::clone(&managed.output_task_finished),
+            Arc::clone(&managed.output_task_finished_notify),
+            Arc::clone(&managed.monitor_stop_pending),
+            Arc::clone(&managed.monitor_stop_pending_notify),
         ));
 
         match exit_rx.try_recv() {
@@ -386,18 +835,28 @@ impl UnifiedExecProcess {
 
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
+        capture_monitor_output: bool,
     ) -> Result<Self, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
         let sandbox_type = started.sandbox_type.unwrap_or(SandboxType::None);
-        let mut managed = Self::new(process_handle, sandbox_type, /*spawn_lifecycle*/ None);
+        let mut managed = Self::new(
+            process_handle,
+            sandbox_type,
+            /*spawn_lifecycle*/ None,
+            capture_monitor_output,
+        );
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,
             output_handles,
             managed.output_tx.clone(),
             managed.state_tx.clone(),
+            Arc::clone(&managed.output_task_finished),
+            Arc::clone(&managed.output_task_finished_notify),
+            Arc::clone(&managed.monitor_stop_pending),
+            Arc::clone(&managed.monitor_stop_pending_notify),
         ));
 
         let mut state_rx = managed.state_rx.clone();
@@ -421,26 +880,39 @@ impl UnifiedExecProcess {
         Ok(managed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_exec_server_output_task(
         started: StartedExecProcess,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
+        output_task_finished: Arc<AtomicBool>,
+        output_task_finished_notify: Arc<Notify>,
+        monitor_stop_pending: Arc<AtomicUsize>,
+        monitor_stop_pending_notify: Arc<Notify>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
             output_notify,
+            monitor_capture,
+            monitor_stream_output,
             output_closed,
             output_closed_notify,
             cancellation_token,
+            ..
         } = output_handles;
         let process = started.process;
         let mut events = process.subscribe_events();
+        let output_task_guard = OutputTaskGuard {
+            output_closed: Arc::clone(&output_closed),
+            output_closed_notify: Arc::clone(&output_closed_notify),
+            output_task_finished,
+            output_task_finished_notify,
+            monitor_capture: Arc::clone(&monitor_capture),
+            completed: false,
+        };
         tokio::spawn(async move {
-            let _output_task_guard = OutputTaskGuard {
-                output_closed: Arc::clone(&output_closed),
-                output_closed_notify: Arc::clone(&output_closed_notify),
-            };
+            let mut output_task_guard = output_task_guard;
             let mut last_seq: u64 = 0;
             loop {
                 let event = match events.recv().await {
@@ -451,8 +923,6 @@ impl UnifiedExecProcess {
                         let _ = state_tx.send_replace(
                             state.failed("exec-server process event stream closed".to_string()),
                         );
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
                         cancellation_token.cancel();
                         break;
                     }
@@ -487,8 +957,6 @@ impl UnifiedExecProcess {
                         Err(err) => {
                             let state = state_tx.borrow().clone();
                             let _ = state_tx.send_replace(state.failed(err.to_string()));
-                            output_closed.store(true, Ordering::Release);
-                            output_closed_notify.notify_waiters();
                             cancellation_token.cancel();
                             break;
                         }
@@ -503,10 +971,22 @@ impl UnifiedExecProcess {
                         sandbox_denied,
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
+                        let is_stdout = chunk.stream == ExecOutputStream::Stdout;
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
-                        drop(guard);
+                        output_buffer.lock().await.push_chunk(bytes.clone());
+                        if let Some(stream_output) = &monitor_stream_output {
+                            stream_output.push_chunk(bytes.clone(), is_stdout).await;
+                        }
+                        send_monitor_capture(
+                            &monitor_capture,
+                            &monitor_stop_pending,
+                            &monitor_stop_pending_notify,
+                            MonitorOutputChunk::Output {
+                                bytes: bytes.clone(),
+                                is_stdout,
+                            },
+                        )
+                        .await;
                         let _ = output_tx.send(bytes);
                         output_notify.notify_waiters();
                     }
@@ -514,8 +994,6 @@ impl UnifiedExecProcess {
                     if let Some(message) = failure {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(state.failed(message));
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
                         cancellation_token.cancel();
                         break;
                     }
@@ -529,8 +1007,7 @@ impl UnifiedExecProcess {
                         });
                     }
                     if closed {
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
+                        output_task_guard.mark_completed();
                         cancellation_token.cancel();
                         break;
                     }
@@ -546,10 +1023,22 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = chunk.seq;
+                        let is_stdout = chunk.stream == ExecOutputStream::Stdout;
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
-                        drop(guard);
+                        output_buffer.lock().await.push_chunk(bytes.clone());
+                        if let Some(stream_output) = &monitor_stream_output {
+                            stream_output.push_chunk(bytes.clone(), is_stdout).await;
+                        }
+                        send_monitor_capture(
+                            &monitor_capture,
+                            &monitor_stop_pending,
+                            &monitor_stop_pending_notify,
+                            MonitorOutputChunk::Output {
+                                bytes: bytes.clone(),
+                                is_stdout,
+                            },
+                        )
+                        .await;
                         let _ = output_tx.send(bytes);
                         output_notify.notify_waiters();
                     }
@@ -570,16 +1059,13 @@ impl UnifiedExecProcess {
                         if seq <= last_seq {
                             continue;
                         }
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
+                        output_task_guard.mark_completed();
                         cancellation_token.cancel();
                         break;
                     }
                     ExecProcessEvent::Failed(message) => {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(state.failed(message));
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
                         cancellation_token.cancel();
                         break;
                     }
@@ -588,40 +1074,83 @@ impl UnifiedExecProcess {
         })
     }
 
-    fn spawn_local_output_task(
-        mut receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_local_output_task(
+        mut stdout_rx: mpsc::Receiver<Vec<u8>>,
+        mut stderr_rx: mpsc::Receiver<Vec<u8>>,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
+        output_task_finished: Arc<AtomicBool>,
+        output_task_finished_notify: Arc<Notify>,
+        monitor_stop_pending: Arc<AtomicUsize>,
+        monitor_stop_pending_notify: Arc<Notify>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
             output_notify,
+            monitor_capture,
+            monitor_stream_output,
             output_closed,
             output_closed_notify,
             ..
         } = output_handles;
+        let output_task_guard = OutputTaskGuard {
+            output_closed: Arc::clone(&output_closed),
+            output_closed_notify: Arc::clone(&output_closed_notify),
+            output_task_finished,
+            output_task_finished_notify,
+            monitor_capture: Arc::clone(&monitor_capture),
+            completed: false,
+        };
         tokio::spawn(async move {
-            let _output_task_guard = OutputTaskGuard {
-                output_closed: Arc::clone(&output_closed),
-                output_closed_notify: Arc::clone(&output_closed_notify),
-            };
-            loop {
-                match receiver.recv().await {
-                    Ok(chunk) => {
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(chunk.clone());
-                        drop(guard);
-                        let _ = output_tx.send(chunk);
-                        output_notify.notify_waiters();
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        break;
-                    }
+            let mut output_task_guard = output_task_guard;
+            let mut stdout_open = true;
+            let mut stderr_open = true;
+            while stdout_open || stderr_open {
+                let (chunk, is_stdout) = tokio::select! {
+                    chunk = stdout_rx.recv(), if stdout_open => match chunk {
+                        Some(chunk) => (chunk, true),
+                        None => {
+                            stdout_open = false;
+                            send_monitor_capture(
+                                &monitor_capture,
+                                &monitor_stop_pending,
+                                &monitor_stop_pending_notify,
+                                MonitorOutputChunk::StdoutClosed,
+                            )
+                            .await;
+                            continue;
+                        }
+                    },
+                    chunk = stderr_rx.recv(), if stderr_open => match chunk {
+                        Some(chunk) => (chunk, false),
+                        None => {
+                            stderr_open = false;
+                            continue;
+                        }
+                    },
                 };
+                {
+                    let mut guard = output_buffer.lock().await;
+                    guard.push_chunk(chunk.clone());
+                }
+                if let Some(stream_output) = &monitor_stream_output {
+                    stream_output.push_chunk(chunk.clone(), is_stdout).await;
+                }
+                send_monitor_capture(
+                    &monitor_capture,
+                    &monitor_stop_pending,
+                    &monitor_stop_pending_notify,
+                    MonitorOutputChunk::Output {
+                        bytes: chunk.clone(),
+                        is_stdout,
+                    },
+                )
+                .await;
+                let _ = output_tx.send(chunk);
+                output_notify.notify_waiters();
             }
+            output_task_guard.mark_completed();
         })
     }
 

@@ -36,6 +36,8 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::parse_command::ParsedCommand as CoreParsedCommand;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
+use codex_protocol::protocol::CommandMonitorInfo as CoreCommandMonitorInfo;
+use codex_protocol::protocol::CommandMonitorTerminationReason as CoreCommandMonitorTerminationReason;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::GuardianRiskLevel as CoreGuardianRiskLevel;
@@ -280,6 +282,10 @@ pub enum ThreadItem {
         cwd: LegacyAppPathString,
         /// Identifier for the underlying PTY process (when available).
         process_id: Option<String>,
+        #[serde(default)]
+        monitor: Option<CommandMonitorInfo>,
+        #[serde(default)]
+        monitor_termination_reason: Option<CommandMonitorTerminationReason>,
         #[serde(default)]
         source: CommandExecutionSource,
         status: CommandExecutionStatus,
@@ -853,6 +859,8 @@ impl From<CoreTurnItem> for ThreadItem {
                     command: presentation.command,
                     cwd: command.cwd.clone().into(),
                     process_id: command.process_id,
+                    monitor: command.monitor.map(Into::into),
+                    monitor_termination_reason: command.monitor_termination_reason.map(Into::into),
                     source: command.source.into(),
                     status: command.status.into(),
                     command_actions: presentation.command_actions,
@@ -1036,6 +1044,49 @@ v2_enum_from_core! {
         UserShell,
         UnifiedExecStartup,
         UnifiedExecInteraction,
+    }
+}
+
+v2_enum_from_core! {
+    pub enum CommandMonitorTerminationReason from CoreCommandMonitorTerminationReason {
+        TimedOut,
+        UserStopped,
+        SessionShutdown,
+        Capacity,
+        Stopped,
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CommandMonitorInfo {
+    pub task_id: String,
+    pub description: String,
+    #[ts(type = "number")]
+    pub timeout_ms: u64,
+    pub persistent: bool,
+}
+
+impl From<CoreCommandMonitorInfo> for CommandMonitorInfo {
+    fn from(value: CoreCommandMonitorInfo) -> Self {
+        Self {
+            task_id: value.task_id,
+            description: value.description,
+            timeout_ms: value.timeout_ms,
+            persistent: value.persistent,
+        }
+    }
+}
+
+impl From<&CoreCommandMonitorInfo> for CommandMonitorInfo {
+    fn from(value: &CoreCommandMonitorInfo) -> Self {
+        Self {
+            task_id: value.task_id.clone(),
+            description: value.description.clone(),
+            timeout_ms: value.timeout_ms,
+            persistent: value.persistent,
+        }
     }
 }
 

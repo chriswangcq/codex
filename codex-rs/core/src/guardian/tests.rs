@@ -2784,6 +2784,84 @@ async fn guardian_review_does_not_retry_valid_denial() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_execve_denial_preserves_monitor_identity() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let denial = serde_json::json!({
+        "risk_level": "high",
+        "user_authorization": "unknown",
+        "outcome": "deny",
+        "rationale": "unsafe",
+    })
+    .to_string();
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-execve-monitor-denied"),
+            ev_assistant_message("msg-execve-monitor-denied", &denial),
+            ev_completed("resp-execve-monitor-denied"),
+        ])],
+    )
+    .await;
+    let (session, turn, rx) = guardian_test_session_turn_and_rx(&server).await;
+    seed_guardian_parent_history(&session, &turn).await;
+    let monitor = codex_protocol::protocol::CommandMonitorInfo {
+        task_id: "bexecve1".to_string(),
+        description: "watch deploy".to_string(),
+        timeout_ms: 300_000,
+        persistent: false,
+    };
+
+    let decision = review_approval_request(
+        &session,
+        &turn,
+        "review-execve-monitor-denied".to_string(),
+        GuardianApprovalRequest::Execve {
+            id: "monitor-parent-call".to_string(),
+            source: codex_protocol::protocol::GuardianCommandSource::UnifiedExec,
+            program: "/usr/bin/rm".to_string(),
+            argv: vec![
+                "/usr/bin/rm".to_string(),
+                "-f".to_string(),
+                "/tmp/file".to_string(),
+            ],
+            monitor: Some(monitor.clone()),
+            cwd: test_path_buf("/repo/codex-rs/core").abs(),
+            additional_permissions: None,
+        },
+        ApprovalRequestReasons::default(),
+    )
+    .await;
+
+    assert!(matches!(decision, ReviewDecision::Denied { .. }));
+    assert_eq!(request_log.requests().len(), 1);
+    let mut assessments = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let EventMsg::GuardianAssessment(event) = event.msg {
+            assessments.push(event);
+        }
+    }
+    assert_eq!(assessments.len(), 2);
+    assert_eq!(
+        assessments
+            .iter()
+            .map(|assessment| assessment.status)
+            .collect::<Vec<_>>(),
+        vec![
+            GuardianAssessmentStatus::InProgress,
+            GuardianAssessmentStatus::Denied,
+        ]
+    );
+    assert!(assessments.iter().all(|assessment| {
+        assessment.target_item_id.as_deref() == Some("monitor-parent-call")
+            && assessment.monitor.as_ref() == Some(&monitor)
+    }));
+    Ok(())
+}
+
 #[tokio::test]
 async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() -> anyhow::Result<()>
 {

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use codex_core_plugins::PluginCommandAttribution;
 use codex_plugin::PluginId;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
@@ -40,6 +41,13 @@ async fn command_approval_holds_an_elicitation_until_response() {
         plugin_id: PluginId::parse("sample@openai-curated").expect("valid plugin id"),
         normalized_relative_path: "scripts/run.py".to_string(),
     };
+    let monitor = CommandMonitorInfo {
+        task_id: "b123monitor".to_string(),
+        description: "watch logs".to_string(),
+        timeout_ms: 300_000,
+        persistent: false,
+    };
+    let expected_monitor = monitor.clone();
 
     let request = tokio::spawn({
         let session = session.clone();
@@ -52,6 +60,7 @@ async fn command_approval_holds_an_elicitation_until_response() {
                     /*approval_id*/ None,
                     /*environment_id*/ None,
                     vec!["echo".to_string()],
+                    Some(monitor),
                     cwd,
                     /*reason*/ None,
                     /*network_approval_context*/ None,
@@ -70,6 +79,7 @@ async fn command_approval_holds_an_elicitation_until_response() {
     };
     assert_eq!(event.plugin_id.as_deref(), Some("sample@openai-curated"));
     assert_eq!(event.script_path.as_deref(), Some("scripts/run.py"));
+    assert_eq!(event.monitor, Some(expected_monitor));
     wait_until_held(&mut pause_state).await;
     session
         .notify_approval("call-1", ReviewDecision::Approved)

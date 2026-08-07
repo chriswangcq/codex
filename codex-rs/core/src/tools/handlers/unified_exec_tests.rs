@@ -305,6 +305,98 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
 }
 
 #[tokio::test]
+async fn monitor_pre_tool_use_payload_and_rewrite_use_command_field() -> anyhow::Result<()> {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "command": "printf monitor",
+            "description": "test monitor"
+        })
+        .to_string(),
+    };
+    let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let handler = ExecCommandHandler::new(ExecCommandHandlerOptions {
+        allow_login_shell: false,
+        exec_permission_approvals_enabled: false,
+        include_environment_id: false,
+        include_shell_parameter: false,
+        monitor: true,
+    });
+    let invocation = ToolInvocation {
+        session: session.into(),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "monitor-call".to_string(),
+        tool_name: codex_tools::ToolName::plain("monitor"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload,
+    };
+
+    assert_eq!(
+        handler.pre_tool_use_payload(&invocation),
+        Some(crate::tools::registry::PreToolUsePayload {
+            tool_name: HookToolName::bash(),
+            tool_input: serde_json::json!({ "command": "printf monitor" }),
+        })
+    );
+
+    let rewritten = handler.with_updated_hook_input(
+        invocation,
+        serde_json::json!({ "command": "printf rewritten" }),
+    )?;
+    let ToolPayload::Function { arguments } = rewritten.payload else {
+        panic!("rewritten monitor input should remain function-shaped");
+    };
+    let arguments: serde_json::Value = serde_json::from_str(&arguments)?;
+    assert_eq!(arguments["command"], "printf rewritten");
+    assert_eq!(arguments["description"], "test monitor");
+
+    Ok(())
+}
+
+#[test]
+fn monitor_timeout_defaults_and_boundaries_match_contract() {
+    let defaults: super::exec_command::MonitorArgs = serde_json::from_value(serde_json::json!({
+        "command": "printf ready",
+        "description": "readiness"
+    }))
+    .expect("monitor defaults should deserialize");
+    assert_eq!(defaults.timeout_ms, 300_000);
+    assert!(!defaults.persistent);
+
+    assert_eq!(
+        super::exec_command::effective_monitor_timeout_ms(1_000, false),
+        Ok(1_000)
+    );
+    assert_eq!(
+        super::exec_command::effective_monitor_timeout_ms(3_600_000, false),
+        Ok(3_600_000)
+    );
+    assert_eq!(
+        super::exec_command::effective_monitor_timeout_ms(1_000, true),
+        Ok(0)
+    );
+    assert_eq!(
+        super::exec_command::effective_monitor_timeout_ms(3_600_001, true),
+        Ok(0)
+    );
+    assert_eq!(
+        super::exec_command::effective_monitor_timeout_ms(999, false),
+        Err("monitor timeout_ms must be between 1000 and 3600000".to_string())
+    );
+    assert_eq!(
+        super::exec_command::effective_monitor_timeout_ms(3_600_001, false),
+        Err("monitor timeout_ms must be between 1000 and 3600000".to_string())
+    );
+    assert_eq!(
+        super::exec_command::effective_monitor_timeout_ms(999, true),
+        Err("monitor timeout_ms must be at least 1000".to_string())
+    );
+}
+
+#[tokio::test]
 async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({ "chars": "echo hi" }).to_string(),

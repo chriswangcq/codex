@@ -5,6 +5,7 @@ use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::GuardianCommandSource;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Serialize;
@@ -26,6 +27,7 @@ pub(crate) enum GuardianApprovalRequest {
     ExecCommand {
         id: String,
         command: Vec<String>,
+        monitor: Option<CommandMonitorInfo>,
         cwd: AbsolutePathBuf,
         sandbox_permissions: crate::sandboxing::SandboxPermissions,
         additional_permissions: Option<AdditionalPermissionProfile>,
@@ -38,6 +40,7 @@ pub(crate) enum GuardianApprovalRequest {
         source: GuardianCommandSource,
         program: String,
         argv: Vec<String>,
+        monitor: Option<CommandMonitorInfo>,
         cwd: AbsolutePathBuf,
         additional_permissions: Option<AdditionalPermissionProfile>,
     },
@@ -282,6 +285,7 @@ pub(crate) fn guardian_approval_request_to_json(
         GuardianApprovalRequest::ExecCommand {
             id: _,
             command,
+            monitor: _,
             cwd,
             sandbox_permissions,
             additional_permissions,
@@ -302,6 +306,7 @@ pub(crate) fn guardian_approval_request_to_json(
             source,
             program,
             argv,
+            monitor: _,
             cwd,
             additional_permissions,
         } => serialize_guardian_action(ExecveApprovalAction {

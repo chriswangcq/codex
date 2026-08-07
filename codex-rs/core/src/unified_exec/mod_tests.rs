@@ -115,6 +115,7 @@ async fn exec_command_with_tty(
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
                 /*network_policy_decider*/ None,
                 tty,
+                /*capture_monitor_output*/ false,
                 Box::new(NoopSpawnLifecycle),
                 turn.environments
                     .primary()
@@ -140,6 +141,7 @@ async fn exec_command_with_tty(
             network_approval: None,
             session: Arc::downgrade(session),
             last_used: started_at,
+            purpose: ProcessPurpose::Terminal,
         };
         manager
             .process_store
@@ -285,15 +287,18 @@ async fn blocking_terminate_unified_process(
 ) -> anyhow::Result<Arc<UnifiedExecProcess>> {
     let (wake_tx, _wake_rx) = watch::channel(0);
     Ok(Arc::new(
-        UnifiedExecProcess::from_exec_server_started(StartedExecProcess {
-            process: Arc::new(BlockingTerminateExecProcess {
-                process_id: process_id.to_string().into(),
-                terminate_started,
-                allow_terminate,
-                wake_tx,
-            }),
-            sandbox_type: Some(codex_sandboxing::SandboxType::None),
-        })
+        UnifiedExecProcess::from_exec_server_started(
+            StartedExecProcess {
+                process: Arc::new(BlockingTerminateExecProcess {
+                    process_id: process_id.to_string().into(),
+                    terminate_started,
+                    allow_terminate,
+                    wake_tx,
+                }),
+                sandbox_type: Some(codex_sandboxing::SandboxType::None),
+            },
+            /*capture_monitor_output*/ false,
+        )
         .await?,
     ))
 }
@@ -365,6 +370,8 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
             process_id: process_id.to_string(),
             command: "bash -i".to_string(),
             cwd: cwd.into(),
+            monitor: None,
+            output: None,
         }]
     );
 
@@ -394,6 +401,92 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     assert!(!session.terminate_background_terminal(process_id).await);
     assert!(session.list_background_terminals().await.is_empty());
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_background_terminal_exposes_bounded_raw_output_snapshot() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone();
+    let request = test_exec_request(
+        &turn,
+        vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 30".to_string(),
+        ],
+        cwd.clone(),
+        shell_env(),
+    );
+    let process = Arc::new(
+        manager
+            .open_session_with_prepared_exec_env(
+                process_id,
+                &request,
+                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+                /*network_policy_decider*/ None,
+                /*tty*/ false,
+                /*capture_monitor_output*/ true,
+                Box::new(NoopSpawnLifecycle),
+                turn.environments
+                    .primary()
+                    .expect("turn environment")
+                    .environment
+                    .as_ref(),
+            )
+            .await?,
+    );
+    let mut raw_output = b"discarded-prefix:".to_vec();
+    raw_output.extend(std::iter::repeat_n(b'x', 9_000));
+    raw_output.extend_from_slice(b"\nTAIL-MARKER\n");
+    process
+        .output_handles()
+        .output_buffer
+        .lock()
+        .await
+        .push_chunk(raw_output.clone());
+    let (stop_tx, _stop_rx) = watch::channel(None);
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process: Arc::clone(&process),
+            call_id: "monitor-call".to_string(),
+            process_id,
+            cwd: cwd.clone().into(),
+            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hook_command: "sleep 30".to_string(),
+            tty: false,
+            network_approval: None,
+            session: Arc::downgrade(&session),
+            last_used: Instant::now(),
+            purpose: ProcessPurpose::Monitor {
+                info: codex_protocol::protocol::CommandMonitorInfo {
+                    task_id: "b1234abcd".to_string(),
+                    description: "test monitor".to_string(),
+                    timeout_ms: 300_000,
+                    persistent: false,
+                },
+                stop_tx,
+            },
+        },
+    );
+
+    let terminals = manager.list_processes().await;
+    let output = terminals
+        .first()
+        .and_then(|terminal| terminal.output.as_ref())
+        .expect("monitor output snapshot");
+    assert_eq!(output.tail.len(), 8 * 1024);
+    assert!(output.tail.ends_with(b"\nTAIL-MARKER\n"));
+    assert_eq!(output.bytes_total, raw_output.len() as u64);
+    assert!(output.truncated);
+
+    manager.terminate_all_processes().await;
     Ok(())
 }
 
@@ -613,6 +706,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
+            purpose: ProcessPurpose::Terminal,
         },
     );
 
@@ -686,6 +780,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used,
+            purpose: ProcessPurpose::Terminal,
         },
     );
 
@@ -715,7 +810,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
 
     manager.release_process_id(process_id).await;
     allow_terminate.notify_one();
-    process.terminate_confirmed().await?;
+    process.terminate_acknowledged().await?;
 
     let output = tokio::time::timeout(Duration::from_secs(2), poll_task)
         .await
@@ -747,6 +842,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ false,
+            /*capture_monitor_output*/ false,
             Box::new(NoopSpawnLifecycle),
             &environment,
         )
@@ -789,6 +885,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ true,
+            /*capture_monitor_output*/ false,
             Box::new(NoopSpawnLifecycle),
             remote_test_env.environment(),
         )
@@ -838,6 +935,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ true,
+            /*capture_monitor_output*/ false,
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],
             }),

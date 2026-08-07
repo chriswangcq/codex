@@ -95,6 +95,7 @@ impl ChatWidget {
             target_item_id: None,
             plugin_id: None,
             script_path: None,
+            monitor: None,
             turn_id,
             started_at_ms,
             completed_at_ms,

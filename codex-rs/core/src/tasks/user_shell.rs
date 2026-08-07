@@ -191,6 +191,8 @@ pub(crate) async fn execute_user_shell_command(
                 parsed_cmd: parsed_cmd.clone(),
                 source: ExecCommandSource::UserShell,
                 interaction_input: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 status: CommandExecutionStatus::InProgress,
                 stdout: None,
                 stderr: None,
@@ -275,6 +277,8 @@ pub(crate) async fn execute_user_shell_command(
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
+                        monitor: None,
+                        monitor_termination_reason: None,
                         status: CommandExecutionStatus::Failed,
                         stdout: Some(String::new()),
                         stderr: Some(aborted_message.clone()),
@@ -300,6 +304,8 @@ pub(crate) async fn execute_user_shell_command(
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
+                        monitor: None,
+                        monitor_termination_reason: None,
                         status: if output.exit_code == 0 {
                             CommandExecutionStatus::Completed
                         } else {
@@ -345,6 +351,8 @@ pub(crate) async fn execute_user_shell_command(
                         parsed_cmd,
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
+                        monitor: None,
+                        monitor_termination_reason: None,
                         status: CommandExecutionStatus::Failed,
                         stdout: Some(exec_output.stdout.text.clone()),
                         stderr: Some(exec_output.stderr.text.clone()),

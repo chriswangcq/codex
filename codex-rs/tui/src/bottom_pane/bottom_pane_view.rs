@@ -56,6 +56,28 @@ pub(crate) trait BottomPaneView: Renderable {
         None
     }
 
+    /// Refresh a live background-process manager, if this view is one.
+    fn update_background_processes(&mut self, _items: Vec<super::BackgroundProcessItem>) -> bool {
+        false
+    }
+
+    /// Merge a command-monitor output response into the active background-process detail view.
+    fn update_background_monitor_output(
+        &mut self,
+        _response: crate::app_event::BackgroundMonitorOutputResponse,
+    ) -> bool {
+        false
+    }
+
+    /// Resolve a stop request issued by the background-process manager.
+    fn update_background_process_stop(
+        &mut self,
+        _process_id: &str,
+        _result: Result<bool, String>,
+    ) -> bool {
+        false
+    }
+
     /// Active tab id for tabbed list-based views.
     #[allow(dead_code)]
     fn active_tab_id(&self) -> Option<&str> {

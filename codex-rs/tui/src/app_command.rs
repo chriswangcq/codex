@@ -26,6 +26,9 @@ use serde_json::Value;
 pub(crate) enum AppCommand {
     Interrupt,
     CleanBackgroundTerminals,
+    TerminateBackgroundProcess {
+        process_id: String,
+    },
     RunUserShellCommand {
         command: String,
     },
@@ -105,6 +108,10 @@ impl AppCommand {
 
     pub(crate) fn clean_background_terminals() -> Self {
         Self::CleanBackgroundTerminals
+    }
+
+    pub(crate) fn terminate_background_process(process_id: String) -> Self {
+        Self::TerminateBackgroundProcess { process_id }
     }
 
     pub(crate) fn run_user_shell_command(command: String) -> Self {

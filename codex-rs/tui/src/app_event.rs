@@ -31,6 +31,7 @@ use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
+use codex_app_server_protocol::ThreadBackgroundTerminalOutput;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_connectors::AppInfo;
@@ -59,6 +60,13 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
+
+/// Upper bound for one command-monitor output snapshot request.
+///
+/// The detail view uses the same deadline to retire an in-flight generation even if its
+/// completion event is lost, while the app layer uses it to bound the underlying RPC future.
+pub(crate) const BACKGROUND_MONITOR_OUTPUT_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(/*secs*/ 5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadGoalSetMode {
@@ -182,6 +190,25 @@ pub(crate) enum KeymapEditIntent {
 pub(crate) enum KeymapCaptureMode {
     SingleKey,
     Chord,
+}
+
+/// Correlation identity for one command-monitor output snapshot request.
+///
+/// All fields are echoed by the completion event so a response from a previous detail selection,
+/// process incarnation, or popup instance cannot update the currently visible monitor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackgroundMonitorOutputRequest {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) process_id: String,
+    pub(crate) task_id: String,
+    pub(crate) generation: Uuid,
+}
+
+/// Result of one background monitor-output snapshot request.
+#[derive(Debug)]
+pub(crate) struct BackgroundMonitorOutputResponse {
+    pub(crate) request: BackgroundMonitorOutputRequest,
+    pub(crate) result: Result<Option<ThreadBackgroundTerminalOutput>, String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -337,6 +364,12 @@ pub(crate) enum AppEvent {
     /// Forward a command to the Agent. Using an `AppEvent` for this avoids
     /// bubbling channels through layers of widgets.
     CodexOp(AppCommand),
+
+    /// Fetch the selected command monitor's raw output without blocking the UI event loop.
+    FetchBackgroundMonitorOutput(BackgroundMonitorOutputRequest),
+
+    /// Deliver a raw command-monitor output snapshot back to the requesting detail view.
+    BackgroundMonitorOutputLoaded(BackgroundMonitorOutputResponse),
 
     /// Approve one retry of a recent auto-review denial selected in the TUI.
     ApproveRecentAutoReviewDenial {

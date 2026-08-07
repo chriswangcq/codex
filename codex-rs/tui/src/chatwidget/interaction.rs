@@ -163,6 +163,22 @@ impl ChatWidget {
             return;
         }
 
+        if matches!(
+            key_event,
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                ..
+            }
+        ) && self.bottom_pane.no_modal_or_popup_active()
+            && self.bottom_pane.composer_is_empty()
+            && !self.unified_exec_processes.is_empty()
+        {
+            self.show_background_processes();
+            return;
+        }
+
         match key_event {
             KeyEvent {
                 code: KeyCode::BackTab,

@@ -114,7 +114,7 @@ pub struct WinChildKiller {
 
 impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
-        self.job.terminate()
+        self.job.force_terminate()
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {

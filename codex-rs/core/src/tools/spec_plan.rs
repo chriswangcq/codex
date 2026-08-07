@@ -28,6 +28,7 @@ use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
+use crate::tools::handlers::TaskStopHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -876,6 +877,7 @@ fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolR
                     turn_context,
                     context.environments,
                 ),
+                monitor: false,
             }));
             registry.add(WriteStdinHandler);
             if turn_context.config.features.enabled(Feature::ViewImage) {
@@ -934,6 +936,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let supports_shell_command = context.environments.single_local_environment().is_some();
+    let supports_monitor = context.environments.local().is_some();
     let shell_command_options = ShellCommandHandlerOptions {
         backend_config: shell_command_backend_for_features(features),
         allow_login_shell,
@@ -950,7 +953,18 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
                     turn_context,
                     context.environments,
                 ),
+                monitor: false,
             }));
+            if supports_monitor {
+                registry.add(ExecCommandHandler::new(ExecCommandHandlerOptions {
+                    allow_login_shell,
+                    exec_permission_approvals_enabled,
+                    include_environment_id,
+                    include_shell_parameter: false,
+                    monitor: true,
+                }));
+            }
+            registry.add(TaskStopHandler);
             registry.add(WriteStdinHandler);
 
             if supports_shell_command {

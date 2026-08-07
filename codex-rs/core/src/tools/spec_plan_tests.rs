@@ -664,11 +664,73 @@ async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell() {
     })
     .await;
 
-    plan.assert_visible_contains(&["exec_command", "write_stdin"]);
+    plan.assert_visible_contains(&["exec_command", "monitor", "task_stop", "write_stdin"]);
     plan.assert_visible_lacks(&["shell_command"]);
-    plan.assert_registered_contains(&["exec_command", "write_stdin", "shell_command"]);
+    plan.assert_registered_contains(&[
+        "exec_command",
+        "monitor",
+        "task_stop",
+        "write_stdin",
+        "shell_command",
+    ]);
     assert_eq!(plan.exposure("shell_command"), ToolExposure::Hidden);
     assert!(has_parameter(plan.visible_spec("exec_command"), "shell"));
+}
+
+#[tokio::test]
+async fn monitor_is_exposed_only_when_a_local_environment_is_available() {
+    let remote_only = probe(|turn| {
+        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+        set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
+        turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
+        let TurnEnvironmentState::Ready(environment) = turn
+            .environments
+            .environments
+            .first_mut()
+            .expect("primary environment")
+        else {
+            panic!("primary environment should be ready");
+        };
+        environment.environment_id = "remote".to_string();
+        environment.environment = Arc::new(
+            codex_exec_server::Environment::create_for_tests(Some(
+                "ws://127.0.0.1:1/remote-exec-server".to_string(),
+            ))
+            .expect("remote test environment"),
+        );
+    })
+    .await;
+    remote_only.assert_visible_contains(&["exec_command", "task_stop", "write_stdin"]);
+    remote_only.assert_visible_lacks(&["monitor"]);
+    remote_only.assert_registered_lacks(&["monitor"]);
+
+    let mixed = probe(|turn| {
+        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+        set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
+        turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
+        duplicate_primary_environment(turn);
+        let TurnEnvironmentState::Ready(environment) = turn
+            .environments
+            .environments
+            .first_mut()
+            .expect("primary environment")
+        else {
+            panic!("primary environment should be ready");
+        };
+        environment.environment_id = "remote".to_string();
+        environment.environment = Arc::new(
+            codex_exec_server::Environment::create_for_tests(Some(
+                "ws://127.0.0.1:1/remote-exec-server".to_string(),
+            ))
+            .expect("remote test environment"),
+        );
+    })
+    .await;
+    mixed.assert_visible_contains(&["monitor"]);
+    assert!(has_parameter(
+        mixed.visible_spec("monitor"),
+        "environment_id"
+    ));
 }
 
 #[tokio::test]

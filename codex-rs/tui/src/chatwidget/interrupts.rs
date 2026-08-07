@@ -182,6 +182,8 @@ mod tests {
             process_id: None,
             plugin_id: None,
             script_path: None,
+            monitor: None,
+            monitor_termination_reason: None,
             source: CommandExecutionSource::Agent,
             status: CommandExecutionStatus::InProgress,
             command_actions: Vec::new(),

@@ -402,8 +402,13 @@ fn spawn_output_reader(
     })
 }
 
-fn terminate_job_or_process(job: &JobObject, process: HANDLE, log_dir: Option<&Path>) {
-    if let Err(job_err) = job.terminate() {
+fn terminate_job_or_process(job: &JobObject, process: HANDLE, log_dir: Option<&Path>, force: bool) {
+    let result = if force {
+        job.force_terminate()
+    } else {
+        job.terminate()
+    };
+    if let Err(job_err) = result {
         log_note(
             &format!("runner failed to terminate process tree: {job_err}"),
             log_dir,
@@ -517,8 +522,8 @@ fn spawn_input_loop(
                         }
                     }
                 }
-                Message::Terminate { .. } => {
-                    terminate_job_or_process(&job, process, log_dir.as_deref());
+                Message::Terminate { payload } => {
+                    terminate_job_or_process(&job, process, log_dir.as_deref(), payload.force);
                 }
                 Message::SpawnRequest { .. } => {}
                 Message::SpawnReady { .. } => {}
@@ -650,7 +655,7 @@ pub fn main() -> Result<()> {
     let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
     let timed_out = wait_res == WAIT_TIMEOUT;
     let child_stopped = if timed_out {
-        terminate_job_or_process(&job, pi.hProcess, log_dir);
+        terminate_job_or_process(&job, pi.hProcess, log_dir, /*force*/ true);
         let termination_wait = unsafe { WaitForSingleObject(pi.hProcess, TERMINATION_WAIT_MS) };
         if termination_wait == WAIT_TIMEOUT {
             log_note(

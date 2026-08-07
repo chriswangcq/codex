@@ -5,11 +5,11 @@ use super::windows_common::start_runner_stdin_writer;
 use super::windows_common::start_runner_stdout_reader;
 use crate::identity::SandboxCreds;
 use crate::identity::refresh_logon_sandbox_creds;
-use crate::ipc_framed::EmptyPayload;
 use crate::ipc_framed::FramedMessage;
 use crate::ipc_framed::IPC_PROTOCOL_VERSION;
 use crate::ipc_framed::Message;
 use crate::ipc_framed::SpawnRequest;
+use crate::ipc_framed::TerminatePayload;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::runner_client::RunnerTransport;
 use crate::runner_client::retry_runner_spawn_once;
@@ -89,6 +89,28 @@ fn spawn_runner_transport_with_retry<T>(
             )
         },
     )
+}
+
+fn make_runner_terminator(
+    outbound_tx: std::sync::mpsc::Sender<FramedMessage>,
+) -> Box<dyn FnMut(codex_utils_pty::ProcessTerminationMode) -> std::io::Result<()> + Send + Sync> {
+    Box::new(move |mode| {
+        outbound_tx
+            .send(FramedMessage {
+                version: IPC_PROTOCOL_VERSION,
+                message: Message::Terminate {
+                    payload: TerminatePayload {
+                        force: mode == codex_utils_pty::ProcessTerminationMode::Force,
+                    },
+                },
+            })
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "runner termination pipe closed",
+                )
+            })
+    })
 }
 
 async fn spawn_runner_transport_task(
@@ -200,17 +222,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
 
     let outbound_tx = start_runner_pipe_writer(pipe_write);
     let writer_handle = start_runner_stdin_writer(writer_rx, outbound_tx.clone(), tty, stdin_open);
-    let terminator = {
-        let outbound_tx = outbound_tx.clone();
-        Some(Box::new(move || {
-            let _ = outbound_tx.send(FramedMessage {
-                version: IPC_PROTOCOL_VERSION,
-                message: Message::Terminate {
-                    payload: EmptyPayload::default(),
-                },
-            });
-        }) as Box<dyn FnMut() + Send + Sync>)
-    };
+    let terminator = Some(make_runner_terminator(outbound_tx.clone()));
 
     start_runner_stdout_reader(
         pipe_read,

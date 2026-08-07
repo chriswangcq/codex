@@ -315,6 +315,16 @@ async fn run_guardian_review(
         external_cancel,
     } = options;
     let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
+    let monitor = match &request {
+        GuardianApprovalRequest::ExecCommand { monitor, .. } => monitor.clone(),
+        #[cfg(unix)]
+        GuardianApprovalRequest::Execve { monitor, .. } => monitor.clone(),
+        GuardianApprovalRequest::Shell { .. }
+        | GuardianApprovalRequest::ApplyPatch { .. }
+        | GuardianApprovalRequest::NetworkAccess { .. }
+        | GuardianApprovalRequest::McpToolCall { .. }
+        | GuardianApprovalRequest::RequestPermissions { .. } => None,
+    };
     let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
     let plugin_attribution = plugin_attribution_override
         .or_else(|| plugin_attribution_for_guardian_request(turn.as_ref(), &request));
@@ -342,6 +352,7 @@ async fn run_guardian_review(
                 target_item_id: target_item_id.clone(),
                 plugin_id: plugin_id.clone(),
                 script_path: script_path.clone(),
+                monitor: monitor.clone(),
                 turn_id: assessment_turn_id.clone(),
                 started_at_ms,
                 completed_at_ms: None,
@@ -381,6 +392,7 @@ async fn run_guardian_review(
                     target_item_id,
                     plugin_id: plugin_id.clone(),
                     script_path: script_path.clone(),
+                    monitor: monitor.clone(),
                     turn_id: assessment_turn_id.clone(),
                     started_at_ms,
                     completed_at_ms: Some(completed_at_ms),
@@ -476,6 +488,7 @@ async fn run_guardian_review(
                             target_item_id,
                             plugin_id: plugin_id.clone(),
                             script_path: script_path.clone(),
+                            monitor: monitor.clone(),
                             turn_id: assessment_turn_id.clone(),
                             started_at_ms,
                             completed_at_ms: Some(completed_at_ms),
@@ -513,6 +526,7 @@ async fn run_guardian_review(
                             target_item_id,
                             plugin_id: plugin_id.clone(),
                             script_path: script_path.clone(),
+                            monitor: monitor.clone(),
                             turn_id: assessment_turn_id.clone(),
                             started_at_ms,
                             completed_at_ms: Some(completed_at_ms),
@@ -601,6 +615,7 @@ async fn run_guardian_review(
                 target_item_id,
                 plugin_id: plugin_id.clone(),
                 script_path: script_path.clone(),
+                monitor,
                 turn_id: assessment_turn_id.clone(),
                 started_at_ms,
                 completed_at_ms: Some(completed_at_ms),

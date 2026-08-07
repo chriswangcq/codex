@@ -24,6 +24,7 @@ use anyhow::Result;
 use portable_pty::CommandBuilder;
 #[cfg(not(windows))]
 use portable_pty::native_pty_system;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -51,6 +52,7 @@ pub fn conpty_supported() -> bool {
 }
 
 struct PtyChildTerminator {
+    #[cfg(not(unix))]
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     #[cfg(unix)]
     process_group_id: Option<u32>,
@@ -73,20 +75,39 @@ impl ChildTerminator for PtyChildTerminator {
     fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(process_group_id) = self.process_group_id {
-            // Match the pipe backend's hard-kill behavior so descendant
-            // processes from interactive shells/REPLs do not survive shutdown.
-            // Also try the direct child killer in case the cached PGID is stale.
-            let process_group_kill_result =
-                crate::process_group::kill_process_group(process_group_id);
-            let child_kill_result = self.killer.kill();
-            return match child_kill_result {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == ErrorKind::NotFound => process_group_kill_result,
-                Err(err) => process_group_kill_result.or(Err(err)),
-            };
+            // The PTY child is a session leader, so its PID is the authoritative
+            // process-group ID. Never fall back to portable-pty's cached raw PID:
+            // after root exit that PID can be reused while descendants keep the
+            // old process group alive.
+            return crate::process_group::kill_process_group(process_group_id);
         }
 
-        self.killer.kill()
+        #[cfg(not(unix))]
+        {
+            return self.killer.kill();
+        }
+
+        #[cfg(unix)]
+        {
+            Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "PTY process group ID is unavailable",
+            ))
+        }
+    }
+
+    fn force_kill(&mut self, _root_exited: bool) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            // Our ConPTY child killer uses the Job Object's force-termination
+            // path. Ordinary post-exit cleanup is filtered by ProcessHandle.
+            return self.killer.kill();
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.kill()
+        }
     }
 }
 
@@ -120,6 +141,22 @@ fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
     {
         native_pty_system()
     }
+}
+
+fn pty_read_error_is_eof(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EIO) {
+        // Linux PTY masters conventionally report EIO when the final slave
+        // closes; this is the PTY equivalent of a clean EOF.
+        return true;
+    }
+    false
 }
 
 /// Spawn a process attached to a PTY, preserving selected inherited file
@@ -176,28 +213,37 @@ async fn spawn_process_portable(
     // Unix, so PID == PGID and we can reuse the pipe backend's process-group
     // hard-kill semantics for descendants.
     let process_group_id = child.process_id();
+    #[cfg(not(unix))]
     let killer = child.clone_killer();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
     let mut reader = pair.master.try_clone_reader()?;
-    let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
+    let raw_reader_handle = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => return true,
                 Ok(n) => {
-                    let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+                    if stdout_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        return false;
+                    }
                 }
                 Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
-                Err(_) => break,
+                Err(error) => return pty_read_error_is_eof(&error),
             }
         }
+    });
+    let reader_handle: JoinHandle<()> = tokio::spawn(async move {
+        assert!(
+            matches!(raw_reader_handle.await, Ok(true)),
+            "PTY output reader task did not reach EOF normally"
+        );
     });
 
     let writer = pair.master.take_writer()?;
@@ -223,15 +269,18 @@ async fn spawn_process_portable(
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
+    let exit_notify = Arc::new(Notify::new());
+    let wait_exit_notify = Arc::clone(&exit_notify);
     let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let code = match child.wait() {
             Ok(status) => status.exit_code() as i32,
             Err(_) => -1,
         };
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {
             *guard = Some(code);
         }
+        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_exit_notify.notify_waiters();
         let _ = exit_tx.send(code);
     });
 
@@ -247,6 +296,7 @@ async fn spawn_process_portable(
     let handle = ProcessHandle::new(
         writer_tx,
         Box::new(PtyChildTerminator {
+            #[cfg(not(unix))]
             killer,
             #[cfg(unix)]
             process_group_id,
@@ -257,6 +307,7 @@ async fn spawn_process_portable(
         wait_handle,
         exit_status,
         exit_code,
+        exit_notify,
         Some(handles),
         /*resizer*/ None,
     );
@@ -346,22 +397,30 @@ async fn spawn_process_preserving_fds(
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
     let mut reader = master.try_clone()?;
-    let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
+    let raw_reader_handle = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
             match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) => break,
+                Ok(0) => return true,
                 Ok(n) => {
-                    let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+                    if stdout_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        return false;
+                    }
                 }
                 Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
-                Err(_) => break,
+                Err(error) => return pty_read_error_is_eof(&error),
             }
         }
+    });
+    let reader_handle: JoinHandle<()> = tokio::spawn(async move {
+        assert!(
+            matches!(raw_reader_handle.await, Ok(true)),
+            "PTY output reader task did not reach EOF normally"
+        );
     });
 
     let writer = Arc::new(tokio::sync::Mutex::new(master.try_clone()?));
@@ -382,15 +441,18 @@ async fn spawn_process_preserving_fds(
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
+    let exit_notify = Arc::new(Notify::new());
+    let wait_exit_notify = Arc::clone(&exit_notify);
     let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let code = match child.wait() {
             Ok(status) => exit_code_from_status(status),
             Err(_) => -1,
         };
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {
             *guard = Some(code);
         }
+        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_exit_notify.notify_waiters();
         let _ = exit_tx.send(code);
     });
 
@@ -411,6 +473,7 @@ async fn spawn_process_preserving_fds(
         wait_handle,
         exit_status,
         exit_code,
+        exit_notify,
         Some(handles),
         /*resizer*/ None,
     );

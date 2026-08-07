@@ -13,6 +13,8 @@ use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::FileChangeItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::CommandMonitorInfo;
+use codex_protocol::protocol::CommandMonitorTerminationReason;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
@@ -115,6 +117,8 @@ async fn emit_exec_command_begin(ctx: ToolEventCtx<'_>, exec_input: &ExecCommand
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
                 source: exec_input.source,
                 interaction_input: exec_input.interaction_input.map(str::to_owned),
+                monitor: exec_input.monitor.cloned(),
+                monitor_termination_reason: exec_input.monitor_termination_reason,
                 status: CommandExecutionStatus::InProgress,
                 stdout: None,
                 stderr: None,
@@ -147,6 +151,8 @@ pub(crate) enum ToolEmitter {
         parsed_cmd: Vec<ParsedCommand>,
         process_id: Option<String>,
         plugin_attribution: Option<PluginCommandAttribution>,
+        monitor: Option<CommandMonitorInfo>,
+        monitor_termination_reason: Option<CommandMonitorTerminationReason>,
     },
 }
 
@@ -194,6 +200,29 @@ impl ToolEmitter {
             parsed_cmd,
             process_id,
             plugin_attribution,
+            monitor: None,
+            monitor_termination_reason: None,
+        }
+    }
+
+    pub fn monitor(
+        command: &[String],
+        cwd: PathUri,
+        process_id: String,
+        plugin_attribution: Option<PluginCommandAttribution>,
+        monitor: CommandMonitorInfo,
+        monitor_termination_reason: Option<CommandMonitorTerminationReason>,
+    ) -> Self {
+        let parsed_cmd = parse_command(command);
+        Self::UnifiedExec {
+            command: command.to_vec(),
+            cwd,
+            source: ExecCommandSource::UnifiedExecStartup,
+            parsed_cmd,
+            process_id: Some(process_id),
+            plugin_attribution,
+            monitor: Some(monitor),
+            monitor_termination_reason,
         }
     }
 
@@ -220,6 +249,8 @@ impl ToolEmitter {
                         /*interaction_input*/ None,
                         /*process_id*/ None,
                         plugin_attribution.as_ref(),
+                        /*monitor*/ None,
+                        /*monitor_termination_reason*/ None,
                     ),
                     stage,
                 )
@@ -342,6 +373,8 @@ impl ToolEmitter {
                     parsed_cmd,
                     process_id,
                     plugin_attribution,
+                    monitor,
+                    monitor_termination_reason,
                 },
                 stage,
             ) => {
@@ -355,6 +388,8 @@ impl ToolEmitter {
                         /*interaction_input*/ None,
                         process_id.as_deref(),
                         plugin_attribution.as_ref(),
+                        monitor.as_ref(),
+                        *monitor_termination_reason,
                     ),
                     stage,
                 )
@@ -469,9 +504,12 @@ struct ExecCommandInput<'a> {
     interaction_input: Option<&'a str>,
     process_id: Option<&'a str>,
     plugin_attribution: Option<&'a PluginCommandAttribution>,
+    monitor: Option<&'a CommandMonitorInfo>,
+    monitor_termination_reason: Option<CommandMonitorTerminationReason>,
 }
 
 impl<'a> ExecCommandInput<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         command: &'a [String],
         cwd: &'a PathUri,
@@ -480,6 +518,8 @@ impl<'a> ExecCommandInput<'a> {
         interaction_input: Option<&'a str>,
         process_id: Option<&'a str>,
         plugin_attribution: Option<&'a PluginCommandAttribution>,
+        monitor: Option<&'a CommandMonitorInfo>,
+        monitor_termination_reason: Option<CommandMonitorTerminationReason>,
     ) -> Self {
         Self {
             command,
@@ -489,6 +529,8 @@ impl<'a> ExecCommandInput<'a> {
             interaction_input,
             process_id,
             plugin_attribution,
+            monitor,
+            monitor_termination_reason,
         }
     }
 }
@@ -580,6 +622,8 @@ async fn emit_exec_end(
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
                 source: exec_input.source,
                 interaction_input: exec_input.interaction_input.map(str::to_owned),
+                monitor: exec_input.monitor.cloned(),
+                monitor_termination_reason: exec_input.monitor_termination_reason,
                 status: exec_result.status.into(),
                 stdout: Some(exec_result.stdout),
                 stderr: Some(exec_result.stderr),

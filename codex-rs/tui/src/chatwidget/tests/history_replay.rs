@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::HistoryLookupResponse;
+use codex_app_server_protocol::CommandMonitorTerminationReason as AppServerCommandMonitorTerminationReason;
 use codex_app_server_protocol::NetworkAccess;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_protocol::models::ManagedFileSystemPermissions;
@@ -272,6 +273,101 @@ async fn replayed_review_prompt_does_not_seed_composer_history() {
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(chat.bottom_pane.composer_text(), "");
+}
+
+#[tokio::test]
+async fn replayed_completed_monitor_renders_completion_and_aggregate() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let _ = drain_insert_history(&mut rx);
+    let command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "wait-for-ready".to_string(),
+    ];
+
+    chat.replay_thread_item(
+        AppServerThreadItem::CommandExecution {
+            id: "monitor-call-1".to_string(),
+            command: codex_shell_command::parse_command::shlex_join(&command),
+            cwd: chat.config.cwd.clone().into(),
+            process_id: Some("401".to_string()),
+            plugin_id: None,
+            script_path: None,
+            monitor: Some(AppServerCommandMonitorInfo {
+                task_id: "b0nftx2ad".to_string(),
+                description: "pixel event probe".to_string(),
+                timeout_ms: 300_000,
+                persistent: false,
+            }),
+            monitor_termination_reason: None,
+            source: ExecCommandSource::UnifiedExecStartup,
+            status: AppServerCommandExecutionStatus::Completed,
+            command_actions: Vec::new(),
+            aggregated_output: Some("ready\nsecret from stderr\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+        },
+        "turn-1".to_string(),
+        ReplayKind::ThreadSnapshot,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Monitor completed"));
+    assert!(rendered.contains("ready"));
+    assert!(rendered.contains("secret from stderr"));
+    assert!(!rendered.contains("Monitor started"));
+    assert!(chat.unified_exec_processes.is_empty());
+    insta::assert_snapshot!(
+        "replayed_completed_monitor_renders_completion_and_aggregate",
+        rendered
+    );
+}
+
+#[tokio::test]
+async fn replayed_timed_out_monitor_does_not_render_failed_exit() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let _ = drain_insert_history(&mut rx);
+
+    chat.replay_thread_item(
+        AppServerThreadItem::CommandExecution {
+            id: "monitor-call-timeout".to_string(),
+            command: "wait-for-ready".to_string(),
+            cwd: chat.config.cwd.clone().into(),
+            process_id: Some("402".to_string()),
+            plugin_id: None,
+            script_path: None,
+            monitor: Some(AppServerCommandMonitorInfo {
+                task_id: "btimeout1".to_string(),
+                description: "deployment readiness".to_string(),
+                timeout_ms: 4_000,
+                persistent: false,
+            }),
+            monitor_termination_reason: Some(AppServerCommandMonitorTerminationReason::TimedOut),
+            source: ExecCommandSource::UnifiedExecStartup,
+            status: AppServerCommandExecutionStatus::Failed,
+            command_actions: Vec::new(),
+            aggregated_output: Some("last output before timeout\n".to_string()),
+            exit_code: Some(137),
+            duration_ms: Some(4_000),
+        },
+        "turn-1".to_string(),
+        ReplayKind::ThreadSnapshot,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Monitor timed out"));
+    assert!(rendered.contains("last output before timeout"));
+    assert!(!rendered.contains("Monitor failed"));
+    assert!(!rendered.contains("exit 137"));
+    assert!(!rendered.contains("Monitor started"));
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::width::display_width;
+use codex_ansi_escape::ansi_escape_line;
 
 #[derive(Debug)]
 pub(crate) struct UnifiedExecInteractionCell {
@@ -118,6 +119,39 @@ impl UnifiedExecProcessesCell {
 pub(crate) struct UnifiedExecProcessDetails {
     pub(crate) command_display: String,
     pub(crate) recent_chunks: Vec<String>,
+    pub(crate) kind: UnifiedExecProcessKindDetails,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum UnifiedExecProcessKindDetails {
+    BackgroundTerminal,
+    Monitor {
+        description: String,
+        task_id: String,
+        timeout_ms: u64,
+        persistent: bool,
+    },
+}
+
+impl UnifiedExecProcessDetails {
+    fn display_label(&self) -> String {
+        match &self.kind {
+            UnifiedExecProcessKindDetails::BackgroundTerminal => self.command_display.clone(),
+            UnifiedExecProcessKindDetails::Monitor {
+                description,
+                task_id,
+                timeout_ms,
+                persistent,
+            } => {
+                let lifecycle = if *persistent {
+                    "persistent".to_string()
+                } else {
+                    format!("timeout {}", format_monitor_timeout(*timeout_ms))
+                };
+                format!("Monitor({description}) · task {task_id} · {lifecycle}")
+            }
+        }
+    }
 }
 
 impl HistoryCell for UnifiedExecProcessesCell {
@@ -129,7 +163,20 @@ impl HistoryCell for UnifiedExecProcessesCell {
         let wrap_width = width as usize;
         let max_processes = 16usize;
         let mut out: Vec<Line<'static>> = Vec::new();
-        out.push(vec!["Background terminals".bold()].into());
+        let monitor_count = self
+            .processes
+            .iter()
+            .filter(|process| {
+                matches!(&process.kind, UnifiedExecProcessKindDetails::Monitor { .. })
+            })
+            .count();
+        let background_terminal_count = self.processes.len().saturating_sub(monitor_count);
+        let title = match (monitor_count > 0, background_terminal_count > 0) {
+            (true, true) => "Background processes",
+            (true, false) => "Monitors",
+            (false, _) => "Background terminals",
+        };
+        out.push(vec![title.bold()].into());
         out.push("".into());
 
         if self.processes.is_empty() {
@@ -146,12 +193,13 @@ impl HistoryCell for UnifiedExecProcessesCell {
             if shown >= max_processes {
                 break;
             }
-            let command = &process.command_display;
+            let command = process.display_label();
             let (snippet, snippet_truncated) = {
                 let (first_line, has_more_lines) = match command.split_once('\n') {
                     Some((first, _)) => (first, true),
                     None => (command.as_str(), false),
                 };
+                let first_line = ansi_line_text(first_line);
                 let max_graphemes = 80;
                 let mut graphemes = first_line.grapheme_indices(true);
                 if let Some((byte_index, _)) = graphemes.nth(max_graphemes) {
@@ -185,6 +233,7 @@ impl HistoryCell for UnifiedExecProcessesCell {
             let chunk_prefix_first = "    ↳ ";
             let chunk_prefix_next = "      ";
             for (idx, chunk) in process.recent_chunks.iter().enumerate() {
+                let chunk = ansi_line_text(chunk);
                 let chunk_prefix = if idx == 0 {
                     chunk_prefix_first
                 } else {
@@ -196,10 +245,10 @@ impl HistoryCell for UnifiedExecProcessesCell {
                     continue;
                 }
                 let budget = wrap_width.saturating_sub(chunk_prefix_width);
-                let (truncated, remainder, _) = take_prefix_by_width(chunk, budget);
+                let (truncated, remainder, _) = take_prefix_by_width(&chunk, budget);
                 if !remainder.is_empty() && budget > truncation_suffix_width {
                     let available = budget.saturating_sub(truncation_suffix_width);
-                    let (shorter, _, _) = take_prefix_by_width(chunk, available);
+                    let (shorter, _, _) = take_prefix_by_width(&chunk, available);
                     out.push(
                         vec![chunk_prefix.dim(), shorter.dim(), truncation_suffix.dim()].into(),
                     );
@@ -232,6 +281,14 @@ impl HistoryCell for UnifiedExecProcessesCell {
     fn desired_height(&self, width: u16) -> u16 {
         self.display_lines(width).len() as u16
     }
+}
+
+fn ansi_line_text(text: &str) -> String {
+    ansi_escape_line(text)
+        .spans
+        .into_iter()
+        .map(|span| span.content.into_owned())
+        .collect()
 }
 
 pub(crate) fn new_unified_exec_processes_output(

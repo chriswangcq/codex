@@ -1,13 +1,22 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use pretty_assertions::assert_eq;
 
 use crate::ProcessDriver;
 use crate::ProcessSignal;
+use crate::ProcessTerminationMode;
 use crate::SpawnedProcess;
 use crate::TerminalSize;
 use crate::combine_output_receivers;
+use crate::process::ChildTerminator;
+use crate::process::ProcessHandle;
 use crate::spawn_from_driver;
 use crate::spawn_pipe_process;
 use crate::spawn_pipe_process_no_stdin;
@@ -59,6 +68,321 @@ fn echo_sleep_command(marker: &str) -> String {
     } else {
         format!("echo {marker}; sleep 0.05")
     }
+}
+
+struct FailOnceTerminator {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl ChildTerminator for FailOnceTerminator {
+    fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
+        Err(crate::process::unsupported_signal(signal))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected kill failure",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct CountingTerminator {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl ChildTerminator for CountingTerminator {
+    fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
+        Err(crate::process::unsupported_signal(signal))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct CheckedModeTerminator {
+    regular_attempts: Arc<AtomicUsize>,
+    force_attempts: Arc<AtomicUsize>,
+}
+
+impl ChildTerminator for CheckedModeTerminator {
+    fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
+        Err(crate::process::unsupported_signal(signal))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.regular_attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn force_kill(&mut self, _root_exited: bool) -> io::Result<()> {
+        self.force_attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn checked_terminate_propagates_kill_failure_and_retains_terminator() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    // Model a shell that has exited while a background descendant still owns
+    // its output pipes. Root exit alone must not suppress process-group kill.
+    let exit_status = Arc::new(AtomicBool::new(true));
+    let exit_code = Arc::new(StdMutex::new(None));
+    let exit_notify = Arc::new(tokio::sync::Notify::new());
+    let reader_handle = tokio::spawn(std::future::pending());
+    let reader_abort_handle = reader_handle.abort_handle();
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(FailOnceTerminator {
+            attempts: Arc::clone(&attempts),
+        }),
+        reader_handle,
+        vec![reader_abort_handle],
+        tokio::spawn(async {}),
+        tokio::spawn(std::future::pending()),
+        exit_status,
+        exit_code,
+        exit_notify,
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+
+    let err = session
+        .try_request_terminate()
+        .expect_err("first kill request should fail");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+    session
+        .try_request_terminate()
+        .expect("second kill request should reuse the terminator");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn checked_terminate_uses_force_mode_after_root_exit() {
+    let regular_attempts = Arc::new(AtomicUsize::new(0));
+    let force_attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let reader_handle = tokio::spawn(std::future::pending());
+    let reader_abort_handle = reader_handle.abort_handle();
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(CheckedModeTerminator {
+            regular_attempts: Arc::clone(&regular_attempts),
+            force_attempts: Arc::clone(&force_attempts),
+        }),
+        reader_handle,
+        vec![reader_abort_handle],
+        tokio::spawn(async {}),
+        tokio::spawn(async {}),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(StdMutex::new(Some(0))),
+        Arc::new(tokio::sync::Notify::new()),
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+
+    session
+        .try_request_terminate()
+        .expect("checked termination should use force mode");
+
+    assert_eq!(regular_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(force_attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn aborted_reader_wrapper_does_not_claim_output_eof() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(CountingTerminator {
+            attempts: Arc::clone(&attempts),
+        }),
+        tokio::spawn(std::future::pending()),
+        Vec::new(),
+        tokio::spawn(async {}),
+        tokio::spawn(std::future::pending()),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(StdMutex::new(None)),
+        Arc::new(tokio::sync::Notify::new()),
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+
+    session.terminate();
+    tokio::task::yield_now().await;
+
+    assert!(!session.output_closed());
+}
+
+#[tokio::test]
+async fn checked_terminate_is_idempotent_after_root_and_output_exit() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(CountingTerminator {
+            attempts: Arc::clone(&attempts),
+        }),
+        tokio::spawn(async {}),
+        Vec::new(),
+        tokio::spawn(async {}),
+        tokio::spawn(async {}),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(StdMutex::new(Some(0))),
+        Arc::new(tokio::sync::Notify::new()),
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+    session.wait_for_output_closed().await;
+    session
+        .confirm_termination()
+        .expect("fully exited process should retire its terminator");
+
+    session
+        .try_request_terminate()
+        .expect("fully exited process should terminate idempotently");
+    session
+        .try_request_terminate()
+        .expect("repeated termination should remain idempotent");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ordinary_cleanup_retires_terminator_after_root_and_output_eof() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(CountingTerminator {
+            attempts: Arc::clone(&attempts),
+        }),
+        tokio::spawn(async {}),
+        Vec::new(),
+        tokio::spawn(async {}),
+        tokio::spawn(async {}),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(StdMutex::new(Some(0))),
+        Arc::new(tokio::sync::Notify::new()),
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+    session.wait_for_output_closed().await;
+
+    session.request_terminate();
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn driver_checked_termination_requests_force_mode() {
+    let modes = Arc::new(StdMutex::new(Vec::new()));
+    let callback_modes = Arc::clone(&modes);
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (_stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+    let (_exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = spawn_from_driver(ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(move |mode| {
+            callback_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(mode);
+            Ok(())
+        })),
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+
+    spawned
+        .session
+        .try_request_terminate()
+        .expect("checked driver termination should call the force callback");
+
+    assert_eq!(
+        *modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![ProcessTerminationMode::Force]
+    );
+}
+
+#[tokio::test]
+async fn driver_checked_termination_propagates_callback_error() {
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (_stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+    let (_exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = spawn_from_driver(ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(|_mode| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected driver termination failure",
+            ))
+        })),
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+
+    let err = spawned
+        .session
+        .try_request_terminate()
+        .expect_err("checked termination should propagate the driver callback error");
+
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn ordinary_post_exit_cleanup_preserves_force_retry_on_windows() {
+    let regular_attempts = Arc::new(AtomicUsize::new(0));
+    let force_attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let reader_handle = tokio::spawn(std::future::pending());
+    let reader_abort_handle = reader_handle.abort_handle();
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(CheckedModeTerminator {
+            regular_attempts: Arc::clone(&regular_attempts),
+            force_attempts: Arc::clone(&force_attempts),
+        }),
+        reader_handle,
+        vec![reader_abort_handle],
+        tokio::spawn(async {}),
+        tokio::spawn(async {}),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(StdMutex::new(Some(0))),
+        Arc::new(tokio::sync::Notify::new()),
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+
+    session.request_terminate();
+    session
+        .try_request_terminate()
+        .expect("checked stop should retain the force terminator");
+
+    assert_eq!(regular_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(force_attempts.load(Ordering::SeqCst), 1);
 }
 
 fn split_stdout_stderr_command() -> String {
@@ -671,8 +995,9 @@ async fn driver_backed_interrupt_terminates_once() {
         stdout_rx,
         stderr_rx: None,
         exit_rx,
-        terminator: Some(Box::new(move || {
+        terminator: Some(Box::new(move |_mode| {
             callback_terminations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         })),
         writer_handle: None,
         resizer: None,
@@ -702,7 +1027,7 @@ async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<(
         stdout_rx: stdout_driver_rx,
         stderr_rx: None,
         exit_rx,
-        terminator: Some(Box::new(|| {})),
+        terminator: Some(Box::new(|_mode| Ok(()))),
         writer_handle: None,
         resizer: Some(Box::new(move |size| {
             if let Ok(mut guard) = size_tx.lock()

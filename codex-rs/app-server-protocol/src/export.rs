@@ -49,6 +49,7 @@ const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
+    "ThreadBackgroundTerminalOutput",
     "ThreadSearchOccurrence",
     "ThreadSearchTextRange",
 ];
@@ -2365,6 +2366,155 @@ mod tests {
             "Generated TypeScript has optional nullable fields outside *Params types (disallowed '?: T | null'):\n{optional_nullable_offenders:?}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn command_execution_monitor_exports_preserve_mixed_version_compatibility() -> Result<()> {
+        let thread_item_ts = v2::ThreadItem::export_to_string()?;
+        assert!(
+            thread_item_ts.contains("monitor: CommandMonitorInfo | null"),
+            "monitor should be a required nullable response field"
+        );
+        assert!(
+            !thread_item_ts.contains("monitor?:"),
+            "monitor should not add undefined to a response field"
+        );
+        let command_execution_source_ts = v2::CommandExecutionSource::export_to_string()?;
+        assert_eq!(
+            command_execution_source_ts.lines().last(),
+            Some(
+                r#"export type CommandExecutionSource = "agent" | "userShell" | "unifiedExecStartup" | "unifiedExecInteraction";"#
+            )
+        );
+
+        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
+        fs::create_dir(&output_dir)?;
+        let schema = write_json_schema_with_return::<v2::ThreadReadResponse>(
+            &output_dir,
+            "ThreadReadResponse",
+        )?
+        .value;
+        let variants = schema
+            .pointer("/definitions/ThreadItem/oneOf")
+            .and_then(Value::as_array)
+            .context("ThreadItem schema should be a oneOf")?;
+        let command_execution = variants
+            .iter()
+            .find(|variant| {
+                variant
+                    .pointer("/properties/type/enum")
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| value.as_str() == Some("commandExecution"))
+                    })
+            })
+            .context("ThreadItem should include commandExecution")?;
+        let properties = command_execution["properties"]
+            .as_object()
+            .context("commandExecution should have properties")?;
+        let monitor = properties
+            .get("monitor")
+            .context("commandExecution should expose monitor")?;
+        assert_eq!(monitor["default"], Value::Null);
+        assert!(
+            monitor["anyOf"].as_array().is_some_and(|variants| {
+                variants
+                    .iter()
+                    .any(|variant| variant["type"].as_str() == Some("null"))
+            }),
+            "monitor should be nullable in JSON Schema"
+        );
+        let required = command_execution["required"]
+            .as_array()
+            .context("commandExecution should have required fields")?;
+        assert!(
+            !required
+                .iter()
+                .any(|field| field.as_str() == Some("monitor")),
+            "monitor must remain optional in JSON Schema for older servers"
+        );
+        assert_eq!(
+            schema["definitions"]["CommandExecutionSource"]["enum"],
+            serde_json::json!([
+                "agent",
+                "userShell",
+                "unifiedExecStartup",
+                "unifiedExecInteraction",
+            ])
+        );
+
+        let _cleanup = fs::remove_dir_all(&output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_background_terminal_exports_preserve_mixed_version_compatibility() -> Result<()> {
+        let terminal_ts = v2::ThreadBackgroundTerminal::export_to_string()?;
+        for (field, ty) in [
+            ("monitor", "CommandMonitorInfo"),
+            ("output", "ThreadBackgroundTerminalOutput"),
+        ] {
+            assert!(
+                terminal_ts.contains(&format!("{field}: {ty} | null")),
+                "{field} should be a required nullable response field"
+            );
+            assert!(
+                !terminal_ts.contains(&format!("{field}?:")),
+                "{field} should not add undefined to a response field"
+            );
+        }
+
+        let older_payload = serde_json::json!({
+            "itemId": "item-1",
+            "processId": "42",
+            "command": "sleep 1",
+            "cwd": "/tmp",
+            "osPid": null,
+            "cpuPercent": null,
+            "rssKb": null,
+        });
+        let terminal: v2::ThreadBackgroundTerminal = serde_json::from_value(older_payload)?;
+        assert_eq!(terminal.monitor, None);
+        assert_eq!(terminal.output, None);
+
+        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
+        fs::create_dir(&output_dir)?;
+        let schema = write_json_schema_with_return::<v2::ThreadBackgroundTerminal>(
+            &output_dir,
+            "ThreadBackgroundTerminal",
+        )?
+        .value;
+        let properties = schema["properties"]
+            .as_object()
+            .context("ThreadBackgroundTerminal should have properties")?;
+        let required = schema["required"]
+            .as_array()
+            .context("ThreadBackgroundTerminal should have required fields")?;
+        for field in ["monitor", "output"] {
+            let property = properties
+                .get(field)
+                .with_context(|| format!("ThreadBackgroundTerminal should expose {field}"))?;
+            assert_eq!(property["default"], Value::Null);
+            assert!(
+                property["anyOf"].as_array().is_some_and(|variants| {
+                    variants
+                        .iter()
+                        .any(|variant| variant["type"].as_str() == Some("null"))
+                }),
+                "{field} should be nullable in JSON Schema"
+            );
+            assert!(
+                !required
+                    .iter()
+                    .any(|required| required.as_str() == Some(field)),
+                "{field} must remain optional in JSON Schema for older servers"
+            );
+        }
+
+        let _cleanup = fs::remove_dir_all(&output_dir);
         Ok(())
     }
 

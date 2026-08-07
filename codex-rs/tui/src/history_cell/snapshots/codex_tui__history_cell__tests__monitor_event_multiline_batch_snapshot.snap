@@ -1,0 +1,7 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: rendered
+---
+⏺ Monitor event: "pixel event probe"
+  ⎿  ready
+     second

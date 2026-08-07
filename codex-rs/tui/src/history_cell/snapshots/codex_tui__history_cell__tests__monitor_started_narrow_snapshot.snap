@@ -1,0 +1,9 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: rendered
+---
+⏺ Monitor(deployment
+  readiness watcher)
+  ⎿  Monitor started · task
+     b0nftx2ad · timeout
+     300s

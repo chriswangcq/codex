@@ -1,6 +1,7 @@
 use super::ActivePermissionProfile;
 use super::ApprovalsReviewer;
 use super::AskForApproval;
+use super::CommandMonitorInfo;
 use super::SandboxMode;
 use super::SandboxPolicy;
 use super::Thread;
@@ -1061,9 +1062,23 @@ pub struct ThreadBackgroundTerminal {
     pub process_id: String,
     pub command: String,
     pub cwd: LegacyAppPathString,
+    #[serde(default)]
+    pub monitor: Option<CommandMonitorInfo>,
+    #[serde(default)]
+    pub output: Option<ThreadBackgroundTerminalOutput>,
     pub os_pid: Option<u32>,
     pub cpu_percent: Option<f64>,
     pub rss_kb: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadBackgroundTerminalOutput {
+    pub tail: String,
+    #[ts(type = "number")]
+    pub bytes_total: u64,
+    pub truncated: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

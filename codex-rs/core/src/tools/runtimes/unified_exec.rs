@@ -43,6 +43,7 @@ use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxablePreference;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
@@ -72,6 +73,7 @@ pub struct UnifiedExecRequest {
     pub explicit_env_overrides: HashMap<String, String>,
     pub network: Option<NetworkProxy>,
     pub tty: bool,
+    pub monitor: Option<CommandMonitorInfo>,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     #[cfg(unix)]
@@ -162,6 +164,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
             id: call_id.to_string(),
             environment_id: req.turn_environment.environment_id.clone(),
             command: req.command.clone(),
+            monitor: req.monitor.clone(),
             hook_command: req.hook_command.clone(),
             cwd: req.cwd.clone(),
             sandbox_permissions: req.sandbox_permissions,
@@ -420,6 +423,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                             windows_sandbox_proxy_settings_mode,
                             /*network_policy_decider*/ None,
                             req.tty,
+                            req.monitor.is_some(),
                             prepared.spawn_lifecycle,
                             req.turn_environment.environment.as_ref(),
                         )
@@ -467,6 +471,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 req.exec_server_env_config.clone(),
                 windows_sandbox_proxy_settings_mode,
                 req.tty,
+                req.monitor.is_some(),
                 Box::new(NoopSpawnLifecycle),
                 req.turn_environment.environment.as_ref(),
             )
@@ -555,6 +560,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_approval_action_preserves_command_execution_identity() {
+        let manager = UnifiedExecProcessManager::default();
+        let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
+        let mut request = test_request(
+            SandboxPermissions::UseDefault,
+            ExecApprovalRequirement::NeedsApproval {
+                reason: None,
+                proposed_execpolicy_amendment: None,
+            },
+        );
+        let monitor = CommandMonitorInfo {
+            task_id: "b123monitor".to_string(),
+            description: "watch logs".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        };
+        request.monitor = Some(monitor.clone());
+
+        assert_eq!(
+            runtime
+                .approval_action(&request, "call-1")
+                .expect("build monitor approval action"),
+            ApprovalAction::ExecCommand {
+                id: "call-1".to_string(),
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                command: request.command.clone(),
+                monitor: Some(monitor),
+                hook_command: request.hook_command.clone(),
+                cwd: request.cwd.clone(),
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                justification: None,
+                tty: false,
+                proposed_execpolicy_amendment: None,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn unified_exec_uses_the_trusted_sandbox_cwd() {
         let cwd_dir = tempdir().expect("create process temp dir");
         let sandbox_dir = tempdir().expect("create sandbox temp dir");
@@ -577,6 +621,7 @@ mod tests {
             explicit_env_overrides: HashMap::new(),
             network: None,
             tty: false,
+            monitor: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             additional_permissions: None,
             #[cfg(unix)]
@@ -679,6 +724,7 @@ mod tests {
             explicit_env_overrides: HashMap::new(),
             network: None,
             tty: false,
+            monitor: None,
             sandbox_permissions,
             additional_permissions: None,
             #[cfg(unix)]

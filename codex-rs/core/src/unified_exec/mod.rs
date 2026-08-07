@@ -24,17 +24,24 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_tools::UnifiedExecShellMode;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
@@ -47,6 +54,12 @@ mod async_watcher;
 mod errors;
 mod head_tail_buffer;
 mod process;
+pub(crate) use process::MonitorCaptureReceiver;
+pub(crate) use process::MonitorOutputChunk;
+pub(crate) use process::MonitorStreamOutput;
+pub(crate) use process::OutputHandles;
+#[cfg(test)]
+pub(crate) use process::monitor_capture_channel;
 mod process_manager;
 mod process_state;
 
@@ -71,6 +84,88 @@ pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
+pub(crate) const MAX_MONITOR_ARCHIVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Session-scoped budget for command-monitor archive content. Per-task writers
+/// retain their own 5 GiB cap, while this shared counter prevents completed
+/// monitor archives from accumulating that cap once per task.
+pub(crate) struct MonitorArchiveBudget {
+    content_bytes: AtomicU64,
+    cap: u64,
+}
+
+impl MonitorArchiveBudget {
+    fn new(cap: u64) -> Self {
+        Self {
+            content_bytes: AtomicU64::new(0),
+            cap,
+        }
+    }
+
+    pub(crate) fn reserve(self: &Arc<Self>, amount: u64) -> Option<MonitorArchiveReservation> {
+        let mut current = self.content_bytes.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(amount)?;
+            if next > self.cap {
+                return None;
+            }
+            match self.content_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(MonitorArchiveReservation {
+                        budget: Arc::clone(self),
+                        uncommitted_bytes: amount,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cap(cap: u64) -> Arc<Self> {
+        Arc::new(Self::new(cap))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn content_bytes(&self) -> u64 {
+        self.content_bytes.load(Ordering::Acquire)
+    }
+}
+
+impl Default for MonitorArchiveBudget {
+    fn default() -> Self {
+        Self::new(MAX_MONITOR_ARCHIVE_BYTES)
+    }
+}
+
+pub(crate) struct MonitorArchiveReservation {
+    budget: Arc<MonitorArchiveBudget>,
+    uncommitted_bytes: u64,
+}
+
+impl MonitorArchiveReservation {
+    /// Records bytes that actually reached the archive. Any reservation left
+    /// uncommitted is returned to the session budget on drop.
+    pub(crate) fn commit_written(&mut self, written: u64) {
+        debug_assert!(written <= self.uncommitted_bytes);
+        self.uncommitted_bytes = self.uncommitted_bytes.saturating_sub(written);
+    }
+}
+
+impl Drop for MonitorArchiveReservation {
+    fn drop(&mut self) {
+        if self.uncommitted_bytes != 0 {
+            self.budget
+                .content_bytes
+                .fetch_sub(self.uncommitted_bytes, Ordering::AcqRel);
+        }
+    }
+}
 
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
@@ -107,6 +202,7 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
+    pub monitor: Option<CommandMonitorInfo>,
 }
 
 #[derive(Debug)]
@@ -134,6 +230,11 @@ impl std::fmt::Debug for WriteStdinInteractionEvent<'_> {
 pub(crate) struct ProcessStore {
     processes: HashMap<i32, ProcessEntry>,
     reserved_process_ids: HashSet<i32>,
+    monitor_statuses: HashMap<String, MonitorTaskStatus>,
+    monitor_output_files: HashMap<String, PathBuf>,
+    monitor_output_dirs: HashSet<PathBuf>,
+    monitor_workers: HashMap<String, Arc<MonitorWorkerControl>>,
+    monitor_tasks: HashMap<String, MonitorTaskRegistration>,
 }
 
 impl ProcessStore {
@@ -145,15 +246,22 @@ impl ProcessStore {
 
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
+    /// Owns monitor processes from spawn until their durable ProcessEntry or
+    /// monitor-task registration is committed. Failed checked termination also
+    /// remains here so shutdown can retry without losing the last Arc.
+    pending_monitor_processes: StdMutex<HashMap<i32, Arc<UnifiedExecProcess>>>,
     max_write_stdin_yield_time_ms: u64,
+    monitor_archive_budget: Arc<MonitorArchiveBudget>,
 }
 
 impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
         Self {
             process_store: Mutex::new(ProcessStore::default()),
+            pending_monitor_processes: StdMutex::new(HashMap::new()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
+            monitor_archive_budget: Arc::new(MonitorArchiveBudget::default()),
         }
     }
 }
@@ -175,6 +283,80 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+    purpose: ProcessPurpose,
+}
+
+struct MonitorWorkerControl {
+    done: CancellationToken,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+#[derive(Clone)]
+struct MonitorTaskRegistration {
+    process: Arc<UnifiedExecProcess>,
+    process_id: i32,
+    command: String,
+    purpose: ProcessPurpose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MonitorStopReason {
+    User,
+    SessionShutdown,
+    Capacity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MonitorTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Killed,
+}
+
+impl std::fmt::Display for MonitorTaskStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Killed => "killed",
+        })
+    }
+}
+
+pub(crate) enum TerminateMonitorResult {
+    Stopped {
+        info: CommandMonitorInfo,
+        command: String,
+    },
+    StopFailed,
+    NotRunning(MonitorTaskStatus),
+    NotFound,
+}
+
+#[derive(Clone)]
+enum ProcessPurpose {
+    Terminal,
+    Monitor {
+        info: CommandMonitorInfo,
+        stop_tx: watch::Sender<Option<MonitorStopReason>>,
+    },
+}
+
+impl ProcessPurpose {
+    fn monitor_info(&self) -> Option<&CommandMonitorInfo> {
+        match self {
+            Self::Terminal => None,
+            Self::Monitor { info, .. } => Some(info),
+        }
+    }
+
+    fn request_monitor_stop(&self, reason: MonitorStopReason) {
+        if let Self::Monitor { stop_tx, .. } = self {
+            let _ = stop_tx.send(Some(reason));
+        }
+    }
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
@@ -205,6 +387,12 @@ pub(crate) fn generate_chunk_id() -> String {
 #[cfg(unix)]
 #[path = "process_tests.rs"]
 mod process_tests;
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) use process::TERMINATE_CONFIRMATION_TIMEOUT;
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) use process_tests::blocking_terminate_remote_process;
 #[cfg(test)]
 #[cfg(unix)]
 #[path = "mod_tests.rs"]

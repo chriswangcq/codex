@@ -39,8 +39,8 @@ expression: commands
 /exit - exit Codex
 /feedback - send logs to maintainers
 /rollout - print the rollout file path
-/ps - list background terminals
-/stop - stop all background terminals
+/ps - list background terminals and monitors
+/stop - stop all background terminals and monitors
 /clear - clear the terminal and start a new chat
 /test-approval - test approval request
 /subagents - switch the active agent thread

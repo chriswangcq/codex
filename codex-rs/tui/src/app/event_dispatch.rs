@@ -509,6 +509,12 @@ impl App {
                     tracing::error!(error = ?err, "failed to start turn through app server");
                 }
             }
+            AppEvent::FetchBackgroundMonitorOutput(request) => {
+                self.fetch_background_monitor_output(app_server, request);
+            }
+            AppEvent::BackgroundMonitorOutputLoaded(response) => {
+                self.chat_widget.update_background_monitor_output(response);
+            }
             AppEvent::RetrySafetyBufferedTurn {
                 thread_id,
                 turn_id,

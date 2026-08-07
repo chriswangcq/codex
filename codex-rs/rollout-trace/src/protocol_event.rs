@@ -165,6 +165,8 @@ struct ExecCommandBeginTracePayload<'a> {
     source: ExecCommandSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     interaction_input: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor: Option<&'a codex_protocol::protocol::CommandMonitorInfo>,
 }
 
 impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
@@ -181,6 +183,7 @@ impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
             parsed_cmd,
             source,
             interaction_input,
+            monitor,
         } = event;
         Self {
             call_id,
@@ -194,6 +197,7 @@ impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
             parsed_cmd,
             source: *source,
             interaction_input: interaction_input.as_deref(),
+            monitor: monitor.as_ref(),
         }
     }
 }
@@ -219,6 +223,11 @@ struct ExecCommandEndTracePayload<'a> {
     source: ExecCommandSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     interaction_input: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor: Option<&'a codex_protocol::protocol::CommandMonitorInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor_termination_reason:
+        Option<&'a codex_protocol::protocol::CommandMonitorTerminationReason>,
     stdout: &'a str,
     stderr: &'a str,
     aggregated_output: &'a str,
@@ -242,6 +251,8 @@ impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
             parsed_cmd,
             source,
             interaction_input,
+            monitor,
+            monitor_termination_reason,
             stdout,
             stderr,
             aggregated_output,
@@ -262,6 +273,8 @@ impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
             parsed_cmd,
             source: *source,
             interaction_input: interaction_input.as_deref(),
+            monitor: monitor.as_ref(),
+            monitor_termination_reason: monitor_termination_reason.as_ref(),
             stdout,
             stderr,
             aggregated_output,

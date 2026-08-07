@@ -109,6 +109,35 @@ impl HeadTailBuffer {
         out
     }
 
+    /// Return at most the last `max_bytes` retained bytes without cloning the
+    /// whole buffer. This never joins the retained head across an omitted
+    /// middle; when `max_bytes` fits in the tail budget, it is the true suffix
+    /// of all bytes observed.
+    pub(crate) fn tail_bytes(&self, max_bytes: usize) -> Vec<u8> {
+        if max_bytes == 0 {
+            return Vec::new();
+        }
+
+        let tail_len = self.tail.len().min(max_bytes);
+        if self.omitted_bytes > 0 {
+            return self
+                .tail
+                .iter()
+                .skip(self.tail.len().saturating_sub(tail_len))
+                .copied()
+                .collect();
+        }
+        let head_len = self.head.len().min(max_bytes.saturating_sub(tail_len));
+        let mut out = Vec::with_capacity(head_len.saturating_add(tail_len));
+        out.extend_from_slice(&self.head[self.head.len().saturating_sub(head_len)..]);
+        out.extend(
+            self.tail
+                .iter()
+                .skip(self.tail.len().saturating_sub(tail_len)),
+        );
+        out
+    }
+
     /// Return the retained output with an explicit marker between the head and
     /// tail when bytes were omitted.
     pub(crate) fn to_bytes_with_omission_marker(&self) -> Vec<u8> {

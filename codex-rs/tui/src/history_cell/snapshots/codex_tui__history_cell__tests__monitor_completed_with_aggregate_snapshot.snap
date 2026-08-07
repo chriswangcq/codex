@@ -1,0 +1,8 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: rendered
+---
+⏺ Monitor(pixel event probe)
+  ⎿  Monitor completed · task b0nftx2ad · exit 0
+     ready
+     secret from stderr

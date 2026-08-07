@@ -194,7 +194,7 @@ Example with notification opt-out:
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
 - `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
 - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
-- `thread/backgroundTerminals/list` — list running background terminals for a loaded thread (experimental; requires `capabilities.experimentalApi`); returns `data` with the running terminal ids.
+- `thread/backgroundTerminals/list` — list running background terminals and command monitors for a loaded thread (experimental; requires `capabilities.experimentalApi`); returns `data` with process ids, nullable monitor metadata, and monitor-only combined output snapshots.
 - `thread/backgroundTerminals/terminate` — terminate one running background terminal by app-server `processId` (experimental; requires `capabilities.experimentalApi`); returns whether a process was terminated.
 - `thread/rollback` — deprecated and will be removed soon. Drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success. Paginated threads do not support rollback.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Experimental `runtimeWorkspaceRoots` supplies the default roots for newly resolved environment selections. Explicit `environments[].runtimeWorkspaceRoots` override that fallback with environment-native absolute paths. Prefer experimental `permissions` profile selection by id for permission overrides; the legacy `sandboxPolicy` field is still accepted but cannot be combined with `permissions`. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode". Deprecated experimental `multiAgentMode` is ignored; Ultra reasoning effort selects proactive behavior.
@@ -1111,7 +1111,7 @@ Use `thread/backgroundTerminals/clean` to terminate all running background termi
 
 ### Example: List and terminate background terminals
 
-Use `thread/backgroundTerminals/list` to inspect running background terminals associated with a loaded thread. The `backgroundTerminals` segment intentionally follows the existing `thread/backgroundTerminals/clean` method. The returned `processId` is the app-server process id; host OS metadata is nullable. The request accepts the standard `cursor` and `limit` pagination fields. When `nextCursor` is non-null, pass it as `cursor` to fetch the next page.
+Use `thread/backgroundTerminals/list` to inspect running background terminals and command monitors associated with a loaded thread. The `backgroundTerminals` segment intentionally follows the existing `thread/backgroundTerminals/clean` method. The returned `processId` is the app-server process id; `monitor` is null for an ordinary terminal and contains the monitor task metadata otherwise. For monitors, `output` contains an atomic combined stdout/stderr snapshot with an 8 KiB raw-byte tail, total byte count, and truncation flag; ordinary terminals return `output: null`. Host OS metadata is nullable. The request accepts the standard `cursor` and `limit` pagination fields. When `nextCursor` is non-null, pass it as `cursor` to fetch the next page.
 
 ```json
 { "method": "thread/backgroundTerminals/list", "id": 36, "params": { "threadId": "thr_123" } }
@@ -1121,6 +1121,8 @@ Use `thread/backgroundTerminals/list` to inspect running background terminals as
         "processId": "42",
         "command": "python3 -m http.server",
         "cwd": "/workspace",
+        "monitor": null,
+        "output": null,
         "osPid": null,
         "cpuPercent": null,
         "rssKb": null
@@ -1538,7 +1540,7 @@ The app-server streams JSON-RPC notifications while a turn is running. Each turn
 - `agentMessage` — `{id, text}` containing the accumulated agent reply.
 - `plan` — `{id, text}` emitted for plan-mode turns; plan text can stream via `item/plan/delta` (experimental).
 - `reasoning` — `{id, summary, content}` where `summary` holds streamed reasoning summaries (applicable for most OpenAI models) and `content` holds raw reasoning blocks (applicable for e.g. open source models).
-- `commandExecution` — `{id, pluginId?, scriptPath?, command, cwd, status, commandActions, aggregatedOutput?, exitCode?, durationMs?}` for sandboxed commands; `pluginId` is present only for commands attributed to a trusted first-party plugin, newly attributed items also include `scriptPath` as a safe `/`-separated path relative to the trusted plugin root, older history may omit `scriptPath`, and `status` is `inProgress`, `completed`, `failed`, or `declined`. Ordinary execution items and their replay expose `command` and `commandActions` as redacted display values, not executable commands.
+- `commandExecution` — `{id, pluginId?, scriptPath?, command, cwd, processId, monitor, source, status, commandActions, aggregatedOutput?, exitCode?, durationMs?}` for sandboxed commands. `monitor` is null for ordinary commands (older server versions omit the field); command monitors include `{taskId, description, timeoutMs, persistent}` while retaining the existing `unifiedExecStartup` source for compatibility. `pluginId` is present only for commands attributed to a trusted first-party plugin, newly attributed items also include `scriptPath` as a safe `/`-separated path relative to the trusted plugin root, older history may omit `scriptPath`, and `status` is `inProgress`, `completed`, `failed`, or `declined`. Ordinary execution items and their replay expose `command` and `commandActions` as redacted display values, not executable commands.
   `cwd` and read `commandActions[].path` use the executor's native path convention, even when the app-server runs on a different operating system. For example, an app-server running on Linux can return `C:\repo\src\main.rs` for a Windows executor; clients must not interpret that path as local to the app-server.
 - `fileChange` — `{id, changes, status}` describing proposed edits; `changes` list `{path, kind, diff}` and `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `mcpToolCall` — `{id, server, tool, status, arguments, appContext, mcpAppResourceUri?, pluginId, readOnlyHint, result?, error?}` describing MCP calls; `appContext` is `{connectorId, linkId, resourceUri, appName, actionName}` for calls through a trusted MCP app, where `connectorId` identifies the connector that owns the tool, `linkId` identifies the app link, `resourceUri` points to the widget template, `appName` is the connector's display name, and `actionName` is the stable connector `Action.name`. `readOnlyHint` is `true` for read-only tools, `false` for write-capable tools, and `null` when the annotation is unavailable, including older rollout entries. The hint describes tool capability, not whether an invocation succeeded or performed a write; use `status`, `result`, and `error` to determine the execution outcome. `appName` and `actionName` may be null for older rollout entries. The top-level `mcpAppResourceUri` is deprecated and temporarily duplicated for client migration. `tool` identifies the raw MCP tool. `status` is `inProgress`, `completed`, or `failed`.
@@ -1561,6 +1563,8 @@ All items emit shared lifecycle events:
 
 `review` is [UNSTABLE] and currently has `{status, riskLevel?, userAuthorization?, rationale?}`, where `status` is one of `inProgress`, `approved`, `denied`, or `aborted`. `riskLevel` is one of `"low"`, `"medium"`, `"high"`, or `"critical"` when present. `userAuthorization` is one of `"unknown"`, `"low"`, `"medium"`, or `"high"` when present. `action` is a tagged union with `type: "command" | "execve" | "applyPatch" | "networkAccess" | "mcpToolCall"`. Command-like actions include a `source` discriminator (`"shell"` or `"unifiedExec"`). These notifications are separate from the target item's own `item/completed` lifecycle and are intentionally temporary while the auto-review app protocol is still being designed.
 
+Approval and auto-review UIs should read monitor identity from the canonical `commandExecution` item correlated by the approval request's `itemId` or the review notification's `targetItemId`; these auxiliary payloads do not duplicate `monitor` metadata.
+
 There are additional item-specific events:
 
 #### agentMessage
@@ -1580,6 +1584,7 @@ There are additional item-specific events:
 #### commandExecution
 
 - `item/commandExecution/outputDelta` — streams stdout/stderr for the command; append deltas in order to render live output alongside `aggregatedOutput` in the final item.
+  When the command item has non-null `monitor` metadata, deltas are the monitor's already-framed stdout event batches; stderr remains part of the final `aggregatedOutput` and never triggers a monitor event.
   Final `commandExecution` items include parsed `commandActions`, `status`, `exitCode`, and `durationMs` so the UI can summarize what ran and whether it succeeded.
 
 #### fileChange

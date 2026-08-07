@@ -106,6 +106,8 @@ fn thread_background_terminals_list_response_round_trips_foreign_paths() {
                 cwd: PathUri::parse(uri)
                     .expect("cross-platform path URI should parse")
                     .into(),
+                monitor: None,
+                output: None,
                 os_pid: None,
                 cpu_percent: None,
                 rss_kb: None,
@@ -118,6 +120,8 @@ fn thread_background_terminals_list_response_round_trips_foreign_paths() {
                 "processId": "42",
                 "command": "run server",
                 "cwd": expected_cwd,
+                "monitor": null,
+                "output": null,
                 "osPid": null,
                 "cpuPercent": null,
                 "rssKb": null,
@@ -137,6 +141,57 @@ fn thread_background_terminals_list_response_round_trips_foreign_paths() {
             "deserializing {uri}",
         );
     }
+}
+
+#[test]
+fn thread_background_terminal_monitor_metadata_round_trips() {
+    let response = ThreadBackgroundTerminalsListResponse {
+        data: vec![ThreadBackgroundTerminal {
+            item_id: "monitor-call".to_string(),
+            process_id: "401".to_string(),
+            command: "tail -f app.log".to_string(),
+            cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()).into(),
+            monitor: Some(CommandMonitorInfo {
+                task_id: "b1234abcd".to_string(),
+                description: "deployment readiness".to_string(),
+                timeout_ms: 300_000,
+                persistent: false,
+            }),
+            output: Some(ThreadBackgroundTerminalOutput {
+                tail: "ready\nwarning\n".to_string(),
+                bytes_total: 12_345,
+                truncated: true,
+            }),
+            os_pid: None,
+            cpu_percent: None,
+            rss_kb: None,
+        }],
+        next_cursor: None,
+    };
+
+    let value = serde_json::to_value(&response).expect("response should serialize");
+    assert_eq!(
+        value["data"][0]["monitor"],
+        json!({
+            "taskId": "b1234abcd",
+            "description": "deployment readiness",
+            "timeoutMs": 300_000,
+            "persistent": false,
+        })
+    );
+    assert_eq!(
+        value["data"][0]["output"],
+        json!({
+            "tail": "ready\nwarning\n",
+            "bytesTotal": 12_345,
+            "truncated": true,
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<ThreadBackgroundTerminalsListResponse>(value)
+            .expect("response should deserialize"),
+        response
+    );
 }
 
 #[test]
@@ -2777,6 +2832,90 @@ fn network_requirements_serializes_canonical_and_legacy_fields() {
     );
 }
 
+fn command_execution_thread_item(monitor: Option<CommandMonitorInfo>) -> ThreadItem {
+    ThreadItem::CommandExecution {
+        id: "exec-1".to_string(),
+        plugin_id: None,
+        script_path: None,
+        command: "echo hello".to_string(),
+        cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
+        process_id: None,
+        monitor,
+        monitor_termination_reason: None,
+        source: CommandExecutionSource::Agent,
+        status: CommandExecutionStatus::Completed,
+        command_actions: Vec::new(),
+        aggregated_output: Some("hello\n".to_string()),
+        exit_code: Some(0),
+        duration_ms: Some(1),
+    }
+}
+
+#[test]
+fn command_execution_defaults_monitor_and_source_for_older_servers() {
+    let item = serde_json::from_value::<ThreadItem>(json!({
+        "type": "commandExecution",
+        "id": "exec-legacy",
+        "pluginId": null,
+        "scriptPath": null,
+        "command": "echo hello",
+        "cwd": absolute_path_string("tmp"),
+        "processId": null,
+        "status": "completed",
+        "commandActions": [],
+        "aggregatedOutput": "hello\n",
+        "exitCode": 0,
+        "durationMs": 1,
+    }))
+    .expect("older command execution item should deserialize");
+
+    let ThreadItem::CommandExecution {
+        monitor,
+        monitor_termination_reason,
+        source,
+        ..
+    } = item
+    else {
+        panic!("expected command execution item");
+    };
+    assert_eq!(monitor, None);
+    assert_eq!(monitor_termination_reason, None);
+    assert_eq!(source, CommandExecutionSource::Agent);
+}
+
+#[test]
+fn ordinary_command_execution_serializes_monitor_fields_as_null() {
+    let value = serde_json::to_value(command_execution_thread_item(None))
+        .expect("command execution item should serialize");
+
+    assert_eq!(value.get("monitor"), Some(&JsonValue::Null));
+    assert_eq!(
+        value.get("monitorTerminationReason"),
+        Some(&JsonValue::Null)
+    );
+}
+
+#[test]
+fn command_execution_serializes_monitor_metadata_in_camel_case() {
+    let value = serde_json::to_value(command_execution_thread_item(Some(CommandMonitorInfo {
+        task_id: "b1234abcd".to_string(),
+        description: "deployment readiness".to_string(),
+        timeout_ms: 300_000,
+        persistent: false,
+    })))
+    .expect("monitored command execution item should serialize");
+
+    assert_eq!(
+        value.get("monitor"),
+        Some(&json!({
+            "taskId": "b1234abcd",
+            "description": "deployment readiness",
+            "timeoutMs": 300_000,
+            "persistent": false,
+        }))
+    );
+}
+
 #[test]
 fn core_turn_item_into_thread_item_converts_supported_variants() {
     let user_item = TurnItem::UserMessage(UserMessageItem {
@@ -2941,8 +3080,17 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             cmd: "git -c 'http.extraHeader=Authorization: Bearer example_synthetic_bearer_token_123456' -c http.extraHeader=X-Trace:example push"
                 .to_string(),
         }],
-        source: CoreExecCommandSource::Agent,
+        source: CoreExecCommandSource::UnifiedExecStartup,
         interaction_input: None,
+        monitor: Some(codex_protocol::protocol::CommandMonitorInfo {
+            task_id: "b1234abcd".to_string(),
+            description: "deployment readiness".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        }),
+        monitor_termination_reason: Some(
+            codex_protocol::protocol::CommandMonitorTerminationReason::TimedOut,
+        ),
         status: CoreCommandExecutionStatus::Completed,
         stdout: Some("done\n".to_string()),
         stderr: Some(String::new()),
@@ -2962,7 +3110,14 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
                 .to_string(),
             cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
             process_id: Some("pid-1".to_string()),
-            source: CommandExecutionSource::Agent,
+            monitor: Some(CommandMonitorInfo {
+                task_id: "b1234abcd".to_string(),
+                description: "deployment readiness".to_string(),
+                timeout_ms: 300_000,
+                persistent: false,
+            }),
+            monitor_termination_reason: Some(CommandMonitorTerminationReason::TimedOut),
+            source: CommandExecutionSource::UnifiedExecStartup,
             status: CommandExecutionStatus::Completed,
             command_actions: vec![CommandAction::Unknown {
                 command: "git -c 'http.extraHeader=Authorization: Bearer [REDACTED_SECRET]' -c http.extraHeader=X-Trace:example push"

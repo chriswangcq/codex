@@ -6,6 +6,9 @@
 
 use super::plugin_mentions::fetch_plugin_mentions;
 use super::*;
+use crate::app_event::BACKGROUND_MONITOR_OUTPUT_REQUEST_TIMEOUT;
+use crate::app_event::BackgroundMonitorOutputRequest;
+use crate::app_event::BackgroundMonitorOutputResponse;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_info::app_info_from_api;
 use crate::config_update::format_config_error;
@@ -19,6 +22,9 @@ use codex_app_server_protocol::MarketplaceRemoveParams;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeParams;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalOutput;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
 
 use codex_app_server_protocol::RequestId;
 
@@ -35,6 +41,27 @@ const WORKSPACE_HEADLINE_FETCH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(/*millis*/ 2000);
 
 impl App {
+    pub(super) fn fetch_background_monitor_output(
+        &self,
+        app_server: &AppServerSession,
+        request: BackgroundMonitorOutputRequest,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                BACKGROUND_MONITOR_OUTPUT_REQUEST_TIMEOUT,
+                fetch_background_monitor_output_snapshot(request_handle, &request),
+            )
+            .await
+            .map_err(|_| "command monitor output request timed out in TUI".to_string())
+            .and_then(|result| result.map_err(|err| err.to_string()));
+            app_event_tx.send(AppEvent::BackgroundMonitorOutputLoaded(
+                BackgroundMonitorOutputResponse { request, result },
+            ));
+        });
+    }
+
     pub(super) fn fetch_mcp_inventory(
         &mut self,
         app_server: &AppServerSession,
@@ -755,6 +782,36 @@ pub(super) async fn fetch_all_mcp_server_statuses(
     }
 
     Ok(statuses)
+}
+
+async fn fetch_background_monitor_output_snapshot(
+    request_handle: AppServerRequestHandle,
+    request: &BackgroundMonitorOutputRequest,
+) -> Result<Option<ThreadBackgroundTerminalOutput>> {
+    let request_id = RequestId::String(format!("monitor-output-{}", request.generation));
+    let response: ThreadBackgroundTerminalsListResponse = request_handle
+        .request_typed(ClientRequest::ThreadBackgroundTerminalsList {
+            request_id,
+            params: ThreadBackgroundTerminalsListParams {
+                thread_id: request.thread_id.to_string(),
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await
+        .wrap_err("thread/backgroundTerminals/list failed in TUI")?;
+
+    Ok(response
+        .data
+        .into_iter()
+        .find(|terminal| {
+            terminal.process_id == request.process_id
+                && terminal
+                    .monitor
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.task_id == request.task_id)
+        })
+        .and_then(|terminal| terminal.output))
 }
 
 pub(super) async fn fetch_account_rate_limits(

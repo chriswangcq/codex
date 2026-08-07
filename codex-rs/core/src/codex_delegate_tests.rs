@@ -448,11 +448,18 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
     });
 
     let cancel_token = CancellationToken::new();
+    let monitor = codex_protocol::protocol::CommandMonitorInfo {
+        task_id: "bdelegated".to_string(),
+        description: "watch delegated command".to_string(),
+        timeout_ms: 300_000,
+        persistent: false,
+    };
     let handle = tokio::spawn({
         let io = Arc::clone(&io);
         let parent_session = Arc::clone(&parent_session);
         let parent_ctx = Arc::clone(&parent_ctx);
         let cancel_token = cancel_token.clone();
+        let monitor = monitor.clone();
         async move {
             handle_exec_approval(
                 io.as_ref(),
@@ -468,6 +475,7 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
                     environment_id: Some("remote".to_string()),
                     started_at_ms: 0,
                     command: vec!["rm".to_string(), "-rf".to_string(), "tmp".to_string()],
+                    monitor: Some(monitor),
                     cwd: test_path_buf("/tmp").abs(),
                     reason: Some("unsafe subcommand".to_string()),
                     network_approval_context: None,
@@ -497,7 +505,7 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
     .await
     .expect("timed out waiting for guardian assessment");
     let expected_action = GuardianAssessmentAction::Command {
-        source: GuardianCommandSource::Shell,
+        source: GuardianCommandSource::UnifiedExec,
         command: "rm -rf tmp".to_string(),
         cwd: test_path_buf("/tmp").abs(),
     };
@@ -514,6 +522,7 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
         assessment_event.script_path.as_deref(),
         Some("scripts/run.py")
     );
+    assert_eq!(assessment_event.monitor, Some(monitor));
     assert_eq!(assessment_event.turn_id, parent_ctx.sub_id);
     assert_eq!(
         assessment_event.status,

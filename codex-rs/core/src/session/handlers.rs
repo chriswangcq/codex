@@ -585,6 +585,9 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    // Close the turn-start gate before the first await. Monitor delivery and
+    // pending-work scheduling may already be in flight on other tasks.
+    sess.begin_session_runtime_shutdown();
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -606,6 +609,14 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    sess.services
+        .unified_exec_manager
+        .cleanup_monitor_output_files()
+        .await;
+    // Defense in depth after monitor workers have been joined (or bounded out):
+    // the closed start gate prevents resurrection while this clears any task
+    // that was linearized immediately before shutdown began.
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {

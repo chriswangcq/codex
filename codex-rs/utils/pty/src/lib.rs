@@ -21,6 +21,8 @@ pub use process::ProcessDriver;
 pub use process::ProcessHandle;
 /// Process signal supported by spawned-process handles.
 pub use process::ProcessSignal;
+/// Termination strength requested from externally-driven process adapters.
+pub use process::ProcessTerminationMode;
 /// Bundle of process handles plus split output and exit receivers returned by spawn helpers.
 pub use process::SpawnedProcess;
 /// Terminal size in character cells used for PTY spawn and resize operations.

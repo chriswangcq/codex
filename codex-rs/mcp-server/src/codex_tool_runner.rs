@@ -207,6 +207,7 @@ async fn run_codex_tool_session_inner(
                             environment_id: _,
                             started_at_ms: _,
                             command,
+                            monitor: _,
                             cwd,
                             call_id,
                             plugin_id: _,

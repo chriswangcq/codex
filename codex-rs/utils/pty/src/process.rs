@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use portable_pty::MasterPty;
 use portable_pty::PtySize;
 use portable_pty::SlavePty;
+use tokio::sync::Notify;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -21,6 +22,12 @@ use tokio::task::JoinHandle;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessSignal {
     Interrupt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessTerminationMode {
+    Regular,
+    Force,
 }
 
 pub(crate) fn unsupported_signal(signal: ProcessSignal) -> io::Error {
@@ -52,6 +59,12 @@ pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
     fn kill(&mut self) -> io::Result<()>;
+
+    /// Force termination even when the platform normally preserves descendants
+    /// after the root process has exited.
+    fn force_kill(&mut self, _root_exited: bool) -> io::Result<()> {
+        self.kill()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,12 +130,37 @@ pub struct ProcessHandle {
     wait_handle: StdMutex<Option<JoinHandle<()>>>,
     exit_status: Arc<AtomicBool>,
     exit_code: Arc<StdMutex<Option<i32>>>,
+    exit_notify: Arc<Notify>,
+    output_closed: Arc<AtomicBool>,
+    output_closed_notify: Arc<Notify>,
     // PtyHandles must be preserved because the process will receive Control+C if the
     // slave is closed
     _pty_handles: StdMutex<Option<PtyHandles>>,
     // Optional resize hook for driver-backed sessions that proxy PTY control to
     // another backend instead of owning local PTY handles.
     resizer: StdMutex<Option<ResizeFn>>,
+}
+
+struct OutputClosedGuard {
+    output_closed: Arc<AtomicBool>,
+    output_closed_notify: Arc<Notify>,
+    completed: bool,
+}
+
+impl OutputClosedGuard {
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for OutputClosedGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            self.output_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.output_closed_notify.notify_waiters();
+    }
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -142,9 +180,26 @@ impl ProcessHandle {
         wait_handle: JoinHandle<()>,
         exit_status: Arc<AtomicBool>,
         exit_code: Arc<StdMutex<Option<i32>>>,
+        exit_notify: Arc<Notify>,
         pty_handles: Option<PtyHandles>,
         resizer: Option<ResizeFn>,
     ) -> Self {
+        let output_closed = Arc::new(AtomicBool::new(false));
+        let output_closed_notify = Arc::new(Notify::new());
+        let reader_handle = tokio::spawn({
+            let output_closed = Arc::clone(&output_closed);
+            let output_closed_notify = Arc::clone(&output_closed_notify);
+            async move {
+                let mut guard = OutputClosedGuard {
+                    output_closed,
+                    output_closed_notify,
+                    completed: false,
+                };
+                if reader_handle.await.is_ok() {
+                    guard.mark_completed();
+                }
+            }
+        });
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
@@ -154,6 +209,9 @@ impl ProcessHandle {
             wait_handle: StdMutex::new(Some(wait_handle)),
             exit_status,
             exit_code,
+            exit_notify,
+            output_closed,
+            output_closed_notify,
             _pty_handles: StdMutex::new(pty_handles),
             resizer: StdMutex::new(resizer),
         }
@@ -180,6 +238,60 @@ impl ProcessHandle {
     /// Returns the exit code if known.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// Wait until the child process waiter has observed its exit.
+    pub async fn wait_for_exit(&self) {
+        loop {
+            let notified = self.exit_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_exited() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// True once all stdout/stderr producers have stopped and their reader
+    /// tasks have released the output channel senders.
+    pub fn output_closed(&self) -> bool {
+        self.output_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait until every stdout/stderr reader has stopped producing output.
+    pub async fn wait_for_output_closed(&self) {
+        loop {
+            let notified = self.output_closed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.output_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Retire the cached process-tree terminator after both the root waiter and
+    /// all output readers have confirmed shutdown.
+    ///
+    /// Until this succeeds, the terminator is retained so a failed or timed-out
+    /// checked termination can be retried. Retiring it also prevents a later
+    /// drop from signaling a process group whose numeric ID may have been reused.
+    pub fn confirm_termination(&self) -> io::Result<()> {
+        if !self.has_exited() || !self.output_closed() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "process root or output readers are still running",
+            ));
+        }
+        let _ = self
+            .killer
+            .lock()
+            .map_err(|_| io::Error::other("failed to lock process terminator"))?
+            .take();
+        Ok(())
     }
 
     /// Resize the PTY in character cells.
@@ -216,14 +328,78 @@ impl ProcessHandle {
         }
     }
 
+    #[cfg(windows)]
+    pub async fn release_pty_handles_after_root_exit(&self) {
+        let has_pty_handles = self
+            ._pty_handles
+            .lock()
+            .map(|handles| handles.is_some())
+            .unwrap_or(false);
+        if !has_pty_handles {
+            return;
+        }
+
+        self.close_stdin();
+        let writer_handle = self
+            .writer_handle
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(writer_handle) = writer_handle {
+            writer_handle.abort();
+            let _ = writer_handle.await;
+        }
+        if let Ok(mut handles) = self._pty_handles.lock() {
+            handles.take();
+        }
+    }
+
     /// Attempts to kill the child while leaving the reader/writer tasks alive
     /// so callers can still drain output until EOF.
     pub fn request_terminate(&self) {
-        if let Ok(mut killer_opt) = self.killer.lock()
-            && let Some(mut killer) = killer_opt.take()
-        {
-            let _ = killer.kill();
+        if let Ok(mut killer_opt) = self.killer.lock() {
+            if self.has_exited() && self.output_closed() {
+                // A normally completed process has no live output producer.
+                // Retire cached numeric identifiers before they can be reused.
+                killer_opt.take();
+                return;
+            }
+            #[cfg(windows)]
+            if self.has_exited() {
+                // Windows waiters disable kill-on-close before publishing root
+                // exit so an ordinary drop preserves background descendants.
+                // Keep the terminator available in case a later checked stop
+                // explicitly needs to force-kill that preserved process tree.
+                return;
+            }
+            if let Some(mut killer) = killer_opt.take() {
+                let _ = killer.kill();
+            }
         }
+    }
+
+    /// Attempts to kill the child without stopping its waiter, propagating any
+    /// error and retaining the terminator so the request can be retried.
+    pub fn try_request_terminate(&self) -> io::Result<()> {
+        // A shell can exit while a background descendant still owns stdout or
+        // stderr. In that state the cached process-group/job terminator is still
+        // needed even though the root waiter has completed. Only skip the kill
+        // once both the root and every output producer are known to be gone.
+        if self.has_exited() && self.output_closed() {
+            return Ok(());
+        }
+
+        let mut killer_opt = self
+            .killer
+            .lock()
+            .map_err(|_| io::Error::other("failed to lock process terminator"))?;
+        let Some(killer) = killer_opt.as_mut() else {
+            if self.has_exited() && self.output_closed() {
+                return Ok(());
+            }
+            return Err(io::Error::other("process terminator is unavailable"));
+        };
+        killer.force_kill(self.has_exited())
     }
 
     pub fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
@@ -277,7 +453,7 @@ impl Drop for ProcessHandle {
 
 /// Adapts a closure into a `ChildTerminator` implementation.
 struct ClosureTerminator {
-    inner: Option<Box<dyn FnMut() + Send + Sync>>,
+    inner: Option<Box<dyn FnMut(ProcessTerminationMode) -> io::Result<()> + Send + Sync>>,
     #[cfg(windows)]
     interrupt_terminates: bool,
 }
@@ -294,7 +470,14 @@ impl ChildTerminator for ClosureTerminator {
 
     fn kill(&mut self) -> io::Result<()> {
         if let Some(inner) = self.inner.as_mut() {
-            (inner)();
+            return (inner)(ProcessTerminationMode::Regular);
+        }
+        Ok(())
+    }
+
+    fn force_kill(&mut self, _root_exited: bool) -> io::Result<()> {
+        if let Some(inner) = self.inner.as_mut() {
+            return (inner)(ProcessTerminationMode::Force);
         }
         Ok(())
     }
@@ -365,7 +548,7 @@ pub struct ProcessDriver {
     pub stdout_rx: broadcast::Receiver<Vec<u8>>,
     pub stderr_rx: Option<broadcast::Receiver<Vec<u8>>>,
     pub exit_rx: oneshot::Receiver<i32>,
-    pub terminator: Option<Box<dyn FnMut() + Send + Sync>>,
+    pub terminator: Option<Box<dyn FnMut(ProcessTerminationMode) -> io::Result<()> + Send + Sync>>,
     pub writer_handle: Option<JoinHandle<()>>,
     pub resizer: Option<ResizeFn>,
     /// Whether this Windows process is attached to a pseudo-console.
@@ -420,19 +603,34 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
                     match recv_result {
                         Ok(chunk) => {
                             if output_tx.send(chunk).await.is_err() {
-                                break;
+                                return false;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
                     }
                 }
             })
         };
-    let reader_handle = spawn_stream_reader(stdout_driver_rx, stdout_tx, exit_seen_rx.clone());
+    let stdout_reader_handle =
+        spawn_stream_reader(stdout_driver_rx, stdout_tx, exit_seen_rx.clone());
     let stderr_reader_handle = stderr_driver_rx
         .take()
         .map(|rx| spawn_stream_reader(rx, stderr_tx, exit_seen_rx));
+    let mut reader_abort_handles = vec![stdout_reader_handle.abort_handle()];
+    if let Some(handle) = stderr_reader_handle.as_ref() {
+        reader_abort_handles.push(handle.abort_handle());
+    }
+    let reader_handle = tokio::spawn(async move {
+        let mut completed = matches!(stdout_reader_handle.await, Ok(true));
+        if let Some(handle) = stderr_reader_handle {
+            completed &= matches!(handle.await, Ok(true));
+        }
+        assert!(
+            completed,
+            "driver output reader task did not complete normally"
+        );
+    });
 
     let writer_handle = writer_handle.unwrap_or_else(|| tokio::spawn(async {}));
 
@@ -441,12 +639,15 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
+    let exit_notify = Arc::new(Notify::new());
+    let wait_exit_notify = Arc::clone(&exit_notify);
     let wait_handle = tokio::spawn(async move {
         let code = exit_rx.await.unwrap_or(-1);
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {
             *guard = Some(code);
         }
+        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_exit_notify.notify_waiters();
         let _ = exit_seen_tx.send(true);
         let _ = exit_tx.send(code);
     });
@@ -459,14 +660,12 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
             interrupt_terminates,
         }),
         reader_handle,
-        stderr_reader_handle
-            .map(|handle| handle.abort_handle())
-            .into_iter()
-            .collect(),
+        reader_abort_handles,
         writer_handle,
         wait_handle,
         exit_status,
         exit_code,
+        exit_notify,
         /*pty_handles*/ None,
         resizer,
     );

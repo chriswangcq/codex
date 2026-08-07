@@ -18,6 +18,8 @@ fn agent_status_uses_bounded_buffered_activity() {
                 process_id: None,
                 plugin_id: None,
                 script_path: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: Vec::new(),

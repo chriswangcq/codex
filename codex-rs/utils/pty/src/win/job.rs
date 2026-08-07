@@ -134,6 +134,20 @@ impl JobObject {
             return Ok(());
         }
 
+        self.terminate_unchecked()
+    }
+
+    /// Terminates every assigned process even after normal root exit disabled
+    /// kill-on-close in order to preserve descendants for ordinary cleanup.
+    pub fn force_terminate(&self) -> io::Result<()> {
+        let _preserve_descendants = self
+            .preserve_descendants
+            .lock()
+            .map_err(|_| io::Error::other("job state lock poisoned"))?;
+        self.terminate_unchecked()
+    }
+
+    fn terminate_unchecked(&self) -> io::Result<()> {
         let terminated = unsafe {
             TerminateJobObject(self.handle.as_raw_handle().cast(), /*uExitCode*/ 1)
         };

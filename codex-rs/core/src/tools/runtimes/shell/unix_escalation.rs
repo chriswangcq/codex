@@ -37,6 +37,7 @@ use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::ReviewDecision;
@@ -238,6 +239,7 @@ pub(super) async fn try_run_zsh_fork(
         sandbox_permissions: req.sandbox_permissions,
         approval_sandbox_permissions,
         prompt_permissions: req.additional_permissions.clone(),
+        monitor: None,
         stopwatch: stopwatch.clone(),
     };
 
@@ -322,6 +324,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
             req.additional_permissions_preapproved,
         ),
         prompt_permissions: req.additional_permissions.clone(),
+        monitor: req.monitor.clone(),
         stopwatch: Stopwatch::unlimited(),
     };
 
@@ -353,6 +356,7 @@ struct CoreShellActionProvider {
     sandbox_permissions: SandboxPermissions,
     approval_sandbox_permissions: SandboxPermissions,
     prompt_permissions: Option<AdditionalPermissionProfile>,
+    monitor: Option<CommandMonitorInfo>,
     stopwatch: Stopwatch,
 }
 
@@ -437,6 +441,7 @@ impl CoreShellActionProvider {
         let approval_id = Some(Uuid::new_v4().to_string());
         let environment_id = Some(self.environment_id.clone());
         let source = self.tool_name;
+        let monitor = self.monitor.clone();
         let guardian_review_id = routes_approval_to_guardian(&turn).then(new_guardian_review_id);
         Ok(stopwatch
             .pause_for(async move {
@@ -474,6 +479,7 @@ impl CoreShellActionProvider {
                             source,
                             program: program.to_string_lossy().into_owned(),
                             argv: argv.to_vec(),
+                            monitor: monitor.clone(),
                             cwd: workdir.clone(),
                             additional_permissions,
                         },
@@ -490,6 +496,7 @@ impl CoreShellActionProvider {
                         approval_id,
                         environment_id,
                         command,
+                        monitor,
                         workdir.clone(),
                         /*reason*/ None,
                         /*network_approval_context*/ None,

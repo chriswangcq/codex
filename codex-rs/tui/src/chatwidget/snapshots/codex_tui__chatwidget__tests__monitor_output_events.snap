@@ -1,0 +1,7 @@
+---
+source: tui/src/chatwidget/tests/exec_flow.rs
+expression: rendered_events
+---
+⏺ Monitor event: "pixel event probe"
+  ⎿  ready
+     second

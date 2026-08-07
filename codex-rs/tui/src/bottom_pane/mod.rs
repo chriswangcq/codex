@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::app_event::AppEvent;
+use crate::app_event::BackgroundMonitorOutputResponse;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::HistoryLookupResponse;
 use crate::app_event_sender::AppEventSender;
@@ -57,6 +58,7 @@ use std::time::Instant;
 mod action_required_title;
 mod app_link_view;
 mod approval_overlay;
+mod background_processes_view;
 mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
@@ -77,6 +79,8 @@ pub(crate) use approval_overlay::ExecApprovalRequest;
 pub(crate) use approval_overlay::McpElicitationApprovalRequest;
 pub(crate) use approval_overlay::PermissionsApprovalRequest;
 pub(crate) use approval_overlay::format_requested_permissions_rule;
+pub(crate) use background_processes_view::BackgroundProcessItem;
+pub(crate) use background_processes_view::BackgroundProcessesView;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
@@ -1142,6 +1146,71 @@ impl BottomPane {
         self.push_view(Box::new(view));
     }
 
+    pub(crate) fn show_background_processes(&mut self, items: Vec<BackgroundProcessItem>) {
+        let view = BackgroundProcessesView::new(
+            items,
+            self.thread_id,
+            self.app_event_tx.clone(),
+            self.keymap.list.clone(),
+        );
+        self.push_view(Box::new(view));
+    }
+
+    pub(crate) fn update_background_processes(&mut self, items: Vec<BackgroundProcessItem>) {
+        let Some(view) = self.view_stack.last_mut() else {
+            return;
+        };
+        if view.view_id() != Some("background-processes") {
+            return;
+        }
+        let updated = view.update_background_processes(items);
+        let completion = view.completion();
+        let complete = view.is_complete();
+        if complete {
+            self.pop_active_view_with_completion(completion);
+        }
+        if updated || complete {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn update_background_monitor_output(
+        &mut self,
+        response: BackgroundMonitorOutputResponse,
+    ) {
+        let Some(view) = self.view_stack.last_mut() else {
+            return;
+        };
+        if view.view_id() != Some("background-processes") {
+            return;
+        }
+        if view.update_background_monitor_output(response) {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn update_background_process_stop(
+        &mut self,
+        process_id: &str,
+        result: Result<bool, String>,
+    ) {
+        let Some(view) = self.view_stack.last_mut() else {
+            return;
+        };
+        if view.view_id() != Some("background-processes") {
+            return;
+        }
+        let updated = view.update_background_process_stop(process_id, result);
+        let completion = view.completion();
+        let complete = view.is_complete();
+        if complete {
+            self.pop_active_view_with_completion(completion);
+        }
+        if updated || complete {
+            self.request_redraw();
+        }
+    }
+
     fn apply_standard_popup_hint(&self, params: &mut list_selection_view::SelectionViewParams) {
         if !params.allow_cancel {
             if params.footer_hint.is_none()
@@ -1336,8 +1405,15 @@ impl BottomPane {
     ///
     /// The summary may be displayed inline in the status row or as a dedicated
     /// footer row depending on whether a status indicator is currently visible.
-    pub(crate) fn set_unified_exec_processes(&mut self, processes: Vec<String>) {
-        if self.unified_exec_footer.set_processes(processes) {
+    pub(crate) fn set_background_process_counts(
+        &mut self,
+        background_terminal_count: usize,
+        monitor_count: usize,
+    ) {
+        if self
+            .unified_exec_footer
+            .set_process_counts(background_terminal_count, monitor_count)
+        {
             self.sync_status_inline_message();
             self.request_redraw();
         }
@@ -1351,6 +1427,11 @@ impl BottomPane {
         if let Some(status) = self.status.as_mut() {
             status.update_inline_message(self.unified_exec_footer.summary_text());
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_process_summary(&self) -> Option<String> {
+        self.unified_exec_footer.summary_text()
     }
 
     pub(crate) fn composer_is_empty(&self) -> bool {
@@ -2503,7 +2584,9 @@ mod tests {
         let width = 120;
         let before = pane.desired_height(width);
 
-        pane.set_unified_exec_processes(vec!["sleep 5".to_string()]);
+        pane.set_background_process_counts(
+            /*background_terminal_count*/ 1, /*monitor_count*/ 0,
+        );
         let after = pane.desired_height(width);
 
         assert_eq!(after, before);

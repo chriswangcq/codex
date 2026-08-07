@@ -10,6 +10,7 @@ use super::map_exec_result;
 use crate::config::Constrained;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::tests::make_session_and_context;
+use crate::test_support;
 use anyhow::Context;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
@@ -17,12 +18,16 @@ use codex_execpolicy::PolicyParser;
 use codex_execpolicy::RuleMatch;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
+use codex_model_provider::create_model_provider;
 use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
 use codex_network_proxy::PROXY_ENV_KEYS;
+use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -30,8 +35,12 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CommandMonitorInfo;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::GuardianCommandSource;
+use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_shell_escalation::EscalationExecution;
@@ -39,6 +48,13 @@ use codex_shell_escalation::EscalationPermissions;
 use codex_shell_escalation::ExecResult;
 use codex_shell_escalation::ResolvedPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -435,6 +451,7 @@ async fn preapproved_additional_permissions_escalate_intercepted_exec() -> anyho
         sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
         approval_sandbox_permissions: SandboxPermissions::UseDefault,
         prompt_permissions: Some(requested_permissions),
+        monitor: None,
         stopwatch: codex_shell_escalation::Stopwatch::new(Duration::from_secs(1)),
     };
 
@@ -575,6 +592,7 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
         sandbox_permissions: SandboxPermissions::RequireEscalated,
         approval_sandbox_permissions: SandboxPermissions::RequireEscalated,
         prompt_permissions: None,
+        monitor: None,
         stopwatch: codex_shell_escalation::Stopwatch::new(Duration::from_secs(1)),
     };
 
@@ -612,6 +630,140 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
         hook_inputs[0]["tool_input"]["description"],
         serde_json::Value::Null
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_provider_routes_monitor_through_guardian_execve() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let denial = serde_json::json!({
+        "risk_level": "high",
+        "user_authorization": "unknown",
+        "outcome": "deny",
+        "rationale": "unsafe",
+    })
+    .to_string();
+    let request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-provider-execve-monitor"),
+            ev_assistant_message("msg-provider-execve-monitor", &denial),
+            ev_completed("resp-provider-execve-monitor"),
+        ]),
+    )
+    .await;
+
+    let (mut session, mut turn, rx) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let mut config = (*turn.config).clone();
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let config = Arc::new(config);
+    let models_manager = test_support::models_manager_with_provider(
+        config.codex_home.to_path_buf(),
+        Arc::clone(&session.services.auth_manager),
+        config.model_provider.clone(),
+    );
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .models_manager = models_manager;
+    let turn_mut = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
+    turn_mut.config = Arc::clone(&config);
+    turn_mut.provider =
+        create_model_provider(config.model_provider.clone(), turn_mut.auth_manager.clone());
+    session
+        .record_conversation_items(
+            turn.as_ref(),
+            &[
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "Watch the deployment and stop it if it becomes unsafe.".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "I need to run the monitored command now.".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+        )
+        .await;
+
+    let monitor = CommandMonitorInfo {
+        task_id: "bprovider1".to_string(),
+        description: "watch deploy".to_string(),
+        timeout_ms: 300_000,
+        persistent: false,
+    };
+    let provider = CoreShellActionProvider {
+        policy: Arc::new(RwLock::new(codex_execpolicy::Policy::empty())),
+        session,
+        turn,
+        call_id: "monitor-parent-call".to_string(),
+        environment_id: "local".to_string(),
+        tool_name: GuardianCommandSource::UnifiedExec,
+        approval_policy: AskForApproval::OnRequest,
+        permission_profile: PermissionProfile::read_only(),
+        sandbox_permissions: SandboxPermissions::RequireEscalated,
+        approval_sandbox_permissions: SandboxPermissions::RequireEscalated,
+        prompt_permissions: None,
+        monitor: Some(monitor.clone()),
+        stopwatch: codex_shell_escalation::Stopwatch::new(Duration::from_secs(5)),
+    };
+    let program = AbsolutePathBuf::from_absolute_path("/usr/bin/rm")?;
+    let argv = vec![
+        "/usr/bin/rm".to_string(),
+        "-f".to_string(),
+        "/tmp/file".to_string(),
+    ];
+    let workdir = test_sandbox_cwd();
+    let decision = provider
+        .prompt(&program, &argv, &workdir, &provider.stopwatch, None)
+        .await?;
+
+    assert!(matches!(decision, ReviewDecision::Denied { .. }));
+    assert_eq!(request_log.requests().len(), 1);
+    let mut assessments = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let EventMsg::GuardianAssessment(event) = event.msg {
+            assessments.push(event);
+        }
+    }
+    assert_eq!(assessments.len(), 2);
+    assert_eq!(
+        assessments
+            .iter()
+            .map(|assessment| assessment.status)
+            .collect::<Vec<_>>(),
+        vec![
+            GuardianAssessmentStatus::InProgress,
+            GuardianAssessmentStatus::Denied,
+        ]
+    );
+    assert!(assessments.iter().all(|assessment| {
+        assessment.target_item_id.as_deref() == Some("monitor-parent-call")
+            && assessment.monitor.as_ref() == Some(&monitor)
+            && matches!(
+                &assessment.action,
+                codex_protocol::protocol::GuardianAssessmentAction::Execve {
+                    source: GuardianCommandSource::UnifiedExec,
+                    ..
+                }
+            )
+    }));
 
     Ok(())
 }
@@ -785,6 +937,7 @@ prefix_rule(pattern = ["{cat_path_literal}"], decision = "allow")
         sandbox_permissions: SandboxPermissions::UseDefault,
         approval_sandbox_permissions: SandboxPermissions::UseDefault,
         prompt_permissions: None,
+        monitor: None,
         stopwatch: codex_shell_escalation::Stopwatch::new(Duration::from_secs(1)),
     };
 
@@ -827,6 +980,7 @@ async fn denied_reads_keep_granular_sandbox_rejection_for_escalation() -> anyhow
         sandbox_permissions: SandboxPermissions::RequireEscalated,
         approval_sandbox_permissions: SandboxPermissions::RequireEscalated,
         prompt_permissions: None,
+        monitor: None,
         stopwatch: codex_shell_escalation::Stopwatch::new(Duration::from_secs(1)),
     };
 

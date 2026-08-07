@@ -51,7 +51,7 @@ pub enum Message {
     Resize { payload: ResizePayload },
     Exit { payload: ExitPayload },
     Error { payload: ErrorPayload },
-    Terminate { payload: EmptyPayload },
+    Terminate { payload: TerminatePayload },
 }
 
 /// Spawn parameters sent from parent to runner.
@@ -137,6 +137,14 @@ pub enum ErrorStage {
 /// Empty payload for control messages.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct EmptyPayload {}
+
+/// Process-tree termination request. `force` bypasses the normal Windows
+/// descendant-preservation behavior after the root process has exited.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TerminatePayload {
+    #[serde(default)]
+    pub force: bool,
+}
 
 /// Base64-encode raw bytes for IPC payloads.
 pub fn encode_bytes(data: &[u8]) -> String {
@@ -281,5 +289,28 @@ mod tests {
             }),
             encoded
         );
+    }
+
+    #[test]
+    fn terminate_payload_defaults_to_regular_and_round_trips_force() {
+        let regular: FramedMessage = serde_json::from_value(serde_json::json!({
+            "version": IPC_PROTOCOL_VERSION,
+            "type": "terminate",
+            "payload": {}
+        }))
+        .expect("deserialize legacy terminate frame");
+        let Message::Terminate { payload } = regular.message else {
+            panic!("unexpected message");
+        };
+        assert!(!payload.force);
+
+        let forced = FramedMessage {
+            version: IPC_PROTOCOL_VERSION,
+            message: Message::Terminate {
+                payload: TerminatePayload { force: true },
+            },
+        };
+        let encoded = serde_json::to_value(forced).expect("serialize forced termination");
+        assert_eq!(Some(true), encoded["payload"]["force"].as_bool());
     }
 }

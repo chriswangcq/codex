@@ -830,6 +830,7 @@ impl NetworkApprovalService {
                     /*approval_id*/ None,
                     Some(environment_id),
                     prompt_command,
+                    /*monitor*/ None,
                     cwd,
                     Some(prompt_reason),
                     Some(network_approval_context.clone()),

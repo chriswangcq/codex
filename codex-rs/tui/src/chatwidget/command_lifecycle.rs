@@ -22,6 +22,7 @@ impl ChatWidget {
             id,
             command,
             process_id,
+            monitor,
             source,
             command_actions,
             ..
@@ -31,9 +32,30 @@ impl ChatWidget {
         };
         let (_command, parsed_cmd) = command_execution_command_and_parsed(command, command_actions);
         self.flush_answer_stream_with_separator();
+        if let Some(monitor) = monitor {
+            self.track_unified_exec_process_begin(
+                id,
+                process_id.as_deref(),
+                command,
+                Some(monitor.clone()),
+            );
+            self.suppressed_exec_calls.insert(id.clone());
+            self.add_to_history(history_cell::new_monitor_started(
+                monitor.description.clone(),
+                monitor.task_id.clone(),
+                monitor.timeout_ms,
+                monitor.persistent,
+            ));
+            return;
+        }
         if is_unified_exec_source(*source) {
             if *source == ExecCommandSource::UnifiedExecStartup {
-                self.track_unified_exec_process_begin(id, process_id.as_deref(), command);
+                self.track_unified_exec_process_begin(
+                    id,
+                    process_id.as_deref(),
+                    command,
+                    /*monitor*/ None,
+                );
             }
             if !self.bottom_pane.is_task_running() {
                 return;
@@ -52,7 +74,15 @@ impl ChatWidget {
     }
 
     pub(super) fn on_exec_command_output_delta(&mut self, call_id: &str, delta: &str) {
-        self.track_unified_exec_output_chunk(call_id, delta.as_bytes());
+        let monitor_batch = self.track_unified_exec_output_chunk(call_id, delta);
+        self.sync_background_processes_view();
+        if let Some(batch) = monitor_batch {
+            self.add_to_history(history_cell::new_monitor_event(
+                batch.description,
+                batch.event,
+            ));
+            return;
+        }
         if !self.bottom_pane.is_task_running() {
             return;
         }
@@ -131,16 +161,49 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn on_command_execution_completed(&mut self, item: ThreadItem) {
+    pub(super) fn on_command_execution_completed(&mut self, item: ThreadItem, from_replay: bool) {
         let ThreadItem::CommandExecution {
             id,
             process_id,
+            monitor,
+            monitor_termination_reason,
             source,
+            status,
+            aggregated_output,
+            exit_code,
             ..
         } = &item
         else {
             return;
         };
+        if let Some(monitor) = monitor {
+            if from_replay {
+                self.suppressed_exec_calls.remove(id);
+                self.add_to_history(history_cell::new_monitor_completed(
+                    monitor.description.clone(),
+                    monitor.task_id.clone(),
+                    status.clone(),
+                    *monitor_termination_reason,
+                    aggregated_output.clone(),
+                    *exit_code,
+                ));
+                self.transcript.had_work_activity = true;
+                return;
+            }
+            let already_rendered = self.suppressed_exec_calls.remove(id);
+            if !already_rendered {
+                self.add_to_history(history_cell::new_monitor_started(
+                    monitor.description.clone(),
+                    monitor.task_id.clone(),
+                    monitor.timeout_ms,
+                    monitor.persistent,
+                ));
+            }
+
+            let _ = self.track_unified_exec_process_end(id, process_id.as_deref());
+            self.transcript.had_work_activity = true;
+            return;
+        }
         if is_unified_exec_source(*source) {
             if let Some(process_id) = process_id.as_deref()
                 && self
@@ -150,7 +213,7 @@ impl ChatWidget {
             {
                 self.flush_unified_exec_wait_streak();
             }
-            self.track_unified_exec_process_end(id, process_id.as_deref());
+            let _ = self.track_unified_exec_process_end(id, process_id.as_deref());
             if !self.bottom_pane.is_task_running() {
                 return;
             }
@@ -167,6 +230,7 @@ impl ChatWidget {
         call_id: &str,
         process_id: Option<&str>,
         command: &str,
+        monitor: Option<codex_app_server_protocol::CommandMonitorInfo>,
     ) {
         let key = process_id.unwrap_or(call_id).to_string();
         let command = split_command_string(command);
@@ -176,16 +240,15 @@ impl ChatWidget {
             .iter_mut()
             .find(|process| process.key == key)
         {
-            existing.call_id = call_id.to_string();
-            existing.command_display = command_display;
-            existing.recent_chunks.clear();
+            existing.reset(call_id.to_string(), command_display, monitor);
         } else {
-            self.unified_exec_processes.push(UnifiedExecProcessSummary {
-                key,
-                call_id: call_id.to_string(),
-                command_display,
-                recent_chunks: Vec::new(),
-            });
+            self.unified_exec_processes
+                .push(UnifiedExecProcessSummary::new(
+                    key,
+                    call_id.to_string(),
+                    command_display,
+                    monitor,
+                ));
         }
         self.sync_unified_exec_footer();
     }
@@ -194,49 +257,40 @@ impl ChatWidget {
         &mut self,
         call_id: &str,
         process_id: Option<&str>,
-    ) {
+    ) -> Option<UnifiedExecProcessSummary> {
         let key = process_id.unwrap_or(call_id);
-        let before = self.unified_exec_processes.len();
-        self.unified_exec_processes
-            .retain(|process| process.key != key);
-        if self.unified_exec_processes.len() != before {
-            self.sync_unified_exec_footer();
-        }
+        let index = self
+            .unified_exec_processes
+            .iter()
+            .position(|process| process.key == key)?;
+        let process = self.unified_exec_processes.remove(index);
+        self.sync_unified_exec_footer();
+        Some(process)
     }
 
     pub(super) fn sync_unified_exec_footer(&mut self) {
-        let processes = self
+        let monitors = self
             .unified_exec_processes
             .iter()
-            .map(|process| process.command_display.clone())
-            .collect();
-        self.bottom_pane.set_unified_exec_processes(processes);
+            .filter(|process| process.monitor_info().is_some())
+            .count();
+        let background_terminals = self.unified_exec_processes.len().saturating_sub(monitors);
+        self.bottom_pane
+            .set_background_process_counts(background_terminals, monitors);
+        self.sync_background_processes_view();
     }
 
     /// Record recent stdout/stderr lines for the unified exec footer.
-    pub(super) fn track_unified_exec_output_chunk(&mut self, call_id: &str, chunk: &[u8]) {
-        let Some(process) = self
+    pub(super) fn track_unified_exec_output_chunk(
+        &mut self,
+        call_id: &str,
+        chunk: &str,
+    ) -> Option<MonitorOutputBatch> {
+        let process = self
             .unified_exec_processes
             .iter_mut()
-            .find(|process| process.call_id == call_id)
-        else {
-            return;
-        };
-
-        let text = String::from_utf8_lossy(chunk);
-        for line in text
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.is_empty())
-        {
-            process.recent_chunks.push(line.to_string());
-        }
-
-        const MAX_RECENT_CHUNKS: usize = 3;
-        if process.recent_chunks.len() > MAX_RECENT_CHUNKS {
-            let drop_count = process.recent_chunks.len() - MAX_RECENT_CHUNKS;
-            process.recent_chunks.drain(0..drop_count);
-        }
+            .find(|process| process.call_id == call_id)?;
+        process.record_output(chunk)
     }
 
     pub(crate) fn handle_command_execution_started_now(&mut self, item: ThreadItem) {

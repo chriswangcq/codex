@@ -15,26 +15,35 @@ use crate::render::renderable::Renderable;
 
 /// Tracks active unified-exec processes and renders a compact summary.
 pub(crate) struct UnifiedExecFooter {
-    processes: Vec<String>,
+    background_terminal_count: usize,
+    monitor_count: usize,
 }
 
 impl UnifiedExecFooter {
     pub(crate) fn new() -> Self {
         Self {
-            processes: Vec::new(),
+            background_terminal_count: 0,
+            monitor_count: 0,
         }
     }
 
-    pub(crate) fn set_processes(&mut self, processes: Vec<String>) -> bool {
-        if self.processes == processes {
+    pub(crate) fn set_process_counts(
+        &mut self,
+        background_terminal_count: usize,
+        monitor_count: usize,
+    ) -> bool {
+        if self.background_terminal_count == background_terminal_count
+            && self.monitor_count == monitor_count
+        {
             return false;
         }
-        self.processes = processes;
+        self.background_terminal_count = background_terminal_count;
+        self.monitor_count = monitor_count;
         true
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.processes.is_empty()
+        self.background_terminal_count == 0 && self.monitor_count == 0
     }
 
     /// Returns the unindented summary text used by both footer and status-row rendering.
@@ -43,15 +52,41 @@ impl UnifiedExecFooter {
     /// callers can choose layout-specific framing (inline separator vs. row
     /// indentation). Returning `None` means there is nothing to surface.
     pub(crate) fn summary_text(&self) -> Option<String> {
-        if self.processes.is_empty() {
+        if self.is_empty() {
             return None;
         }
 
-        let count = self.processes.len();
-        let plural = if count == 1 { "" } else { "s" };
-        Some(format!(
-            "{count} background terminal{plural} running · /ps to view · /stop to close"
-        ))
+        let monitor_summary = (self.monitor_count > 0).then(|| {
+            let plural = if self.monitor_count == 1 { "" } else { "s" };
+            format!("{} monitor{plural}", self.monitor_count)
+        });
+        let terminal_summary = (self.background_terminal_count > 0).then(|| {
+            let plural = if self.background_terminal_count == 1 {
+                ""
+            } else {
+                "s"
+            };
+            format!(
+                "{} background terminal{plural} running · /ps to view · /stop to close",
+                self.background_terminal_count
+            )
+        });
+        match (monitor_summary, terminal_summary) {
+            (Some(monitors), Some(_)) => {
+                let shell_plural = if self.background_terminal_count == 1 {
+                    ""
+                } else {
+                    "s"
+                };
+                Some(format!(
+                    "{} shell{shell_plural}, {monitors} · ↓ to manage",
+                    self.background_terminal_count
+                ))
+            }
+            (Some(monitors), None) => Some(format!("{monitors} · ↓ to manage")),
+            (None, Some(terminals)) => Some(terminals),
+            (None, None) => None,
+        }
     }
 
     fn render_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -96,7 +131,9 @@ mod tests {
     #[test]
     fn render_more_sessions() {
         let mut footer = UnifiedExecFooter::new();
-        footer.set_processes(vec!["rg \"foo\" src".to_string()]);
+        footer.set_process_counts(
+            /*background_terminal_count*/ 1, /*monitor_count*/ 0,
+        );
         let width = 50;
         let height = footer.desired_height(width);
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
@@ -107,11 +144,39 @@ mod tests {
     #[test]
     fn render_many_sessions() {
         let mut footer = UnifiedExecFooter::new();
-        footer.set_processes((0..123).map(|idx| format!("cmd {idx}")).collect());
+        footer.set_process_counts(
+            /*background_terminal_count*/ 123, /*monitor_count*/ 0,
+        );
         let width = 50;
         let height = footer.desired_height(width);
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         footer.render(Rect::new(0, 0, width, height), &mut buf);
         assert_snapshot!("render_many_sessions", format!("{buf:?}"));
+    }
+
+    #[test]
+    fn render_one_monitor() {
+        let mut footer = UnifiedExecFooter::new();
+        footer.set_process_counts(
+            /*background_terminal_count*/ 0, /*monitor_count*/ 1,
+        );
+        let width = 50;
+        let height = footer.desired_height(width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        footer.render(Rect::new(0, 0, width, height), &mut buf);
+        assert_snapshot!("render_one_monitor", format!("{buf:?}"));
+    }
+
+    #[test]
+    fn render_mixed_processes() {
+        let mut footer = UnifiedExecFooter::new();
+        footer.set_process_counts(
+            /*background_terminal_count*/ 1, /*monitor_count*/ 2,
+        );
+        let width = 90;
+        let height = footer.desired_height(width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        footer.render(Rect::new(0, 0, width, height), &mut buf);
+        assert_snapshot!("render_mixed_processes", format!("{buf:?}"));
     }
 }

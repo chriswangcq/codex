@@ -510,6 +510,7 @@ async fn handle_exec_approval(
         approval_id,
         environment_id,
         command,
+        monitor,
         cwd,
         reason,
         network_approval_context,
@@ -529,22 +530,36 @@ async fn handle_exec_approval(
         });
     let decision = if routes_approval_to_guardian(parent_ctx) {
         let review_cancel = cancel_token.child_token();
+        let sandbox_permissions = if additional_permissions.is_some() {
+            crate::sandboxing::SandboxPermissions::WithAdditionalPermissions
+        } else {
+            crate::sandboxing::SandboxPermissions::UseDefault
+        };
+        let guardian_request = match monitor {
+            Some(monitor) => GuardianApprovalRequest::ExecCommand {
+                id: call_id.clone(),
+                command,
+                monitor: Some(monitor),
+                cwd,
+                sandbox_permissions,
+                additional_permissions,
+                justification: None,
+                tty: false,
+            },
+            None => GuardianApprovalRequest::Shell {
+                id: call_id.clone(),
+                command,
+                cwd,
+                sandbox_permissions,
+                additional_permissions,
+                justification: None,
+            },
+        };
         let review_rx = spawn_approval_request_review(
             Arc::clone(parent_session),
             Arc::clone(parent_ctx),
             new_guardian_review_id(),
-            GuardianApprovalRequest::Shell {
-                id: call_id.clone(),
-                command,
-                cwd,
-                sandbox_permissions: if additional_permissions.is_some() {
-                    crate::sandboxing::SandboxPermissions::WithAdditionalPermissions
-                } else {
-                    crate::sandboxing::SandboxPermissions::UseDefault
-                },
-                additional_permissions,
-                justification: None,
-            },
+            guardian_request,
             reason,
             GuardianReviewOptions {
                 plugin_attribution_override: plugin_attribution.clone(),
@@ -568,6 +583,7 @@ async fn handle_exec_approval(
                 approval_id,
                 environment_id,
                 command,
+                monitor,
                 cwd,
                 reason,
                 network_approval_context,

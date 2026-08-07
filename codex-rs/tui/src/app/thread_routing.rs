@@ -427,6 +427,13 @@ impl App {
         op: AppCommand,
     ) -> Result<()> {
         let Some(thread_id) = self.active_thread_id else {
+            if let AppCommand::TerminateBackgroundProcess { process_id } = &op {
+                self.chat_widget.update_background_process_stop(
+                    process_id,
+                    Err("No active thread is available".to_string()),
+                );
+                return Ok(());
+            }
             self.chat_widget
                 .add_error_message("No active thread is available.".to_string());
             return Ok(());
@@ -798,6 +805,16 @@ impl App {
                 app_server
                     .thread_background_terminals_clean(thread_id)
                     .await?;
+                Ok(true)
+            }
+            AppCommand::TerminateBackgroundProcess { process_id } => {
+                let result = app_server
+                    .thread_background_terminal_terminate(thread_id, process_id.clone())
+                    .await
+                    .map(|response| response.terminated)
+                    .map_err(|err| err.to_string());
+                self.chat_widget
+                    .update_background_process_stop(process_id, result);
                 Ok(true)
             }
             AppCommand::RunUserShellCommand { command } => {

@@ -1,0 +1,12 @@
+---
+source: tui/src/bottom_pane/background_processes_view.rs
+expression: rendered
+---
+
+  Background
+  1 shell, 1 monitor active
+
+  › 监 控     🚀  (running)
+    npm run dev (running)
+
+  ↑/↓ · Enter · x stop · Esc

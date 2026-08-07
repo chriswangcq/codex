@@ -281,14 +281,15 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(
-            turn_context,
-            input,
-            task,
-            /*input_persisted*/ None,
-            MailboxParentProvenance::Ignore,
-        )
-        .await;
+        let _ = self
+            .start_task(
+                turn_context,
+                input,
+                task,
+                /*input_persisted*/ None,
+                MailboxParentProvenance::Ignore,
+            )
+            .await;
     }
 
     pub(crate) async fn start_task<T: SessionTask>(
@@ -300,7 +301,10 @@ impl Session {
             tokio::sync::oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>,
         >,
         mailbox_parent_provenance: MailboxParentProvenance,
-    ) {
+    ) -> bool {
+        if self.is_session_runtime_closing() {
+            return false;
+        }
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
@@ -344,6 +348,15 @@ impl Session {
             .await;
 
         let mut active = self.active_turn.lock().await;
+        let Some(_runtime_start_guard) = self.try_acquire_session_runtime_start() else {
+            if active
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.task.is_none())
+            {
+                *active = None;
+            }
+            return false;
+        };
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
         let agent_execution_guard = self.services.agent_control.execution_guard(
@@ -424,6 +437,7 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        true
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -459,7 +473,8 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
-        if !self.input_queue.has_pending_mailbox_items().await
+        if self.is_session_runtime_closing()
+            || !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
         {
@@ -468,23 +483,32 @@ impl Session {
 
         {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            let reserved = self
+                .try_run_while_session_runtime_open(|| {
+                    if active_turn.is_some() {
+                        return false;
+                    }
+                    *active_turn = Some(ActiveTurn::default());
+                    true
+                })
+                .unwrap_or(false);
+            if !reserved {
                 return;
             }
-            *active_turn = Some(ActiveTurn::default());
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        self.start_task(
-            turn_context,
-            Vec::new(),
-            RegularTask::new(),
-            /*input_persisted*/ None,
-            MailboxParentProvenance::Attribute,
-        )
-        .await;
+        let _ = self
+            .start_task(
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+                /*input_persisted*/ None,
+                MailboxParentProvenance::Attribute,
+            )
+            .await;
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -512,7 +536,10 @@ impl Session {
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
             self.input_queue.clear_pending(&active_turn).await;
         }
-        if reason == TurnAbortReason::Interrupted && aborted_turn {
+        if reason == TurnAbortReason::Interrupted
+            && aborted_turn
+            && !self.is_session_runtime_closing()
+        {
             self.maybe_start_turn_for_pending_work().await;
         }
     }
@@ -551,7 +578,7 @@ impl Session {
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue.clear_pending(&active_turn).await;
 
-        if reason == TurnAbortReason::Interrupted {
+        if reason == TurnAbortReason::Interrupted && !self.is_session_runtime_closing() {
             self.maybe_start_turn_for_pending_work().await;
         }
 

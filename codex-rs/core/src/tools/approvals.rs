@@ -23,6 +23,7 @@ use codex_otel::ToolDecisionSource;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::ReviewDecision;
@@ -61,6 +62,7 @@ pub(crate) enum ApprovalAction {
         id: String,
         environment_id: String,
         command: Vec<String>,
+        monitor: Option<CommandMonitorInfo>,
         hook_command: String,
         cwd: PathUri,
         sandbox_permissions: SandboxPermissions,
@@ -180,6 +182,7 @@ impl ApprovalAction {
                 id,
                 environment_id,
                 command,
+                monitor,
                 cwd,
                 sandbox_permissions,
                 additional_permissions,
@@ -189,6 +192,7 @@ impl ApprovalAction {
             } => crate::guardian::GuardianApprovalRequest::ExecCommand {
                 id,
                 command,
+                monitor,
                 cwd: guardian_cwd(&environment_id, cwd)?,
                 sandbox_permissions,
                 additional_permissions,
@@ -384,6 +388,10 @@ impl Session {
         action: &ApprovalAction,
         ctx: &ApprovalContext,
     ) -> ReviewDecision {
+        let monitor = match action {
+            ApprovalAction::ExecCommand { monitor, .. } => monitor.clone(),
+            ApprovalAction::Shell { .. } | ApprovalAction::ApplyPatch { .. } => None,
+        };
         match action {
             ApprovalAction::Shell {
                 environment_id,
@@ -427,6 +435,7 @@ impl Session {
                         /*approval_id*/ None,
                         Some(environment_id.clone()),
                         command.clone(),
+                        monitor,
                         cwd,
                         reason,
                         ctx.network_approval_context.clone(),

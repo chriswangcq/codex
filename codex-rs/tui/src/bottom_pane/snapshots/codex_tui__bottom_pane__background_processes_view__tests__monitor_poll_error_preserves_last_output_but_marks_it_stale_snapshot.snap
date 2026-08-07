@@ -1,0 +1,26 @@
+---
+source: tui/src/bottom_pane/background_processes_view.rs
+expression: rendered
+---
+
+  Monitor details
+
+  Status: Running
+  Runtime: 12s
+  Script: tail -f app.log
+
+  Output:
+   ╭──────────────────────────────────────────────────────────────╮
+   │ ready                                                        │
+   │ secret from stderr                                           │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   ╰──────────────────────────────────────────────────────────────╯
+
+  Showing 2 lines · stale; refresh paused; reopen to retry

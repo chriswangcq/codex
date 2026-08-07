@@ -1,0 +1,15 @@
+---
+source: tui/src/chatwidget/tests/exec_flow.rs
+expression: normalized_backend_snapshot(terminal.backend())
+---
+"                                                                                "
+"                                                                                "
+"  Monitor details                                                               "
+"                                                                                "
+"  Status: Running                                                               "
+"  Runtime: 0s                                                                   "
+"  Script: tail -f app.log                                                       "
+"                                                                                "
+"  Output:                                                                       "
+"  Loading output…                                                               "
+"                                                                                "

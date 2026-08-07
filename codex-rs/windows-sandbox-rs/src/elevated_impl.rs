@@ -33,11 +33,11 @@ mod windows_impl {
     use crate::env::normalize_null_device_env;
     use crate::identity::refresh_logon_sandbox_creds;
     use crate::identity::require_logon_sandbox_creds;
-    use crate::ipc_framed::EmptyPayload;
     use crate::ipc_framed::FramedMessage;
     use crate::ipc_framed::Message;
     use crate::ipc_framed::OutputStream;
     use crate::ipc_framed::SpawnRequest;
+    use crate::ipc_framed::TerminatePayload;
     use crate::ipc_framed::decode_bytes;
     use crate::ipc_framed::read_frame;
     use crate::ipc_framed::write_frame;
@@ -83,7 +83,7 @@ mod windows_impl {
                         &FramedMessage {
                             version: 1,
                             message: Message::Terminate {
-                                payload: EmptyPayload::default(),
+                                payload: TerminatePayload { force: true },
                             },
                         },
                     );
