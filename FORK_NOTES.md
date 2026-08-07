@@ -43,6 +43,18 @@ The fork adds a local command-monitor lifecycle to the existing unified-exec arc
 The monitor is implemented as an extension of unified exec, not as a second process subsystem.
 Unified exec remains the process-lifecycle authority.
 
+## Local Release Bundle
+
+The source-built local release requires two adjacent executables:
+
+- `codex`, the CLI/TUI executable; and
+- `codex-code-mode-host`, the Code Mode execution sidecar.
+
+`InstallContext` resolves the sidecar next to the running CLI when no packaged resource layout is
+present. Building or copying only `codex` leaves ordinary chat available but breaks Code Mode and
+any tool path routed through it. Keep both executables in the same directory; the sidecar name must
+remain exactly `codex-code-mode-host` even if the main executable is privately renamed.
+
 ## Platform Status
 
 Only platforms that have been exercised on real hardware may be described as validated.
@@ -248,6 +260,7 @@ Status vocabulary:
 | Stable and experimental schema generation | Both writer modes passed; protocol suite passed afterward | PASS |
 | Current debug CLI and hermetic TUI | Built from the current source and exercised against an isolated mock server and `CODEX_HOME` | PASS |
 | Locked release build and isolated smoke | `codex-cli 0.0.0`, arm64 Mach-O, private install, clean-`CODEX_HOME` version smoke, checksum, and precise rollback | PASS |
+| Code Mode release sidecar | Adjacent arm64 `codex-code-mode-host`; help and stdio startup/EOF shutdown smoke | PASS |
 
 The full-suite environment failures above are not monitor regressions, but they remain visible in
 the ledger rather than being rewritten as a clean full-suite pass.
@@ -308,8 +321,10 @@ From `codex-rs`:
 rustc -V
 cargo -V
 cargo build --locked --release -p codex-cli --bin codex
+cargo build --locked --release -p codex-code-mode-host --bin codex-code-mode-host
 ./target/release/codex --version
-shasum -a 256 target/release/codex
+./target/release/codex-code-mode-host --help
+shasum -a 256 target/release/codex target/release/codex-code-mode-host
 ```
 
 The repository pins Rust 1.95.0 in `codex-rs/rust-toolchain.toml`. Record the exact `rustc -V`,
@@ -333,6 +348,10 @@ binary.
 | Binary path | `codex-rs/target/release/codex` |
 | Binary size | 282 MiB |
 | SHA-256 | `08568c4573d73dfeb84b5cbf88f7055fc3e056da4b85a7c13729248a967a989f` |
+| Code Mode host path | `codex-rs/target/release/codex-code-mode-host` |
+| Code Mode host size | 61 MiB |
+| Code Mode host SHA-256 | `65adfc61635f20893a90da70648f535aaa1a604f9030e43920b6497426a08c36` |
+| Code Mode host smoke | `--help` passed; `--listen stdio </dev/null` exited successfully |
 
 The release binary was copied to a `mktemp -d` private directory under the name `codex-monitor`,
 run with a separate empty `CODEX_HOME`, and verified to have the same SHA-256. The private binary,
@@ -347,7 +366,10 @@ MONITOR_INSTALL_DIR=/an/explicit/private/bin
 MONITOR_SMOKE_HOME="$(mktemp -d)"
 mkdir -p "$MONITOR_INSTALL_DIR"
 install -m 0755 target/release/codex "$MONITOR_INSTALL_DIR/codex-monitor"
+install -m 0755 target/release/codex-code-mode-host \
+  "$MONITOR_INSTALL_DIR/codex-code-mode-host"
 CODEX_HOME="$MONITOR_SMOKE_HOME" "$MONITOR_INSTALL_DIR/codex-monitor" --version
+"$MONITOR_INSTALL_DIR/codex-code-mode-host" --listen stdio </dev/null
 ```
 
 Before calling an installation repeatable, rebuild from the same clean fork commit in a fresh
@@ -373,6 +395,8 @@ byte-for-byte reproducibility is not claimed until it has been measured.
   and there is no startup scavenger.
 - The unified-exec process cap is 64; capacity pressure can terminate a monitor.
 - Persistent monitors are session-scoped and are not durable or resumed after restart.
+- A source-built installation is incomplete without the adjacent `codex-code-mode-host` sidecar;
+  packaging only the main executable disables Code Mode execution.
 
 ## Deferred Upstream-Synchronization Risk Map
 
@@ -404,8 +428,8 @@ The fork uses a deliberately small buildable sequence on top of the frozen basel
 2. `4c5e9ff572` contains the complete vertical Monitor slice: PTY and Windows termination
    plumbing, core lifecycle, protocol/history propagation, app-server API and generated schemas,
    TUI behavior, snapshots, and tests.
-3. The documentation commit containing this file records the validation and artifact evidence; it
-   does not change the executable.
+3. Documentation commits containing this file record validation, artifact, and required-sidecar
+   evidence; they do not change either executable.
 
 The functional code stays in one commit because the protocol fields, lifecycle authority, PTY
 termination API, app-server consumers, and TUI consumers must change together to keep the
@@ -421,6 +445,7 @@ A stable local release requires all of the following. This checklist closed on 2
 - [x] environment-specific suite failures are documented with isolated rerun evidence;
 - [x] only Apple Silicon macOS is labeled validated;
 - [x] the release binary is built with `--locked` and the pinned Rust toolchain;
+- [x] the release Code Mode host is built with `--locked`, placed next to the CLI, and smoke-tested;
 - [x] the binary has a recorded SHA-256 and explicit private install/rollback evidence;
 - [x] isolated-home start plus hermetic monitor stop, timeout, replay, soak, and shutdown cleanup
   are exercised; and
