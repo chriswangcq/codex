@@ -130,8 +130,10 @@ impl Drop for RemoteExecProcess {
     fn drop(&mut self) {
         self.session.cancel_network_policy_decisions();
         let session = self.session.clone();
-        tokio::spawn(async move {
-            session.unregister().await;
-        });
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                session.unregister().await;
+            });
+        }
     }
 }

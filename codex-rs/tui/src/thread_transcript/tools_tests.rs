@@ -11,6 +11,8 @@ use serde_json::json;
 
 fn command_item(status: CommandExecutionStatus) -> ThreadItem {
     ThreadItem::CommandExecution {
+        monitor: None,
+        monitor_termination_reason: None,
         id: "command".to_string(),
         plugin_id: None,
         script_path: None,

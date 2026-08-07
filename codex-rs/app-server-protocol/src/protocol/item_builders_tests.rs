@@ -94,6 +94,7 @@ fn read_command_actions_preserve_native_and_foreign_paths() {
 fn guardian_stdin_reviews_preserve_parent_command_history() {
     let cwd = PathUri::parse("file:///home/alice/repo").expect("valid cwd URI");
     let begin = ExecCommandBeginEvent {
+        monitor: None,
         call_id: "terminal-command".into(),
         plugin_id: None,
         script_path: None,
@@ -130,6 +131,7 @@ fn guardian_stdin_reviews_preserve_parent_command_history() {
     assert!(expected[1].items.is_empty());
 
     let assessment = GuardianAssessmentEvent {
+        monitor: None,
         review_reason: None,
         model_context: None,
         id: "review-stdin".into(),

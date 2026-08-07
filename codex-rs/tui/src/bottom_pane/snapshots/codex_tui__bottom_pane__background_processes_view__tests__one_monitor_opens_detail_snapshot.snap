@@ -1,0 +1,26 @@
+---
+source: tui/src/bottom_pane/background_processes_view.rs
+expression: "render_view(&view(vec![monitor_item()]), 70)"
+---
+
+  Monitor details
+
+  Status: Running
+  Runtime: 12s
+  Script: tail -f app.log
+
+  Output:
+   ╭──────────────────────────────────────────────────────────────╮
+   │ ready                                                        │
+   │ healthy                                                      │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   ╰──────────────────────────────────────────────────────────────╯
+
+  Showing 2 lines

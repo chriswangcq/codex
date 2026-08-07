@@ -3551,6 +3551,26 @@ pub enum ExecCommandSource {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandMonitorInfo {
+    pub task_id: String,
+    pub description: String,
+    #[ts(type = "number")]
+    pub timeout_ms: u64,
+    pub persistent: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandMonitorTerminationReason {
+    TimedOut,
+    UserStopped,
+    SessionShutdown,
+    Capacity,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecCommandStatus {
     Completed,
@@ -3590,6 +3610,10 @@ pub struct ExecCommandBeginEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub interaction_input: Option<String>,
+    /// Monitor metadata when this command was started by the monitor tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub monitor: Option<CommandMonitorInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -3624,6 +3648,14 @@ pub struct ExecCommandEndEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub interaction_input: Option<String>,
+    /// Monitor metadata when this command was started by the monitor tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub monitor: Option<CommandMonitorInfo>,
+    /// Why a monitor was terminated externally, when it did not finish naturally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub monitor_termination_reason: Option<CommandMonitorTerminationReason>,
 
     /// Captured stdout
     pub stdout: String,
@@ -5604,6 +5636,8 @@ mod tests {
                 }],
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 status: CommandExecutionStatus::InProgress,
                 stdout: None,
                 stderr: None,
@@ -5632,6 +5666,13 @@ mod tests {
                 }],
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: Some(CommandMonitorInfo {
+                    task_id: "b1234abcd".into(),
+                    description: "deployment readiness".into(),
+                    timeout_ms: 300_000,
+                    persistent: false,
+                }),
+                monitor_termination_reason: Some(CommandMonitorTerminationReason::TimedOut),
                 status: CommandExecutionStatus::Completed,
                 stdout: Some("done\n".into()),
                 stderr: Some(String::new()),
@@ -5667,12 +5708,14 @@ mod tests {
                 turn_id,
                 completed_at_ms: 20,
                 aggregated_output,
+                monitor_termination_reason,
                 ..
             })] if call_id == "exec-1"
                 && plugin_id.as_deref() == Some("sample@openai-curated")
                 && script_path.as_deref() == Some("scripts/run.py")
                 && turn_id == "turn-1"
                 && aggregated_output == "done\n"
+                && *monitor_termination_reason == Some(CommandMonitorTerminationReason::TimedOut)
         ));
     }
 

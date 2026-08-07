@@ -1132,6 +1132,12 @@ impl App {
                 self.chat_widget
                     .confirm_safety_buffered_retry(thread_id, turn_id, model, turn, prompt);
             }
+            AppEvent::FetchBackgroundMonitorOutput(request) => {
+                self.fetch_background_monitor_output(app_server, request);
+            }
+            AppEvent::BackgroundMonitorOutputLoaded(response) => {
+                self.chat_widget.update_background_monitor_output(response);
+            }
             AppEvent::RetrySafetyBufferedTurn {
                 thread_id,
                 turn_id,

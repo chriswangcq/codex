@@ -150,6 +150,11 @@ pub(crate) fn thread_items_to_transcript_cells(
             }
             continue;
         }
+        if let Some(cell) = tools::monitor_history(&item) {
+            PendingActivity::flush(&mut pending, &mut cells);
+            cells.push(cell);
+            continue;
+        }
         if let Some(cell) = tools::historical_tool_fallback(&item) {
             PendingActivity::flush(&mut pending, &mut cells);
             cells.push(Arc::new(cell));
@@ -226,6 +231,10 @@ fn item_to_cells(
     inline_visualization_context: Option<InlineVisualizationContext>,
 ) -> TranscriptCells {
     let mut cells: TranscriptCells = Vec::new();
+    if let Some(cell) = tools::monitor_history(&item) {
+        cells.push(cell);
+        return cells;
+    }
     match item {
         ThreadItem::UserMessage {
             id,

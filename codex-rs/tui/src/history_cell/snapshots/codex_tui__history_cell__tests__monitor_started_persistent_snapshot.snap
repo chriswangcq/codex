@@ -1,0 +1,6 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: rendered
+---
+⏺ Monitor(server readiness)
+  ⎿  Monitor started · task srv7k2 · persistent

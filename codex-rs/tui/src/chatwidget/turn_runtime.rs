@@ -153,13 +153,30 @@ impl ChatWidget {
         }
         let runtime_metrics = (!from_replay && !self.turn_runtime_metrics.is_empty())
             .then_some(self.turn_runtime_metrics);
+        let monitor_count = if from_replay {
+            0
+        } else {
+            self.unified_exec_processes
+                .iter()
+                .filter(|process| process.monitor_info().is_some())
+                .count()
+        };
+        let shell_count = self
+            .unified_exec_processes
+            .len()
+            .saturating_sub(monitor_count);
+        let completion = completion
+            .map(|completion| completion.with_background_processes(shell_count, monitor_count));
         if let Some(completion) = completion {
             self.add_to_history(completion.with_runtime_metrics(runtime_metrics));
-        } else if let Some(runtime_metrics) = runtime_metrics {
-            self.add_to_history(history_cell::FinalMessageSeparator::new(
-                /*elapsed_seconds*/ None,
-                Some(runtime_metrics),
-            ));
+        } else if runtime_metrics.is_some() || monitor_count > 0 {
+            self.add_to_history(
+                history_cell::FinalMessageSeparator::new(
+                    /*elapsed_seconds*/ None,
+                    runtime_metrics,
+                )
+                .with_background_processes(shell_count, monitor_count),
+            );
         }
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
         if !from_replay {

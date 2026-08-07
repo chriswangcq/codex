@@ -3,10 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
 
+use super::MonitorStreamOutput;
 use super::SharedPluginMetricsSidecar;
 use super::UnifiedExecContext;
 use super::process::OutputBuffers;
@@ -25,6 +27,8 @@ use codex_core_plugins::PluginCommandAttribution;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::CommandMonitorInfo;
+use codex_protocol::protocol::CommandMonitorTerminationReason;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
@@ -54,7 +58,11 @@ struct Buffer<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES> {
 }
 
 /// Spawn a background task that emits ExecCommandOutputDelta events on UTF‑8 boundaries.
-pub(crate) fn start_streaming_output(process: &UnifiedExecProcess, context: &UnifiedExecContext) {
+pub(crate) fn start_streaming_output(
+    process: &UnifiedExecProcess,
+    context: &UnifiedExecContext,
+    emit_output_deltas: bool,
+) {
     let mut receiver = process.output_receiver();
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
@@ -65,7 +73,11 @@ pub(crate) fn start_streaming_output(process: &UnifiedExecProcess, context: &Uni
     } = process.output_handles().clone();
 
     let emitter = Emitter {
-        remaining_deltas: MAX_EXEC_OUTPUT_DELTAS_PER_CALL,
+        remaining_deltas: if emit_output_deltas {
+            MAX_EXEC_OUTPUT_DELTAS_PER_CALL
+        } else {
+            0
+        },
         session: Arc::clone(&context.session),
         turn: Arc::clone(&context.step_context.turn),
         call_id: context.call_id.clone(),
@@ -166,6 +178,8 @@ pub(crate) fn spawn_exit_watcher(
     started_at: Instant,
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
     plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+    monitor: Option<CommandMonitorInfo>,
+    monitor_done: Option<oneshot::Receiver<Option<CommandMonitorTerminationReason>>>,
 ) {
     let session_ref = Arc::clone(&context.session);
     let turn_ref = Arc::clone(&context.step_context.turn);
@@ -175,6 +189,7 @@ pub(crate) fn spawn_exit_watcher(
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
     let interaction_lock = process.interaction_lock();
+    let monitor_stream_output = process.output_handles().monitor_stream_output.clone();
 
     tokio::spawn(async move {
         exit_token.cancelled().await;
@@ -185,6 +200,12 @@ pub(crate) fn spawn_exit_watcher(
         if let Some(network_denial_monitor) = network_denial_monitor {
             let _ = network_denial_monitor.await;
         }
+        let monitor_termination_reason = match monitor_done {
+            Some(monitor_done) => monitor_done
+                .await
+                .unwrap_or(Some(CommandMonitorTerminationReason::Stopped)),
+            None => None,
+        };
         let _interaction_guard = interaction_lock.lock_owned().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
@@ -207,6 +228,9 @@ pub(crate) fn spawn_exit_watcher(
                 String::new(),
                 message,
                 duration,
+                monitor_stream_output,
+                monitor,
+                monitor_termination_reason,
             )
             .await;
         } else {
@@ -236,6 +260,9 @@ pub(crate) fn spawn_exit_watcher(
                 exit_code,
                 duration,
                 timed_out,
+                monitor_stream_output,
+                monitor,
+                monitor_termination_reason,
             )
             .await;
         }
@@ -343,12 +370,23 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     exit_code: i32,
     duration: Duration,
     timed_out: bool,
+    monitor_stream_output: Option<MonitorStreamOutput>,
+    monitor: Option<CommandMonitorInfo>,
+    monitor_termination_reason: Option<CommandMonitorTerminationReason>,
 ) {
-    let aggregated_output = resolve_aggregated_output(&output_buffer, fallback_output).await;
+    let fallback_aggregated = resolve_aggregated_output(&output_buffer, fallback_output).await;
+    let (stdout, stderr, aggregated_output) = match monitor_stream_output {
+        Some(output) => output.snapshot().await,
+        None => (
+            fallback_aggregated.clone(),
+            String::new(),
+            fallback_aggregated,
+        ),
+    };
     let output = ExecToolCallOutput {
         exit_code,
-        stdout: StreamOutput::new(aggregated_output.clone()),
-        stderr: StreamOutput::new(String::new()),
+        stdout: StreamOutput::new(stdout),
+        stderr: StreamOutput::new(stderr),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
         timed_out,
@@ -361,13 +399,23 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         /*turn_diff_tracker*/ None,
     );
     event_ctx.sandbox_type = sandbox_type;
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        plugin_attribution,
-    );
+    let emitter = match monitor {
+        Some(monitor) => ToolEmitter::monitor(
+            &command,
+            cwd,
+            process_id.unwrap_or_default(),
+            plugin_attribution,
+            monitor,
+            monitor_termination_reason,
+        ),
+        None => ToolEmitter::unified_exec(
+            &command,
+            cwd,
+            ExecCommandSource::UnifiedExecStartup,
+            process_id,
+            plugin_attribution,
+        ),
+    };
     emitter
         .emit(
             event_ctx,
@@ -394,21 +442,37 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     fallback_output: String,
     message: String,
     duration: Duration,
+    monitor_stream_output: Option<MonitorStreamOutput>,
+    monitor: Option<CommandMonitorInfo>,
+    monitor_termination_reason: Option<CommandMonitorTerminationReason>,
 ) {
-    let stdout = if fallback_output.is_empty() {
-        resolve_aggregated_output(&output_buffer, fallback_output).await
+    let fallback_combined = if fallback_output.is_empty() {
+        resolve_aggregated_output(&output_buffer, fallback_output.clone()).await
     } else {
         fallback_output
     };
-    let aggregated_output = if stdout.is_empty() {
+    let (stdout, captured_stderr, captured_combined) = match monitor_stream_output {
+        Some(output) => output.snapshot().await,
+        None => (
+            fallback_combined.clone(),
+            String::new(),
+            fallback_combined.clone(),
+        ),
+    };
+    let stderr = if captured_stderr.is_empty() {
         message.clone()
     } else {
-        format!("{stdout}\n{message}")
+        format!("{captured_stderr}\n{message}")
+    };
+    let aggregated_output = if captured_combined.is_empty() {
+        message.clone()
+    } else {
+        format!("{captured_combined}\n{message}")
     };
     let output = ExecToolCallOutput {
         exit_code: -1,
         stdout: StreamOutput::new(stdout),
-        stderr: StreamOutput::new(message),
+        stderr: StreamOutput::new(stderr),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
         timed_out: false,
@@ -421,13 +485,23 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         /*turn_diff_tracker*/ None,
     );
     event_ctx.sandbox_type = sandbox_type;
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        plugin_attribution,
-    );
+    let emitter = match monitor {
+        Some(monitor) => ToolEmitter::monitor(
+            &command,
+            cwd,
+            process_id.unwrap_or_default(),
+            plugin_attribution,
+            monitor,
+            monitor_termination_reason,
+        ),
+        None => ToolEmitter::unified_exec(
+            &command,
+            cwd,
+            ExecCommandSource::UnifiedExecStartup,
+            process_id,
+            plugin_attribution,
+        ),
+    };
     emitter
         .emit(
             event_ctx,

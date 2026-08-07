@@ -1,0 +1,8 @@
+---
+source: tui/src/chatwidget/tests/history_replay.rs
+expression: rendered
+---
+⏺ Monitor(pixel event probe)
+  ⎿  Monitor completed · task b0nftx2ad · exit 0
+     ready
+     secret from stderr

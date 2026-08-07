@@ -1,0 +1,12 @@
+---
+source: tui/src/bottom_pane/background_processes_view.rs
+expression: "render_view(&view(vec![monitor_item(), shell_item()]), 80)"
+---
+
+  Background
+  1 shell, 1 monitor active
+
+  › deployment readiness (running)
+    npm run dev (running)
+
+  ↑/↓ select · Enter view · x stop · Esc close

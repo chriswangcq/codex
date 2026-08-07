@@ -169,6 +169,8 @@ fn turn_started_emits_turn_started_event() {
 fn command_execution_started_and_completed_translate_to_thread_events() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
     let command_item = ThreadItem::CommandExecution {
+        monitor: None,
+        monitor_termination_reason: None,
         model_context: None,
         sandbox_type: None,
         id: "cmd-1".to_string(),
@@ -213,6 +215,8 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::CommandExecution {
+                monitor: None,
+                monitor_termination_reason: None,
                 model_context: None,
                 sandbox_type: None,
                 id: "cmd-1".to_string(),
@@ -1416,6 +1420,8 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
             item: ThreadItem::CommandExecution {
+                monitor: None,
+                monitor_termination_reason: None,
                 model_context: None,
                 sandbox_type: None,
                 id: "cmd-1".to_string(),
@@ -1460,6 +1466,8 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::CommandExecution {
+                    monitor: None,
+                    monitor_termination_reason: None,
                     model_context: None,
                     sandbox_type: None,
                     id: "cmd-1".to_string(),

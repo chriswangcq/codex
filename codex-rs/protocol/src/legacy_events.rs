@@ -196,6 +196,7 @@ impl CommandExecutionItem {
             parsed_cmd: self.parsed_cmd.clone(),
             source: self.source,
             interaction_input: self.interaction_input.clone(),
+            monitor: self.monitor.clone(),
         })
     }
 
@@ -222,6 +223,8 @@ impl CommandExecutionItem {
             parsed_cmd: self.parsed_cmd.clone(),
             source: self.source,
             interaction_input: self.interaction_input.clone(),
+            monitor: self.monitor.clone(),
+            monitor_termination_reason: self.monitor_termination_reason,
             stdout: self.stdout.clone().unwrap_or_default(),
             stderr: self.stderr.clone().unwrap_or_default(),
             aggregated_output: self.aggregated_output.clone().unwrap_or_default(),

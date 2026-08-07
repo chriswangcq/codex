@@ -2548,7 +2548,7 @@ async fn slash_stop_submits_background_terminal_cleanup() {
     assert_eq!(cells.len(), 1, "expected cleanup confirmation message");
     let rendered = lines_to_single_string(&cells[0]);
     assert!(
-        rendered.contains("Stopping all background terminals."),
+        rendered.contains("Stopping all background terminals and monitors."),
         "expected cleanup confirmation, got {rendered:?}"
     );
 }
@@ -3197,7 +3197,12 @@ async fn slash_cd_rejects_pending_input_and_unsupported_session_ownership() {
             "side" => chat.set_side_conversation_active(/*active*/ true),
             "owned" => chat.set_parent_owned_thread(),
             "ephemeral" => chat.config.ephemeral = true,
-            "exec" => chat.track_unified_exec_process_begin("call", Some("process"), "sleep"),
+            "exec" => chat.track_unified_exec_process_begin(
+                "call",
+                Some("process"),
+                "sleep",
+                /*monitor*/ None,
+            ),
             "mcp" => {
                 let cell =
                     history_cell::new_mcp_inventory_loading(/*animations_enabled*/ false);

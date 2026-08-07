@@ -253,7 +253,13 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
         ))
     }
 
-    async fn emit(&self, event: EventMsg) {
+    async fn emit(&self, mut event: EventMsg) {
+        if let EventMsg::GuardianAssessment(assessment) = &mut event
+            && let Ok(GuardianApprovalRequest::ExecCommand { monitor, .. }) =
+                self.request.request.as_ref()
+        {
+            assessment.monitor = monitor.clone();
+        }
         self.session.send_event(self.context.turn(), event).await;
     }
 

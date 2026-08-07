@@ -22,6 +22,9 @@ pub struct FinalMessageSeparator {
     completed_at: Option<DateTime<Local>>,
     display_date: NaiveDate,
     clock_format: ClockFormat,
+    background_process_summary: Option<String>,
+    monitor_count: usize,
+    monitor_duration_verb: &'static str,
 }
 impl FinalMessageSeparator {
     /// Creates completion metadata using the protocol turn duration when available.
@@ -32,6 +35,9 @@ impl FinalMessageSeparator {
         Self {
             elapsed_seconds,
             runtime_metrics,
+            background_process_summary: None,
+            monitor_count: 0,
+            monitor_duration_verb: random_monitor_duration_verb(),
             completed_at: None,
             display_date: Local::now().date_naive(),
             clock_format: ClockFormat::TwelveHour,
@@ -56,6 +62,23 @@ impl FinalMessageSeparator {
         self
     }
 
+    /// Appends the active background-process count to this turn's existing footer label.
+    pub(crate) fn with_background_processes(
+        mut self,
+        shell_count: usize,
+        monitor_count: usize,
+    ) -> Self {
+        self.background_process_summary = background_process_summary(shell_count, monitor_count);
+        self.monitor_count = monitor_count;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_monitor_duration_verb(mut self, verb: &'static str) -> Self {
+        self.monitor_duration_verb = verb;
+        self
+    }
+
     fn label(&self, today: NaiveDate) -> Option<String> {
         let mut label_parts = Vec::new();
         if let Some(elapsed_seconds) = self.elapsed_seconds {
@@ -71,7 +94,11 @@ impl FinalMessageSeparator {
             } else {
                 format!("{seconds}s")
             };
-            label_parts.push(format!("Worked for {elapsed}"));
+            if self.monitor_count > 0 {
+                label_parts.push(format!("{} for {elapsed}", self.monitor_duration_verb));
+            } else {
+                label_parts.push(format!("Worked for {elapsed}"));
+            }
         }
         if let Some(completed_at) = self.completed_at {
             let date_format = if completed_at.date_naive() == today {
@@ -90,7 +117,8 @@ impl FinalMessageSeparator {
         if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
             label_parts.push(metrics_label);
         }
-        (!label_parts.is_empty()).then(|| label_parts.join(" • "))
+        let label = footer_label(&label_parts, self.background_process_summary.as_deref());
+        (!label.is_empty()).then_some(label)
     }
 }
 impl HistoryCell for FinalMessageSeparator {
@@ -122,6 +150,56 @@ impl HistoryCell for FinalMessageSeparator {
 #[cfg(test)]
 #[path = "separators_tests.rs"]
 mod tests;
+
+#[cfg(not(test))]
+fn random_monitor_duration_verb() -> &'static str {
+    use rand::Rng as _;
+
+    const VERBS: [&str; 8] = [
+        "Baked",
+        "Brewed",
+        "Churned",
+        "Cogitated",
+        "Cooked",
+        "Crunched",
+        "Sautéed",
+        "Worked",
+    ];
+    VERBS[rand::rng().random_range(0..VERBS.len())]
+}
+
+#[cfg(test)]
+fn random_monitor_duration_verb() -> &'static str {
+    "Baked"
+}
+
+fn footer_label(label_parts: &[String], background_process_summary: Option<&str>) -> String {
+    let mut label = label_parts.join(" • ");
+    if let Some(summary) = background_process_summary {
+        if !label.is_empty() {
+            label.push_str(" · ");
+        }
+        label.push_str(summary);
+    }
+    label
+}
+
+fn background_process_summary(shell_count: usize, monitor_count: usize) -> Option<String> {
+    let shells = (shell_count > 0).then(|| {
+        let suffix = if shell_count == 1 { "" } else { "s" };
+        format!("{shell_count} shell{suffix}")
+    });
+    let monitors = (monitor_count > 0).then(|| {
+        let suffix = if monitor_count == 1 { "" } else { "s" };
+        format!("{monitor_count} monitor{suffix}")
+    });
+    match (shells, monitors) {
+        (Some(shells), Some(monitors)) => Some(format!("{shells}, {monitors} still running")),
+        (Some(shells), None) => Some(format!("{shells} still running")),
+        (None, Some(monitors)) => Some(format!("{monitors} still running")),
+        (None, None) => None,
+    }
+}
 
 pub(crate) fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
     let mut parts = Vec::new();

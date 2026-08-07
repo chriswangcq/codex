@@ -1,0 +1,14 @@
+---
+source: tui/src/bottom_pane/unified_exec_footer.rs
+expression: "format!(\"{buf:?}\")"
+---
+Buffer {
+    area: Rect { x: 0, y: 0, width: 90, height: 1 },
+    content: [
+        "  1 shell, 2 monitors · ↓ to manage                                                       ",
+    ],
+    styles: [
+        x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
+        x: 35, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+    ]
+}

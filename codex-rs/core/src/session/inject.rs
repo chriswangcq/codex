@@ -18,7 +18,13 @@ impl Session {
         &self,
         input: Vec<T>,
     ) -> Result<(), Vec<T>> {
+        if self.is_session_runtime_closing() {
+            return Err(input);
+        }
         let mut active = self.active_turn.lock().await;
+        if self.is_session_runtime_closing() {
+            return Err(input);
+        }
         match active.as_mut() {
             Some(active_turn) => {
                 self.input_queue
@@ -172,9 +178,15 @@ impl Session {
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) {
+        if self.is_session_runtime_closing() {
+            return;
+        }
         let Err(items) = self.inject_if_running(items).await else {
             return;
         };
+        if self.is_session_runtime_closing() {
+            return;
+        }
         let default_turn_context;
         let turn_context = match current_turn_context {
             Some(turn_context) => turn_context,

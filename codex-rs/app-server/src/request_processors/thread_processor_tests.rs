@@ -50,6 +50,8 @@ mod background_terminal_pagination_tests {
             process_id: process_id.to_string(),
             command: format!("command-{process_id}"),
             cwd: LegacyAppPathString::from_string(cwd),
+            monitor: None,
+            output: None,
             os_pid: None,
             cpu_percent: None,
             rss_kb: None,
@@ -92,6 +94,39 @@ mod background_terminal_pagination_tests {
             paginate_background_terminals(&terminals, Some("missing".to_string()), Some(1))
                 .is_err()
         );
+    }
+}
+
+mod background_terminal_mapping_tests {
+    use super::super::background_terminal_to_v2;
+    use codex_core::BackgroundTerminalInfo;
+    use codex_core::BackgroundTerminalOutput;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
+
+    #[test]
+    fn monitor_output_mapping_is_atomic_and_utf8_lossy() {
+        let cwd: AbsolutePathBuf = std::env::current_dir()
+            .expect("current directory")
+            .try_into()
+            .expect("absolute current directory");
+        let terminal = background_terminal_to_v2(BackgroundTerminalInfo {
+            item_id: "monitor-call".to_string(),
+            process_id: "42".to_string(),
+            command: "watch deployment".to_string(),
+            cwd: PathUri::from_abs_path(&cwd),
+            monitor: None,
+            output: Some(BackgroundTerminalOutput {
+                tail: vec![0xff, b'r', b'e', b'a', b'd', b'y'],
+                bytes_total: 9_001,
+                truncated: true,
+            }),
+        });
+
+        let output = terminal.output.expect("monitor output");
+        assert_eq!(output.tail, "�ready");
+        assert_eq!(output.bytes_total, 9_001);
+        assert!(output.truncated);
     }
 }
 

@@ -2781,6 +2781,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             sandbox_type,
             plugin_id,
             script_path,
+            monitor,
             source,
             status,
             command_actions,
@@ -2794,7 +2795,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                 thread_id,
                 turn_id,
                 id.clone(),
-                command_execution_tool_name(*source).to_string(),
+                command_execution_tool_name(*source, monitor.is_some()).to_string(),
                 ToolItemOutcome {
                     terminal_status,
                     failure_kind,
@@ -3403,7 +3404,10 @@ fn final_approval_outcome(
     }
 }
 
-fn command_execution_tool_name(source: CommandExecutionSource) -> &'static str {
+fn command_execution_tool_name(source: CommandExecutionSource, is_monitor: bool) -> &'static str {
+    if is_monitor {
+        return "monitor";
+    }
     match source {
         CommandExecutionSource::UnifiedExecStartup
         | CommandExecutionSource::UnifiedExecInteraction => "unified_exec",
@@ -4088,6 +4092,18 @@ mod tests {
         assert_eq!(
             safe_plugin_relative_script_path(/*plugin_id*/ None, Some("scripts/run.py"),),
             None
+        );
+    }
+
+    #[test]
+    fn command_monitor_keeps_its_tool_identity_in_analytics() {
+        assert_eq!(
+            command_execution_tool_name(CommandExecutionSource::UnifiedExecStartup, true),
+            "monitor"
+        );
+        assert_eq!(
+            command_execution_tool_name(CommandExecutionSource::UnifiedExecStartup, false),
+            "unified_exec"
         );
     }
 }

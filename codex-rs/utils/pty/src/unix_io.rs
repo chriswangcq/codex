@@ -58,11 +58,15 @@ impl PtyIo {
                     Ok(0) => break,
                     Ok(count) => {
                         // Output caps may close the receiver before the child exits.
-                        let _ = stdout_tx.send(buf[..count].to_vec()).await;
+                        assert!(
+                            stdout_tx.send(buf[..count].to_vec()).await.is_ok(),
+                            "PTY output receiver closed before EOF"
+                        );
                     }
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                     // Unix PTYs may report EIO rather than EOF when the slave closes.
-                    Err(_) => break,
+                    Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
+                    Err(err) => panic!("PTY output reader failed before EOF: {err}"),
                 }
             }
         });

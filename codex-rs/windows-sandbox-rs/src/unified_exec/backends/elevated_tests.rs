@@ -1,4 +1,5 @@
 use super::RunnerTransportRequest;
+use super::make_runner_terminator;
 use super::spawn_runner_transport_with_retry;
 use crate::WindowsSandboxProxySettingsMode;
 use crate::identity::SandboxCreds;
@@ -10,17 +11,31 @@ use crate::runner_client::RunnerLogonError;
 use crate::runner_client::RunnerStartupError;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_pty::ProcessTerminationMode;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::tempdir;
 use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
 use windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
+
+#[test]
+fn runner_terminator_reports_closed_outbound_channel() {
+    let (outbound_tx, outbound_rx) = std::sync::mpsc::channel();
+    drop(outbound_rx);
+    let mut terminate = make_runner_terminator(outbound_tx);
+
+    let err = terminate(ProcessTerminationMode::Force)
+        .expect_err("closed runner channel should reject force termination");
+
+    assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SpawnObservation {

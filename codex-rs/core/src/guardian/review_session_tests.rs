@@ -228,6 +228,7 @@ async fn test_review_params() -> GuardianReviewSessionParams {
         node_repl_policy: GuardianNodeReplPolicy::from_messages(ResolvedModelMessages::bundled()),
         category: GuardianScope::Shell,
         request: GuardianApprovalRequest::ExecCommand {
+            monitor: None,
             id: "shell-1".to_string(),
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
             command: vec!["git".to_string(), "status".to_string()],

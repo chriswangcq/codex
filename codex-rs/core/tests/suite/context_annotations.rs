@@ -76,6 +76,7 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
     test.codex
         .submit(Op::ApproveGuardianDeniedAction {
             event: GuardianAssessmentEvent {
+                monitor: None,
                 review_reason: None,
                 model_context: None,
                 id: "guardian-review".to_string(),

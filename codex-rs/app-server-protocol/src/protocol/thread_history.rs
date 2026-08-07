@@ -2407,6 +2407,8 @@ mod tests {
             parsed_cmd: parsed_cmd.clone(),
             source: ExecCommandSource::Agent,
             interaction_input: None,
+            monitor: None,
+            monitor_termination_reason: None,
             status: CoreCommandExecutionStatus::Completed,
             stdout: Some("hello world\n".to_string()),
             stderr: Some(String::new()),
@@ -2436,6 +2438,7 @@ mod tests {
                 parsed_cmd: parsed_cmd.clone(),
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: None,
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
                 thread_id,
@@ -2456,6 +2459,8 @@ mod tests {
                 parsed_cmd,
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 stdout: "hello world\n".to_string(),
                 stderr: String::new(),
                 aggregated_output: "hello world\n".to_string(),
@@ -2492,6 +2497,8 @@ mod tests {
                     .to_string(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".to_string()),
+                monitor: None,
+                monitor_termination_reason: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::InProgress,
                 command_actions: vec![CommandAction::Unknown {
@@ -2519,6 +2526,8 @@ mod tests {
                     .to_string(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".to_string()),
+                monitor: None,
+                monitor_termination_reason: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
@@ -3145,6 +3154,8 @@ mod tests {
                 }],
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 stdout: String::new(),
                 stderr: String::new(),
                 aggregated_output: "hello world\n".into(),
@@ -3208,6 +3219,8 @@ mod tests {
                 command: "echo 'hello world'".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".into()),
+                monitor: None,
+                monitor_termination_reason: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
@@ -3439,6 +3452,8 @@ mod tests {
                 parsed_cmd: vec![ParsedCommand::Unknown { cmd: "ls".into() }],
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 stdout: String::new(),
                 stderr: "exec command rejected by user".into(),
                 aggregated_output: "exec command rejected by user".into(),
@@ -3483,6 +3498,8 @@ mod tests {
                 command: "ls".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-2".into()),
+                monitor: None,
+                monitor_termination_reason: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
@@ -3509,6 +3526,12 @@ mod tests {
 
     #[test]
     fn reconstructs_declined_guardian_command_item() {
+        let monitor = codex_protocol::protocol::CommandMonitorInfo {
+            task_id: "bguardian".into(),
+            description: "watch guardian command".into(),
+            timeout_ms: 300_000,
+            persistent: false,
+        };
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
@@ -3533,6 +3556,7 @@ mod tests {
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
+                monitor: Some(monitor.clone()),
                 turn_id: "turn-1".into(),
                 started_at_ms: 1_000,
                 completed_at_ms: None,
@@ -3556,6 +3580,7 @@ mod tests {
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
+                monitor: Some(monitor.clone()),
                 turn_id: "turn-1".into(),
                 started_at_ms: 1_000,
                 completed_at_ms: Some(1_042),
@@ -3594,7 +3619,9 @@ mod tests {
                 command: "rm -rf /tmp/guardian".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
-                source: CommandExecutionSource::Agent,
+                monitor: Some(monitor.into()),
+                monitor_termination_reason: None,
+                source: CommandExecutionSource::UnifiedExecStartup,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
                     command: "rm -rf /tmp/guardian".into(),
@@ -3608,6 +3635,12 @@ mod tests {
 
     #[test]
     fn reconstructs_in_progress_guardian_execve_item() {
+        let monitor = codex_protocol::protocol::CommandMonitorInfo {
+            task_id: "bexecve3".into(),
+            description: "watch execve guardian command".into(),
+            timeout_ms: 300_000,
+            persistent: false,
+        };
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
@@ -3632,6 +3665,7 @@ mod tests {
                 target_item_id: Some("guardian-execve".into()),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
+                monitor: Some(monitor.clone()),
                 turn_id: "turn-1".into(),
                 started_at_ms: 2_000,
                 completed_at_ms: None,
@@ -3669,7 +3703,9 @@ mod tests {
                 command: "/bin/rm -f /tmp/file.sqlite".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
-                source: CommandExecutionSource::Agent,
+                monitor: Some(monitor.into()),
+                monitor_termination_reason: None,
+                source: CommandExecutionSource::UnifiedExecStartup,
                 status: CommandExecutionStatus::InProgress,
                 command_actions: vec![CommandAction::Unknown {
                     command: "/bin/rm -f /tmp/file.sqlite".into(),
@@ -3833,6 +3869,8 @@ mod tests {
                 }],
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 stdout: "done\n".into(),
                 stderr: String::new(),
                 aggregated_output: "done\n".into(),
@@ -3873,6 +3911,8 @@ mod tests {
                 command: "echo done".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-42".into()),
+                monitor: None,
+                monitor_termination_reason: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
@@ -3943,6 +3983,8 @@ mod tests {
                 }],
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 stdout: "done\n".into(),
                 stderr: String::new(),
                 aggregated_output: "done\n".into(),

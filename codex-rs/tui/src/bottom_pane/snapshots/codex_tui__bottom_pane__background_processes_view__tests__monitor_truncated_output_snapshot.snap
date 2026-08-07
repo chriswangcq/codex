@@ -1,0 +1,26 @@
+---
+source: tui/src/bottom_pane/background_processes_view.rs
+expression: "render_view(&monitor_view_with_output(\"first\\nsecond\\nthird\\n\", 1536, true),\n70)"
+---
+
+  Monitor details
+
+  Status: Running
+  Runtime: 12s
+  Script: tail -f app.log
+
+  Output:
+   ╭──────────────────────────────────────────────────────────────╮
+   │ first                                                        │
+   │ second                                                       │
+   │ third                                                        │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   │                                                              │
+   ╰──────────────────────────────────────────────────────────────╯
+
+  Showing 3 lines of 1.5KB

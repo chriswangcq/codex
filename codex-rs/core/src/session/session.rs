@@ -53,6 +53,44 @@ use tokio::sync::Semaphore;
 
 type McpToolApprovalMetadataMap =
     HashMap<(String, String), std::sync::Weak<(Option<McpInvocation>, McpToolApprovalMetadata)>>;
+#[derive(Default)]
+pub(super) struct SessionRuntimeGate {
+    closing: AtomicBool,
+    start_boundary: std::sync::Mutex<()>,
+}
+
+impl SessionRuntimeGate {
+    fn try_acquire_open(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let guard = self
+            .start_boundary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Linearizes session shutdown against idle-turn reservation and task
+    /// installation. Callers must not await inside `action`.
+    pub(super) fn try_run_while_open<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let _guard = self.try_acquire_open()?;
+        Some(action())
+    }
+
+    pub(super) fn begin_shutdown(&self) {
+        let _guard = self
+            .start_boundary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closing
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.closing.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
 
 /// Context for an initialized model agent
 ///
@@ -91,12 +129,36 @@ pub(crate) struct Session {
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
+    pub(super) session_runtime_gate: SessionRuntimeGate,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
     pub(super) fork_persistence: ForkPersistence,
     pub(super) forked_from_ordinal_exclusive: Option<u64>,
     pub(super) next_internal_sub_id: AtomicU64,
+}
+
+impl Session {
+    pub(crate) fn begin_session_runtime_shutdown(&self) {
+        self.session_runtime_gate.begin_shutdown();
+    }
+
+    pub(crate) fn is_session_runtime_closing(&self) -> bool {
+        self.session_runtime_gate.is_closing()
+    }
+
+    pub(crate) fn try_run_while_session_runtime_open<T>(
+        &self,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.session_runtime_gate.try_run_while_open(action)
+    }
+
+    pub(crate) fn try_acquire_session_runtime_start(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.session_runtime_gate.try_acquire_open()
+    }
 }
 
 #[derive(Clone)]
@@ -1803,6 +1865,7 @@ impl Session {
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
+                session_runtime_gate: SessionRuntimeGate::default(),
                 input_queue: InputQueue::new(),
                 services,
                 git_enrichment_policy,

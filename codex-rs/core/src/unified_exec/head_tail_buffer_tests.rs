@@ -89,3 +89,22 @@ fn empty_and_tiny_chunks_have_bounded_metadata() {
     assert_eq!(buf.retained_bytes(), 10);
     assert_eq!(buf.omitted_bytes(), 2);
 }
+
+#[test]
+fn tail_bytes_reads_from_head_before_tail_budget_is_used() {
+    let mut buf = HeadTailBuffer::<16>::default();
+    buf.push_chunk(b"abcdef");
+
+    assert_eq!(buf.tail_bytes(4), b"cdef".to_vec());
+    assert_eq!(buf.tail_bytes(99), b"abcdef");
+}
+
+#[test]
+fn tail_bytes_returns_the_true_suffix_after_middle_omission() {
+    let mut buf = HeadTailBuffer::<10>::default();
+    buf.push_chunk(b"0123456789abcdef");
+
+    assert_eq!(buf.tail_bytes(4), b"cdef".to_vec());
+    assert_eq!(buf.total_bytes(), 16);
+    assert_eq!(buf.tail_bytes(99), b"bcdef".to_vec());
+}

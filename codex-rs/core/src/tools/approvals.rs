@@ -35,6 +35,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::ReviewDecision;
@@ -69,6 +70,7 @@ pub(crate) enum ApprovalAction {
         id: String,
         environment_id: String,
         command: Vec<String>,
+        monitor: Option<CommandMonitorInfo>,
         #[serde(skip_serializing)]
         hook_command: String,
         cwd: PathUri,
@@ -287,6 +289,7 @@ impl ApprovalAction {
                 id,
                 environment_id,
                 command,
+                monitor,
                 cwd,
                 sandbox_permissions,
                 additional_permissions,
@@ -297,6 +300,7 @@ impl ApprovalAction {
                 id,
                 environment_id,
                 command,
+                monitor,
                 guardian_cwd: codex_utils_path_uri::LegacyAppPathString::from_path_uri(
                     &cwd,
                     exec_command_cwd_convention.ok_or_else(|| {
@@ -685,6 +689,7 @@ impl Session {
             ApprovalAction::ExecCommand {
                 environment_id,
                 command,
+                monitor,
                 cwd,
                 additional_permissions,
                 justification,
@@ -718,6 +723,7 @@ impl Session {
                         /*approval_id*/ None,
                         Some(environment_id.clone()),
                         command.clone(),
+                        monitor.clone(),
                         cwd.clone(),
                         reason,
                         ctx.network_approval_context.clone(),
@@ -753,6 +759,7 @@ impl Session {
                         process_id.to_string(),
                         input.clone(),
                     ],
+                    /*monitor*/ None,
                     cwd.clone(),
                     ctx.approval_reason.clone(),
                     /*network_approval_context*/ None,
@@ -780,6 +787,7 @@ impl Session {
                     Some(approval_id.clone()),
                     Some(environment_id.clone()),
                     command.clone(),
+                    /*monitor*/ None,
                     cwd.clone().into(),
                     /*reason*/ None,
                     /*network_approval_context*/ None,
@@ -853,6 +861,7 @@ impl Session {
                     /*approval_id*/ None,
                     Some(environment_id.clone()),
                     command.clone(),
+                    /*monitor*/ None,
                     cwd.clone().into(),
                     ctx.approval_reason.clone(),
                     ctx.network_approval_context.clone(),

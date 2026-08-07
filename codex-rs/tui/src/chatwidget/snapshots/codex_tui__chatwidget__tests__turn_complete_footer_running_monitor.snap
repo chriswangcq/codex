@@ -1,0 +1,19 @@
+---
+source: tui/src/chatwidget/tests/exec_flow.rs
+expression: combined
+---
+• Ran echo preparing
+  └ preparing
+
+
+⏺ Monitor(deployment readiness)
+  ⎿  Monitor started · task task-monitor-1 · timeout 300s
+
+
+────────────────────────────────────────────────────────────────────────────────
+
+
+• The monitor is still running.
+
+
+─ Baked for 1m 01s · 1 monitor still running ───────────────────────────────────

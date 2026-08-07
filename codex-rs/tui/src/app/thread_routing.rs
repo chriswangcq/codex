@@ -489,6 +489,13 @@ impl App {
                 self.chat_widget.record_realtime_failure();
                 self.chat_widget.reset_realtime_conversation();
             }
+            if let AppCommand::TerminateBackgroundProcess { process_id } = &op {
+                self.chat_widget.update_background_process_stop(
+                    process_id,
+                    Err("No active thread is available".to_string()),
+                );
+                return Ok(());
+            }
             self.chat_widget
                 .add_error_message("No active thread is available.".to_string());
             return Ok(());
@@ -993,6 +1000,16 @@ impl App {
                     .thread_realtime_append_speech(*realtime_thread_id, text.as_str().to_owned())
                     .await?;
                 self.chat_widget.accept_realtime_speech(*delivery_id);
+                Ok(true)
+            }
+            AppCommand::TerminateBackgroundProcess { process_id } => {
+                let result = app_server
+                    .thread_background_terminal_terminate(thread_id, process_id.clone())
+                    .await
+                    .map(|response| response.terminated)
+                    .map_err(|err| err.to_string());
+                self.chat_widget
+                    .update_background_process_stop(process_id, result);
                 Ok(true)
             }
             AppCommand::RunUserShellCommand { command } => {

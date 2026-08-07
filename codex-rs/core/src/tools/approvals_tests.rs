@@ -2,6 +2,8 @@ use super::*;
 use crate::session::tests::make_session_and_context_with_rx;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::approvals::NetworkPolicyAmendment;
+use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -136,6 +138,7 @@ async fn non_utf8_cwd_preserves_approval_routing(
         id: context.call_id.clone(),
         environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
         command: vec!["npm".to_string(), "install".to_string()],
+        monitor: None,
         hook_command: "npm install".to_string(),
         cwd: cwd.clone(),
         sandbox_permissions: if reviewer == ApprovalsReviewer::User {
@@ -234,4 +237,44 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
             );
         }
     }
+}
+
+#[test]
+fn monitor_metadata_survives_guardian_request_projection() {
+    let cwd = test_path_buf("/tmp").abs();
+    let monitor = CommandMonitorInfo {
+        task_id: "bguardian".to_string(),
+        description: "watch guardian command".to_string(),
+        timeout_ms: 300_000,
+        persistent: false,
+    };
+    let action = ApprovalAction::ExecCommand {
+        id: "call-1".to_string(),
+        environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        command: vec!["tail".to_string(), "-f".to_string(), "app.log".to_string()],
+        monitor: Some(monitor.clone()),
+        hook_command: "tail -f app.log".to_string(),
+        cwd: PathUri::from_abs_path(&cwd),
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        justification: None,
+        tty: false,
+        proposed_execpolicy_amendment: None,
+    };
+
+    assert_eq!(
+        action.into_guardian_request(Some(PathConvention::native())).expect("guardian request"),
+        crate::guardian::GuardianApprovalRequest::ExecCommand {
+            id: "call-1".to_string(),
+            environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+            command: vec!["tail".to_string(), "-f".to_string(), "app.log".to_string()],
+            monitor: Some(monitor),
+            cwd: PathUri::from_abs_path(&cwd),
+            guardian_cwd: codex_utils_path_uri::LegacyAppPathString::from_abs_path(&cwd),
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            additional_permissions: None,
+            justification: None,
+            tty: false,
+        }
+    );
 }

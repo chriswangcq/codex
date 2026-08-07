@@ -59,6 +59,7 @@ impl ReviewReport {
             crate::REVIEW_TIMEOUT.as_millis() as u64,
         );
         let started = GuardianAssessmentEvent {
+            monitor: None,
             review_reason: Some(metadata.review_reason),
             model_context: Some(metadata.model_context),
             id: metadata.review_id,

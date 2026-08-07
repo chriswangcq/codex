@@ -11,6 +11,7 @@ mod contextual_user_message;
 mod current_time_reminder;
 mod developer_instructions;
 mod environment_context;
+pub(crate) use environment_context::push_xml_escaped_text;
 mod environments_instructions;
 mod guardian_approved_action;
 mod guardian_assistant_context;

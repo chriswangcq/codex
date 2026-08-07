@@ -512,3 +512,25 @@ and out-of-scope item IDs return invalid params (`-32602`) with
 Omitted or null cursors preserve normal first-page behavior. Continue anchored
 pages with the returned opaque string `nextCursor`; response fields and
 `backwardsCursor` semantics are unchanged.
+
+# Local command monitors
+
+The `monitor` tool starts a local command as a background monitor. Its canonical
+`commandExecution` item includes nullable `monitor` metadata containing `taskId`,
+`description`, `timeoutMs`, and `persistent`, together with the existing
+`unifiedExecStartup` source. Ordinary commands keep `monitor: null`.
+
+`thread/backgroundTerminals/list` includes both ordinary terminals and monitors.
+Monitor entries expose an atomic combined stdout/stderr snapshot in `output`,
+with an 8 KiB raw-byte tail, total byte count, and truncation flag. Ordinary
+terminals expose `output: null`. Standard cursor and limit pagination applies.
+`thread/backgroundTerminals/terminate` stops one process by its app-server
+`processId`; `thread/backgroundTerminals/clean` stops all terminals and monitors.
+These endpoints require the `experimentalApi` capability.
+
+For monitor items, `item/commandExecution/outputDelta` contains already-framed
+stdout event batches. Stderr appears in final `aggregatedOutput` and does not
+trigger monitor events. The completed item records nullable
+`monitorTerminationReason` alongside the normal status and exit metadata.
+Approval and auto-review clients correlate `itemId` or `targetItemId` with the
+canonical command item to obtain monitor identity.

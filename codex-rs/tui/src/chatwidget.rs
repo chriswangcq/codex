@@ -256,6 +256,7 @@ use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod activity_groups;
 mod activity_presentation;
+mod background_processes;
 mod command_lifecycle;
 mod connector_mentions;
 mod connectors;
@@ -265,6 +266,7 @@ mod empty_state_policy;
 pub(crate) use self::connectors::ConnectorScopeGeneration;
 use self::connectors::ConnectorsState;
 mod exec_state;
+use self::exec_state::MonitorOutputBatch;
 use self::exec_state::RunningCommand;
 use self::exec_state::UnifiedExecProcessSummary;
 use self::exec_state::UnifiedExecWaitState;
@@ -1465,6 +1467,15 @@ impl ChatWidget {
             .map(|process| history_cell::UnifiedExecProcessDetails {
                 command_display: process.command_display.clone(),
                 recent_chunks: process.recent_chunks.clone(),
+                kind: process.monitor_info().map_or(
+                    history_cell::UnifiedExecProcessKindDetails::BackgroundTerminal,
+                    |monitor| history_cell::UnifiedExecProcessKindDetails::Monitor {
+                        description: monitor.description.clone(),
+                        task_id: monitor.task_id.clone(),
+                        timeout_ms: monitor.timeout_ms,
+                        persistent: monitor.persistent,
+                    },
+                ),
             })
             .collect();
         self.add_to_history(history_cell::new_unified_exec_processes_output(processes));
@@ -1475,7 +1486,7 @@ impl ChatWidget {
         self.unified_exec_processes.clear();
         self.sync_unified_exec_footer();
         self.add_info_message(
-            "Stopping all background terminals.".to_string(),
+            "Stopping all background terminals and monitors.".to_string(),
             /*hint*/ None,
         );
     }

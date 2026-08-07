@@ -44,6 +44,7 @@ pub(super) use codex_app_server_protocol::CommandExecutionRequestApprovalParams 
 pub(super) use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
 pub(super) use codex_app_server_protocol::CommandExecutionSource as AppServerCommandExecutionSource;
 pub(super) use codex_app_server_protocol::CommandExecutionStatus as AppServerCommandExecutionStatus;
+pub(super) use codex_app_server_protocol::CommandMonitorInfo as AppServerCommandMonitorInfo;
 pub(super) use codex_app_server_protocol::ConfigWarningNotification;
 pub(super) use codex_app_server_protocol::CreditsSnapshot;
 pub(super) use codex_app_server_protocol::ErrorNotification;

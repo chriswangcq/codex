@@ -277,19 +277,34 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        let _ = self.start_task(turn_context, input, task).await;
+    }
+
+    pub(crate) async fn start_task<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> bool {
+        self.start_task_with_reservation(
+            turn_context, input, task, /*expected_turn_state*/ None,
+        ).await
     }
 
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "record the started turn atomically with its active reservation"
     )]
-    pub(crate) async fn start_task<T: SessionTask>(
+    pub(crate) async fn start_task_with_reservation<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
-    ) {
+        expected_turn_state: Option<&Arc<Mutex<TurnState>>>,
+    ) -> bool {
+        if self.is_session_runtime_closing() {
+            return false;
+        }
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -312,15 +327,22 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
-        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
+            if expected_turn_state.is_some_and(|expected| {
+                active.as_ref().is_none_or(|turn| {
+                    turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, expected)
+                })
+            }) {
+                return false;
+            }
             self.record_started_turn(&turn_context.sub_id).await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
             Arc::clone(&turn.turn_state)
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
+        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         self.input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
             .await;
@@ -332,6 +354,22 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
+        let Some(_runtime_start_guard) = self.try_acquire_session_runtime_start() else {
+            if active
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.task.is_none())
+            {
+                *active = None;
+            }
+            return false;
+        };
+        if expected_turn_state.is_some_and(|expected| {
+            active.as_ref().is_none_or(|turn| {
+                turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, expected)
+            })
+        }) {
+            return false;
+        }
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
         let agent_execution_guard = self.services.agent_control.admit_turn(
@@ -418,6 +456,7 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        true
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -453,7 +492,8 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
-        if !self.input_queue.has_pending_mailbox_items().await
+        if self.is_session_runtime_closing()
+            || !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
         {
@@ -462,7 +502,16 @@ impl Session {
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            let reserved = self
+                .try_run_while_session_runtime_open(|| {
+                    if active_turn.is_some() {
+                        return false;
+                    }
+                    *active_turn = Some(ActiveTurn::default());
+                    true
+                })
+                .unwrap_or(false);
+            if !reserved {
                 return;
             }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
@@ -565,7 +614,10 @@ impl Session {
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
             self.input_queue.clear_pending(&active_turn).await;
         }
-        if reason == TurnAbortReason::Interrupted && aborted_turn {
+        if reason == TurnAbortReason::Interrupted
+            && aborted_turn
+            && !self.is_session_runtime_closing()
+        {
             self.maybe_start_turn_for_pending_work().await;
         }
     }
@@ -622,7 +674,7 @@ impl Session {
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue.clear_pending(&active_turn).await;
 
-        if reason == TurnAbortReason::Interrupted {
+        if reason == TurnAbortReason::Interrupted && !self.is_session_runtime_closing() {
             self.maybe_start_turn_for_pending_work().await;
         }
     }

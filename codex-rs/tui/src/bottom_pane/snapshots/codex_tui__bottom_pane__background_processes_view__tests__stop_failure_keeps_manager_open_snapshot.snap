@@ -1,0 +1,12 @@
+---
+source: tui/src/bottom_pane/background_processes_view.rs
+expression: rendered
+---
+
+  Background
+  Process still running · press x to retry
+
+    deployment readiness (running)
+  › npm run dev (running)
+
+  ↑/↓ · Enter · x stop · Esc

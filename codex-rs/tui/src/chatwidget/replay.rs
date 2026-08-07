@@ -380,14 +380,9 @@ impl ChatWidget {
                 status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
                 ..
             } => self.on_command_execution_started(item),
-            item @ ThreadItem::CommandExecution {
-                source: ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup,
-                status:
-                    codex_app_server_protocol::CommandExecutionStatus::Completed
-                    | codex_app_server_protocol::CommandExecutionStatus::Failed,
-                ..
-            } if from_replay => self.handle_command_execution_completed_now(item),
-            item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
+            item @ ThreadItem::CommandExecution { .. } => {
+                self.on_command_execution_completed(item, from_replay)
+            }
             ThreadItem::FileChange {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,
                 ..

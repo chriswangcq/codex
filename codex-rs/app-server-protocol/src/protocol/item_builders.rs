@@ -14,6 +14,7 @@ use crate::protocol::v2::AutoReviewDecisionSource;
 use crate::protocol::v2::CommandAction;
 use crate::protocol::v2::CommandExecutionSource;
 use crate::protocol::v2::CommandExecutionStatus;
+use crate::protocol::v2::CommandMonitorInfo;
 use crate::protocol::v2::FileUpdateChange;
 use crate::protocol::v2::GuardianApprovalReview;
 use crate::protocol::v2::GuardianApprovalReviewStatus;
@@ -105,6 +106,8 @@ pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> Th
         command: presentation.command,
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
+        monitor: payload.monitor.as_ref().map(Into::into),
+        monitor_termination_reason: None,
         source: payload.source.into(),
         status: CommandExecutionStatus::InProgress,
         command_actions: presentation.command_actions,
@@ -133,6 +136,8 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
         command: presentation.command,
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
+        monitor: payload.monitor.as_ref().map(Into::into),
+        monitor_termination_reason: payload.monitor_termination_reason.map(Into::into),
         source: payload.source.into(),
         status: (&payload.status).into(),
         command_actions: presentation.command_actions,
@@ -194,6 +199,12 @@ pub fn build_item_from_guardian_event(
     assessment: &GuardianAssessmentEvent,
     status: CommandExecutionStatus,
 ) -> Option<ThreadItem> {
+    let monitor = assessment.monitor.as_ref().map(CommandMonitorInfo::from);
+    let source = if monitor.is_some() {
+        CommandExecutionSource::UnifiedExecStartup
+    } else {
+        CommandExecutionSource::Agent
+    };
     match &assessment.action {
         GuardianAssessmentAction::Command { command, cwd, .. } => {
             let id = assessment.target_item_id.as_ref()?;
@@ -210,7 +221,9 @@ pub fn build_item_from_guardian_event(
                 command,
                 cwd: cwd.clone(),
                 process_id: None,
-                source: CommandExecutionSource::Agent,
+                monitor,
+                monitor_termination_reason: None,
+                source,
                 status,
                 command_actions,
                 aggregated_output: None,
@@ -250,7 +263,9 @@ pub fn build_item_from_guardian_event(
                 command,
                 cwd: cwd.clone().into(),
                 process_id: None,
-                source: CommandExecutionSource::Agent,
+                monitor,
+                monitor_termination_reason: None,
+                source,
                 status,
                 command_actions,
                 aggregated_output: None,

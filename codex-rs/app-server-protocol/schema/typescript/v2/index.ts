@@ -93,6 +93,8 @@ export type { CommandMigration } from "./CommandMigration";
 export type { ComputerUseConfig } from "./ComputerUseConfig";
 export type { ComputerUseMacosConfig } from "./ComputerUseMacosConfig";
 export type { ComputerUseMacosRequirements } from "./ComputerUseMacosRequirements";
+export type { CommandMonitorInfo } from "./CommandMonitorInfo";
+export type { CommandMonitorTerminationReason } from "./CommandMonitorTerminationReason";
 export type { ComputerUseRequirements } from "./ComputerUseRequirements";
 export type { ComputerUseWindowsConfig } from "./ComputerUseWindowsConfig";
 export type { ComputerUseWindowsExeConfig } from "./ComputerUseWindowsExeConfig";

@@ -1214,6 +1214,8 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 process_id: None,
                 plugin_id: None,
                 script_path: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 source: AppServerCommandExecutionSource::UserShell,
                 status: AppServerCommandExecutionStatus::InProgress,
                 command_actions: vec![AppServerCommandAction::Unknown {
@@ -1240,6 +1242,8 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 process_id: None,
                 plugin_id: None,
                 script_path: None,
+                monitor: None,
+                monitor_termination_reason: None,
                 source: AppServerCommandExecutionSource::UserShell,
                 status: AppServerCommandExecutionStatus::Completed,
                 command_actions: vec![AppServerCommandAction::Unknown {

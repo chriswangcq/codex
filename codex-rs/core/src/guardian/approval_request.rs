@@ -6,6 +6,7 @@ use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::GuardianCommandSource;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::CommandMonitorInfo;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 #[cfg(unix)]
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -20,6 +21,7 @@ pub(crate) enum GuardianApprovalRequest {
         id: String,
         environment_id: String,
         command: Vec<String>,
+        monitor: Option<CommandMonitorInfo>,
         cwd: PathUri,
         /// Executor-native rendering sent to Guardian; `cwd` remains typed for attribution.
         guardian_cwd: LegacyAppPathString,
@@ -271,6 +273,7 @@ pub(crate) fn guardian_approval_request_to_json(
             id: _,
             environment_id: _,
             command,
+            monitor: _,
             cwd: _,
             guardian_cwd,
             sandbox_permissions,

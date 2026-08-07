@@ -26,6 +26,7 @@ use crate::tools::handlers::RequestUserInputAsyncHandler;
 use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::SendMessageToUserAsyncHandler;
 use crate::tools::handlers::SleepHandler;
+use crate::tools::handlers::TaskStopHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -1094,6 +1095,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals)
         && context.tool_policy.expose_additional_permissions;
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+    let supports_monitor = context.environments.local().is_some();
     let options = ExecCommandHandlerOptions {
         allow_login_shell,
         allow_tty: features.enabled(Feature::UnifiedExecTty),
@@ -1104,9 +1106,18 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
             context.environments,
         ),
         include_windows_shell_guidance: should_include_windows_shell_guidance(context.environments),
+        monitor: false,
     };
     if features.enabled(Feature::UnifiedExec) {
         registry.add(ExecCommandHandler::new(options));
+        if supports_monitor {
+            registry.add(ExecCommandHandler::new(ExecCommandHandlerOptions {
+                monitor: true,
+                include_shell_parameter: false,
+                ..options
+            }));
+        }
+        registry.add(TaskStopHandler);
         registry.add(WriteStdinHandler);
     } else {
         // Managed requirements are the only configuration path that can keep

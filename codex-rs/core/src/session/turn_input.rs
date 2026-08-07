@@ -59,13 +59,15 @@ mod tests;
 enum TurnStartKind {
     User,
     Automatic,
+    /// External process events wake the model even in Plan mode.
+    Monitor,
     Recovery,
 }
 
 impl TurnStartKind {
     fn permits_mode(self, mode: ModeKind) -> bool {
         match self {
-            Self::User | Self::Recovery => true,
+            Self::User | Self::Monitor | Self::Recovery => true,
             Self::Automatic => mode != ModeKind::Plan,
         }
     }
@@ -150,7 +152,7 @@ impl PreparedTurnInputSettings {
             cyber_access_program,
         };
         let turn_context = match kind {
-            TurnStartKind::User | TurnStartKind::Recovery => Some(
+            TurnStartKind::User | TurnStartKind::Monitor | TurnStartKind::Recovery => Some(
                 session
                     .new_turn_with_sub_id(submission_id.clone(), updates, options)
                     .await?,
@@ -415,6 +417,11 @@ async fn start_if_idle(
         ..
     } = request;
     let origin = UserInputOrigin::from_turn_trigger(start.turn_trigger.as_deref());
+    if session.is_session_runtime_closing() {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
+    }
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -465,8 +472,15 @@ async fn start_if_idle(
                 reason: NotSubmittedReason::Superseded,
             });
         }
-        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-        Arc::clone(&active_turn.turn_state)
+        let Some(turn_state) = session.try_run_while_session_runtime_open(|| {
+            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+            Arc::clone(&active_turn.turn_state)
+        }) else {
+            return Ok(TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::NotIdle,
+            });
+        };
+        turn_state
     };
 
     if session.input_queue.has_trigger_turn_mailbox_items().await {
@@ -509,6 +523,27 @@ async fn start_if_idle(
         .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
 
+    if session.input_queue.has_trigger_turn_mailbox_items().await {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::PendingTriggerTurn,
+        });
+    }
+    let still_reserved = {
+        let active_turn = session.active_turn.lock().await;
+        session.try_run_while_session_runtime_open(|| {
+            active_turn.as_ref().is_some_and(|active_turn| {
+                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+            })
+        }).unwrap_or(false)
+    };
+    if !still_reserved {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
+    }
     let mut task_input = merge_additional_context_input(session, additional_context).await;
     match kind {
         TurnStartKind::User => {
@@ -518,7 +553,7 @@ async fn start_if_idle(
             }
             task_input.push(pending_turn_input(session, input, &turn_context.sub_id, origin).await);
         }
-        TurnStartKind::Automatic | TurnStartKind::Recovery => {
+        TurnStartKind::Automatic | TurnStartKind::Monitor | TurnStartKind::Recovery => {
             // Empty automatic user input resumes sampling without a new message.
             if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
                 session
@@ -533,9 +568,17 @@ async fn start_if_idle(
             }
         }
     }
-    session
-        .start_task(turn_context, task_input, RegularTask::new())
-        .await;
+    if !session
+        .start_task_with_reservation(
+            turn_context, task_input, RegularTask::new(), Some(&turn_state),
+        )
+        .await
+    {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
+    }
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
     })
@@ -582,6 +625,25 @@ async fn steer(
 }
 
 impl Session {
+    /// Uses the same reservation, shutdown and user-priority gates as submitted turns.
+    pub(crate) async fn try_start_monitor_turn_if_idle(
+        self: &Arc<Self>,
+        item: ResponseItem,
+    ) -> CodexResult<TurnInputSubmission> {
+        start_if_idle(
+            self,
+            TurnInputRequest::new(SubmittedTurnInput::ResponseItem(item))
+                .on_start(TurnStartOptions {
+                    turn_trigger: Some("command_monitor".to_string()),
+                    ..Default::default()
+                }),
+            Uuid::now_v7().to_string(),
+            TurnStartKind::Monitor,
+            /*expected_previous_turn_id*/ None,
+        )
+        .await
+    }
+
     /// Called under the active-turn lock before running any task or lifecycle callback.
     pub(crate) async fn record_started_turn(&self, turn_id: &str) {
         self.state.lock().await.last_started_turn_id = Some(turn_id.to_string());

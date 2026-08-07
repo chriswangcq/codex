@@ -4,11 +4,13 @@
 //! changes composer state, or leaves an animation running; pending items retain their last known
 //! status. Callers own chronological grouping.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::exec_cell::CommandOutput;
 use crate::exec_cell::ExecCell;
 use crate::exec_cell::new_active_exec_command;
+use crate::history_cell::HistoryCell;
 use crate::history_cell::McpInvocation;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
@@ -23,6 +25,38 @@ use codex_protocol::mcp::CallToolResult;
 use codex_protocol::parse_command::ParsedCommand;
 use ratatui::style::Stylize as _;
 use ratatui::text::Line;
+
+/// Keep monitor identity and controlled termination visible in persisted history pages.
+pub(crate) fn monitor_history(item: &ThreadItem) -> Option<Arc<dyn HistoryCell>> {
+    let ThreadItem::CommandExecution {
+        monitor: Some(monitor),
+        monitor_termination_reason,
+        status,
+        aggregated_output,
+        exit_code,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    if *status == CommandExecutionStatus::InProgress {
+        Some(Arc::new(crate::history_cell::new_monitor_started(
+            monitor.description.clone(),
+            monitor.task_id.clone(),
+            monitor.timeout_ms,
+            monitor.persistent,
+        )))
+    } else {
+        Some(Arc::new(crate::history_cell::new_monitor_completed(
+            monitor.description.clone(),
+            monitor.task_id.clone(),
+            status.clone(),
+            *monitor_termination_reason,
+            aggregated_output.clone(),
+            *exit_code,
+        )))
+    }
+}
 
 /// Preserve status and output when replay cannot reconstruct a rich completed tool cell.
 /// Declined commands never ran, and historical terminal interactions do not carry stdin details.
@@ -131,6 +165,7 @@ impl CommandHistory {
     pub(crate) fn from_item(item: ThreadItem) -> Option<Self> {
         let ThreadItem::CommandExecution {
             id,
+            monitor,
             command,
             source,
             status,
@@ -143,8 +178,9 @@ impl CommandHistory {
         else {
             return None;
         };
+        // Monitor cells retain their own identity instead of joining exploration groups.
         // Thread snapshots omit stdin, so `None` would falsely classify these as waits.
-        if source == CommandExecutionSource::UnifiedExecInteraction {
+        if monitor.is_some() || source == CommandExecutionSource::UnifiedExecInteraction {
             return None;
         }
         let exit_code = match status {

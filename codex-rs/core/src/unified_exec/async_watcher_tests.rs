@@ -14,6 +14,8 @@ use crate::unified_exec::process::OutputBuffers;
 use crate::unified_exec::process::UnifiedExecProcess;
 use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::TurnItem;
+use codex_protocol::protocol::CommandMonitorInfo;
+use codex_protocol::protocol::CommandMonitorTerminationReason;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
@@ -49,8 +51,13 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         tty: false,
     });
     let process = Arc::new(
-        UnifiedExecProcess::from_spawned(spawned, SandboxType::None, Box::new(NoopSpawnLifecycle))
-            .await?,
+        UnifiedExecProcess::from_spawned(
+            spawned,
+            SandboxType::None,
+            Box::new(NoopSpawnLifecycle),
+            /*capture_monitor_output*/ false,
+        )
+        .await?,
     );
     let (session, turn, rx_event) = make_session_and_context_with_rx().await;
     let context = UnifiedExecContext::new(
@@ -100,7 +107,7 @@ async fn completed_output_preserves_bytes_before_subscription(
     .await;
     assert_eq!(model_output.to_bytes(), b"early\n");
 
-    start_streaming_output(&process, &context);
+    start_streaming_output(&process, &context, /*emit_output_deltas*/ true);
     #[allow(deprecated)]
     let cwd = context.step_context.turn.cwd.clone().into();
     spawn_exit_watcher(
@@ -151,7 +158,7 @@ async fn streaming_output_preserves_multibyte_characters_across_chunks() -> anyh
         rx_event,
         context,
     } = streaming_output_harness().await?;
-    start_streaming_output(&process, &context);
+    start_streaming_output(&process, &context, /*emit_output_deltas*/ true);
     let output_drained = process.output_drained_notify();
     let drained = output_drained.notified();
     tokio::pin!(drained);
@@ -199,7 +206,7 @@ async fn streaming_output_finishes_on_close_without_waiting_for_grace() -> anyho
         context,
         ..
     } = streaming_output_harness().await?;
-    start_streaming_output(&process, &context);
+    start_streaming_output(&process, &context, /*emit_output_deltas*/ true);
     let output_drained = process.output_drained_notify();
     let drained = output_drained.notified();
     tokio::pin!(drained);
@@ -244,7 +251,7 @@ async fn streaming_output_keeps_grace_as_fallback_without_close() -> anyhow::Res
         rx_event,
         context,
     } = streaming_output_harness().await?;
-    start_streaming_output(&process, &context);
+    start_streaming_output(&process, &context, /*emit_output_deltas*/ true);
     let output_drained = process.output_drained_notify();
     let drained = output_drained.notified();
     tokio::pin!(drained);
@@ -297,7 +304,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         mut context,
         rx_event,
     } = streaming_output_harness().await?;
-    start_streaming_output(&process, &context);
+    start_streaming_output(&process, &context, /*emit_output_deltas*/ true);
 
     tokio::time::pause();
     let process_for_late_denial = Arc::clone(&process);
@@ -330,6 +337,8 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         Instant::now(),
         Some(network_denial_monitor),
         /*plugin_metrics_sidecar*/ None,
+        /*monitor*/ None,
+        /*monitor_done*/ None,
     );
 
     let exited_at = Instant::now();
@@ -368,6 +377,100 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         elapsed >= Duration::from_millis(10) && elapsed < TRAILING_OUTPUT_GRACE,
         "completion should wait for denial without falling back to the output grace: {elapsed:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn monitor_exit_event_preserves_stdout_and_stderr_streams() -> anyhow::Result<()> {
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = codex_utils_pty::spawn_from_driver(codex_utils_pty::ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: Some(stderr_rx),
+        exit_rx,
+        terminator: None,
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+    let process = Arc::new(
+        UnifiedExecProcess::from_spawned(
+            spawned,
+            SandboxType::None,
+            Box::new(NoopSpawnLifecycle),
+            /*capture_monitor_output*/ true,
+        )
+        .await?,
+    );
+    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
+    let context = UnifiedExecContext::new(
+        session,
+        crate::session::step_context::StepContext::for_test(turn),
+        tokio_util::sync::CancellationToken::new(),
+        "monitor-stream-test".to_string(),
+    );
+    let output_buffer = Arc::clone(&process.output_handles().output_buffer);
+    start_streaming_output(&process, &context, /*emit_output_deltas*/ false);
+    let (monitor_done_tx, monitor_done_rx) = tokio::sync::oneshot::channel();
+    #[allow(deprecated)]
+    let cwd = context.step_context.turn.cwd.clone().into();
+    spawn_exit_watcher(
+        Arc::clone(&process),
+        &context,
+        vec!["proof".to_string()],
+        cwd,
+        /*process_id*/ 123,
+        /*plugin_attribution*/ None,
+        output_buffer,
+        Instant::now(),
+        /*network_denial_monitor*/ None,
+        /*plugin_metrics_sidecar*/ None,
+        Some(CommandMonitorInfo {
+            task_id: "b1234abcd".to_string(),
+            description: "stream identity".to_string(),
+            timeout_ms: 300_000,
+            persistent: false,
+        }),
+        Some(monitor_done_rx),
+    );
+
+    stdout_tx
+        .send(b"stdout-only\n".to_vec())
+        .expect("send stdout");
+    stderr_tx
+        .send(b"stderr-only\n".to_vec())
+        .expect("send stderr");
+    drop(stdout_tx);
+    drop(stderr_tx);
+    exit_tx.send(137).expect("send exit");
+    monitor_done_tx
+        .send(Some(CommandMonitorTerminationReason::TimedOut))
+        .expect("finish monitor worker");
+
+    let event = rx_event.recv().await.expect("command end event");
+    let EventMsg::ItemCompleted(completed) = event.msg else {
+        panic!("expected ItemCompleted");
+    };
+    let TurnItem::CommandExecution(item) = completed.item else {
+        panic!("expected CommandExecution");
+    };
+    assert_eq!(
+        item.monitor_termination_reason,
+        Some(CommandMonitorTerminationReason::TimedOut)
+    );
+    assert_eq!(item.stdout.as_deref(), Some("stdout-only\n"));
+    assert_eq!(item.stderr.as_deref(), Some("stderr-only\n"));
+    let aggregated = item
+        .aggregated_output
+        .as_deref()
+        .expect("monitor completion should retain combined output");
+    assert!(aggregated.contains("stdout-only\n"));
+    assert!(aggregated.contains("stderr-only\n"));
 
     Ok(())
 }

@@ -285,6 +285,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    sess.begin_session_runtime_shutdown();
     let startup_prewarm = {
         let mut state = sess.state.lock().await;
         // Stop admission and take the current warmup together so resume cannot replace it.
@@ -322,6 +323,14 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
     emit_thread_stop_lifecycle(sess).await;
+    sess.services
+        .unified_exec_manager
+        .cleanup_monitor_output_files()
+        .await;
+    // Defense in depth after monitor workers have been joined (or bounded out):
+    // the closed start gate prevents resurrection while this clears any task
+    // that was linearized immediately before shutdown began.
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {
