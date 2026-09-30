@@ -432,5 +432,8 @@ pub(crate) use process::TERMINATE_CONFIRMATION_TIMEOUT;
 pub(crate) use process_tests::blocking_terminate_remote_process;
 #[cfg(test)]
 #[cfg(unix)]
+pub(crate) use process_tests::completed_monitor_process_for_test;
+#[cfg(test)]
+#[cfg(unix)]
 #[path = "mod_tests.rs"]
 mod tests;

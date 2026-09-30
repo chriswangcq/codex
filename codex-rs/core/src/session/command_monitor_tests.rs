@@ -272,6 +272,85 @@ async fn deadline_reports_termination_failure_without_marking_monitor_killed() {
     assert!(!process.has_exited());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn deadline_published_during_finalization_delivers_once_and_preserves_external_stop() {
+    for stop_reason in [
+        None,
+        Some(MonitorStopReason::User),
+        Some(MonitorStopReason::SessionShutdown),
+    ] {
+        let (session, _turn_context, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        // A reservation receives the notification without starting a model task.
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+        let (process, output, termination_calls) =
+            crate::unified_exec::completed_monitor_process_for_test().await;
+        let stop_guard = process.begin_monitor_stop();
+        let (stop_tx, stop_rx) = watch::channel(None);
+        let deadline_fired = Arc::new(AtomicBool::new(false));
+        let deadline_stop_error = Arc::new(StdMutex::new(None));
+        let deadline_notify = Arc::new(Notify::new());
+        let deadline_cancel = CancellationToken::new();
+        let monitor = CommandMonitorInfo {
+            task_id: "bdeadline-finalization".to_string(),
+            description: "finalization ordering".to_string(),
+            timeout_ms: 1_000,
+            persistent: false,
+        };
+        let temp_dir = tempfile::tempdir().expect("temporary archive directory");
+        let output_file = temp_dir.path().join("monitor.output");
+        let session_ref = Arc::downgrade(&session);
+        let worker = run_monitor_worker(
+            &session_ref,
+            "call-finalizing-monitor",
+            "turn-finalizing-monitor",
+            &monitor,
+            &output,
+            &output_file,
+            stop_rx,
+            &process,
+            &deadline_fired,
+            &deadline_stop_error,
+            &deadline_notify,
+            &deadline_cancel,
+            MonitorArchiveBudget::with_cap(u64::MAX),
+        );
+        tokio::pin!(worker);
+        tokio::select! {
+            _ = deadline_cancel.cancelled() => {}
+            status = &mut worker => panic!("worker crossed the held stop guard: {status:?}"),
+        }
+        assert!(!deadline_fired.load(Ordering::Acquire));
+        // The supervisor publishes its result only after root/output closure
+        // lets the worker enter finalization, then releases the stop guard.
+        deadline_fired.store(true, Ordering::Release);
+        if let Some(reason) = stop_reason {
+            stop_tx
+                .send(Some(reason))
+                .expect("worker still owns stop receiver");
+        }
+        drop(stop_guard);
+        assert_eq!(worker.await, MonitorTaskStatus::Killed);
+        assert_eq!(termination_calls.load(Ordering::SeqCst), 0);
+
+        let mut deltas = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventMsg::ExecCommandOutputDelta(delta) = event.msg {
+                assert_eq!(delta.call_id, "call-finalizing-monitor");
+                deltas.push(String::from_utf8(delta.chunk).expect("monitor UTF-8 event"));
+            }
+        }
+        let expected = match stop_reason {
+            None => vec!["[Monitor timed out — re-arm if needed.]"],
+            Some(MonitorStopReason::User) => vec!["[Monitor stopped]"],
+            Some(MonitorStopReason::SessionShutdown) => Vec::new(),
+            Some(MonitorStopReason::Capacity) => unreachable!(),
+        };
+        assert_eq!(deltas, expected);
+    }
+}
+
 #[test]
 fn natural_completion_requires_normal_output_completion() {
     assert!(monitor_worker_ready_to_finalize(

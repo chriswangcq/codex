@@ -130,6 +130,45 @@ pub(super) async fn remote_process(
         .expect("remote process should start")
 }
 
+pub(crate) async fn completed_monitor_process_for_test()
+-> (Arc<UnifiedExecProcess>, OutputHandles, Arc<AtomicUsize>) {
+    let termination_attempts = Arc::new(AtomicUsize::new(0));
+    let terminator_attempts = Arc::clone(&termination_attempts);
+    let (writer_tx, _writer_rx) = mpsc::channel(1);
+    let (stdout_tx, stdout_rx) = broadcast::channel(1);
+    drop(stdout_tx);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    exit_tx
+        .send(0)
+        .expect("driver exit receiver should be open");
+    let spawned = codex_utils_pty::spawn_from_driver(codex_utils_pty::ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(move |_mode| {
+            terminator_attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })),
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+    let process = Arc::new(
+        UnifiedExecProcess::from_spawned(
+            spawned,
+            codex_sandboxing::SandboxType::None,
+            Box::new(crate::unified_exec::NoopSpawnLifecycle),
+            /*capture_monitor_output*/ true,
+        )
+        .await
+        .expect("completed monitor process should start"),
+    );
+    let output = process.output_handles().clone();
+    (process, output, termination_attempts)
+}
+
 pub(crate) async fn blocking_terminate_remote_process(
     capture_monitor_output: bool,
 ) -> UnifiedExecProcess {

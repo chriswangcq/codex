@@ -543,6 +543,10 @@ async fn run_monitor_worker(
                     stop_kind = Some(MonitorWorkerStop::External(reason));
                     continue;
                 }
+                if deadline_fired.load(Ordering::Acquire) {
+                    stop_kind = Some(MonitorWorkerStop::Deadline);
+                    continue;
+                }
             }
             if let Err(err) = file.flush().await
                 && stop_kind.is_none()

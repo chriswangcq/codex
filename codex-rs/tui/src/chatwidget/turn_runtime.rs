@@ -165,18 +165,26 @@ impl ChatWidget {
             .unified_exec_processes
             .len()
             .saturating_sub(monitor_count);
-        let completion = completion
-            .map(|completion| completion.with_background_processes(shell_count, monitor_count));
+        let completion = completion.map(|completion| {
+            if monitor_count > 0 {
+                completion.with_background_processes(shell_count, monitor_count)
+            } else {
+                completion
+            }
+        });
         if let Some(completion) = completion {
             self.add_to_history(completion.with_runtime_metrics(runtime_metrics));
         } else if runtime_metrics.is_some() || monitor_count > 0 {
-            self.add_to_history(
-                history_cell::FinalMessageSeparator::new(
-                    /*elapsed_seconds*/ None,
-                    runtime_metrics,
-                )
-                .with_background_processes(shell_count, monitor_count),
+            let separator = history_cell::FinalMessageSeparator::new(
+                /*elapsed_seconds*/ None,
+                runtime_metrics,
             );
+            let separator = if monitor_count > 0 {
+                separator.with_background_processes(shell_count, monitor_count)
+            } else {
+                separator
+            };
+            self.add_to_history(separator);
         }
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
         if !from_replay {

@@ -161,6 +161,10 @@ $CODEX_HOME/monitor-tasks/<thread-id>/<task-id>.output
 On Unix, the per-thread directory is set to mode `0700` and new archive files use mode `0600`.
 Monitor archives share a 5 GiB budget. When the cap is reached, capture records a truncation marker
 instead of allowing unbounded disk growth.
+The current exec-server backend also retains a bounded output window. If archive capture
+falls behind that window, recovery records an archive-gap marker and reports truncation;
+it does not present the recovered tail as a complete log. Large bursts can therefore leave
+a marked gap even before the shared disk budget is reached.
 
 Controlled session shutdown requests monitor termination, waits for workers with bounded grace
 periods, aborts workers that do not finish, and removes archives whose workers are no longer live.
@@ -241,6 +245,9 @@ The migration preserves upstream atomic pending/transcript buffering, AsyncFd PT
 executor environments, Guardian policy, plugin metrics, task timeouts, latest model selection,
 and paginated history. Monitor wakeups use the current turn-input admission path, with a
 reservation check so a delayed monitor start cannot overwrite newer user work.
+Confirmed stops use an explicit executor Force request so descendants holding output pipes
+can be stopped after the root shell exits. Ordinary termination requests retain their existing
+wire representation and behavior. PTY readers keep draining discarded output through EOF.
 
 Stable and experimental app-server exports, JSON schemas, TypeScript types, and Python SDK
 types have been regenerated from the merged protocol. The released CLI must have a real

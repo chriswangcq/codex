@@ -204,20 +204,6 @@ impl ChatWidget {
             let _ = self.track_unified_exec_process_end(id, process_id.as_deref());
             return;
         }
-        if from_replay
-            && matches!(
-                source,
-                ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup
-            )
-            && matches!(
-                status,
-                codex_app_server_protocol::CommandExecutionStatus::Completed
-                    | codex_app_server_protocol::CommandExecutionStatus::Failed
-            )
-        {
-            self.handle_command_execution_completed_now(item);
-            return;
-        }
         if is_unified_exec_source(*source) {
             if let Some(process_id) = process_id.as_deref()
                 && self
