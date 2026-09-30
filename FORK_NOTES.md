@@ -17,7 +17,9 @@ release evidence applies only to the recorded source and validated host.
 - Upstream commit subject: `Bind the app-server time provider to a local variable (#49411)`
 - Claude Code behavioral reference: 2.1.223, inspected locally on 2026-08-07
 - Current status: command-monitor feature rebased onto the September 30 upstream baseline;
-  validation of the migrated release is in progress
+  focused automated validation passed; live-model smoke and installation remain pending
+- Current validated code commit: `ed0991f270`
+- September release version: `0.161.0-monitor.20260930`
 - Synchronization decision: the user requested and confirmed preservation of monitor while
   rebasing onto current upstream on 2026-09-30
 - P2 status: paused; additional platforms, remote monitor support, and WebSocket monitor support
@@ -255,8 +257,65 @@ client version rather than the upstream development placeholder `0.0.0`: the ser
 that version for model-catalog eligibility. The release preparation records the package
 version and exact code commit alongside the installed artifact.
 
-Current validation results will be recorded here when the migrated checks complete. The
-August evidence below remains historical, and additional platforms remain unvalidated.
+### Current validation ledger (2026-09-30)
+
+This ledger applies to code commit `ed0991f270`, rebased onto
+`eefe0ce1a8e39788a4de7ef5bafd47e51339610b`, for release
+`0.161.0-monitor.20260930` on macOS Apple Silicon. The focused groups below overlap;
+their counts are not additive. The August ledger remains historical, and additional
+platforms remain unvalidated.
+
+| Scope | Recorded result | Interpretation |
+| --- | --- | --- |
+| Focused validation | 413 / 413 passed | PASS for the selected automated scopes |
+| Final regressions | 132 / 132 passed | PASS after the final migration fixes |
+| Monitor end-to-end scenarios | 3 / 3 passed | PASS for the selected monitor lifecycle scenarios |
+| Scenario and Guardian coverage | 55 / 55 passed | PASS with reviewed tool-inventory snapshot updates |
+| Local HTTP/2 gRPC rerun | 1 / 1 passed with `NO_PROXY` / `no_proxy` covering loopback | PASS for this isolated rerun; does not establish that every original gRPC failure is resolved |
+| Cursor rendering rerun | 6 / 6 passed with `NO_COLOR` unset | PASS under the recorded rendering environment |
+| Broad supported workspace suite | 20,972 passed; 113 failed; 16 timed out; 64 skipped | NOT GREEN. This is the recorded broad-run result, not a final passing full-workspace result |
+| Voice-host / GStreamer target | Excluded from the supported run because GStreamer 1.28 is unavailable | NOT VALIDATED on this host; the original complete workspace suite did not pass |
+| Release live-model selection and monitor smoke | Latest-model call and same-thread `gpt-6.1-sol` to `gpt-6-sol` switch passed; monitor start, background listing, output-triggered automatic follow-up, and cleanup passed | PASS against the live model service using the final packaged binary |
+| Actual local installation and installed-entry smoke | Both `codex` and `codex-monitor` report `0.161.0-monitor.20260930`; installed command execution, model catalog, adjacent Code Mode JavaScript execution, and resource copies passed | PASS; desktop Codex was retained |
+
+The final locked, optimized release build completed successfully. The native CLI and adjacent
+Code Mode host are installed under `~/.local/lib/codex-0.161.0-monitor.20260930-macos-arm64`.
+`~/.local/bin/codex`, `codex-monitor`, and `/opt/homebrew/bin/codex` point to that package;
+old CLI entrypoints were backed up, and the running desktop Codex was preserved. The complete
+Apple Silicon distribution includes an installer, patched zsh, portable ripgrep, third-party
+licenses, the release-only version patch, a build record, and SHA-256 checksums. A real isolated
+HOME installation verified exact binary/resource copies and both entrypoints before local deployment.
+
+| Final artifact | SHA-256 |
+| --- | --- |
+| `bin/codex` | `312db248392a33d37c26472f7837e8500a40d4dae1cf5f66516c881a1d07374d` |
+| `bin/codex-code-mode-host` | `35026861df4360685a3cf1fc5402a42217fe9071a41cb41a2882c300414317c4` |
+
+`/model` is available during an active main-thread task. Changes update later turns, including
+later monitor wakeups; they do not replace an in-flight request. Stop a stuck current request
+before continuing with the newly selected model. Side conversations and unavailable-thread or
+model-catalog states retain upstream restrictions.
+
+The migration checks found and fixed a deadline-finalization race: a monitor worker could
+observe process/output closure while the deadline supervisor was still confirming termination,
+then return without the timeout notification. The worker now resolves that stop and dispatches
+the deadline notification exactly once, while preserving external user-stop and shutdown
+priority. A controlled stop-guard regression and the selected monitor end-to-end rerun cover
+this ordering.
+
+The final fixes also restore ordinary background-terminal footer behavior and termination
+replay, and migrate the reviewed scenario snapshots to the current monitor/tool inventory.
+Snapshot updates preserve the message/request sequences; unrelated history changes are not
+accepted merely to make the suite pass.
+
+Some remaining broad-run failures have concrete host evidence: the macOS system HTTP proxy
+intercepts loopback HTTP/2 until the isolated gRPC test bypasses it, and this host resolves
+`example.com` to `198.18.0.212`, which the managed network proxy correctly rejects as a
+non-public address. Cursor cases passed with the recorded `NO_COLOR` adjustment. Other
+network, MCP, startup, snapshot, and timeout failures have not all been individually resolved
+or proven to be environment-only. They remain open host/baseline failures requiring separate
+triage; the focused passing runs do not erase them or justify declaring the original broad
+suite green.
 
 ## Historical Validation Ledger (2026-08-07)
 
