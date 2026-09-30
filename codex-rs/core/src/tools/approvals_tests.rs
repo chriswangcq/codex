@@ -263,7 +263,9 @@ fn monitor_metadata_survives_guardian_request_projection() {
     };
 
     assert_eq!(
-        action.into_guardian_request(Some(PathConvention::native())).expect("guardian request"),
+        action
+            .into_guardian_request(Some(PathConvention::native()))
+            .expect("guardian request"),
         crate::guardian::GuardianApprovalRequest::ExecCommand {
             id: "call-1".to_string(),
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),

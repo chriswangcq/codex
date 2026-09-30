@@ -995,17 +995,17 @@ async fn monitor_is_exposed_only_when_a_local_environment_is_available() {
         set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
         set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
         update_turn_settings_for_test(turn, |settings| {
-            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::ShellCommand;
+            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::UnifiedExec;
         });
         let TurnEnvironmentState::Ready(environment) = turn
-            .environments
+            .initial_environments
             .environments
             .first_mut()
             .expect("primary environment")
         else {
             panic!("primary environment should be ready");
         };
-        environment.environment_id = "remote".to_string();
+        environment.selection.environment_id = "remote".to_string();
         environment.environment = Arc::new(
             codex_exec_server::Environment::create_for_tests(Some(
                 "ws://127.0.0.1:1/remote-exec-server".to_string(),
@@ -1022,18 +1022,18 @@ async fn monitor_is_exposed_only_when_a_local_environment_is_available() {
         set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
         set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
         update_turn_settings_for_test(turn, |settings| {
-            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::ShellCommand;
+            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::UnifiedExec;
         });
         duplicate_primary_environment(turn);
         let TurnEnvironmentState::Ready(environment) = turn
-            .environments
+            .initial_environments
             .environments
             .first_mut()
             .expect("primary environment")
         else {
             panic!("primary environment should be ready");
         };
-        environment.environment_id = "remote".to_string();
+        environment.selection.environment_id = "remote".to_string();
         environment.environment = Arc::new(
             codex_exec_server::Environment::create_for_tests(Some(
                 "ws://127.0.0.1:1/remote-exec-server".to_string(),
@@ -1181,8 +1181,18 @@ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
         );
     })
     .await;
-    remote_environment.assert_visible_lacks(&["exec_command", "write_stdin"]);
-    remote_environment.assert_registered_lacks(&["exec_command", "write_stdin"]);
+    remote_environment.assert_visible_lacks(&[
+        "exec_command",
+        "monitor",
+        "task_stop",
+        "write_stdin",
+    ]);
+    remote_environment.assert_registered_lacks(&[
+        "exec_command",
+        "monitor",
+        "task_stop",
+        "write_stdin",
+    ]);
     assert!(!remote_environment.has_terminal_controls);
 
     let multiple_local_environments = probe(|turn| {
@@ -1193,8 +1203,18 @@ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
         duplicate_primary_environment(turn);
     })
     .await;
-    multiple_local_environments.assert_visible_lacks(&["exec_command", "write_stdin"]);
-    multiple_local_environments.assert_registered_lacks(&["exec_command", "write_stdin"]);
+    multiple_local_environments.assert_visible_lacks(&[
+        "exec_command",
+        "monitor",
+        "task_stop",
+        "write_stdin",
+    ]);
+    multiple_local_environments.assert_registered_lacks(&[
+        "exec_command",
+        "monitor",
+        "task_stop",
+        "write_stdin",
+    ]);
 }
 
 #[tokio::test]
@@ -1368,6 +1388,8 @@ async fn environment_count_controls_environment_backed_tools() {
     })
     .await;
     no_environment.assert_visible_lacks(&[
+        "monitor",
+        "task_stop",
         "exec_command",
         "write_stdin",
         "apply_patch",
@@ -1375,6 +1397,8 @@ async fn environment_count_controls_environment_backed_tools() {
         "request_permissions",
     ]);
     no_environment.assert_registered_lacks(&[
+        "monitor",
+        "task_stop",
         "exec_command",
         "write_stdin",
         "apply_patch",

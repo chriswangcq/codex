@@ -532,11 +532,13 @@ async fn start_if_idle(
     }
     let still_reserved = {
         let active_turn = session.active_turn.lock().await;
-        session.try_run_while_session_runtime_open(|| {
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+        session
+            .try_run_while_session_runtime_open(|| {
+                active_turn.as_ref().is_some_and(|active_turn| {
+                    active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+                })
             })
-        }).unwrap_or(false)
+            .unwrap_or(false)
     };
     if !still_reserved {
         session.clear_reserved_idle_turn(&turn_state).await;
@@ -570,7 +572,10 @@ async fn start_if_idle(
     }
     if !session
         .start_task_with_reservation(
-            turn_context, task_input, RegularTask::new(), Some(&turn_state),
+            turn_context,
+            task_input,
+            RegularTask::new(),
+            Some(&turn_state),
         )
         .await
     {
@@ -632,11 +637,12 @@ impl Session {
     ) -> CodexResult<TurnInputSubmission> {
         start_if_idle(
             self,
-            TurnInputRequest::new(SubmittedTurnInput::ResponseItem(item))
-                .on_start(TurnStartOptions {
+            TurnInputRequest::new(SubmittedTurnInput::ResponseItem(item)).on_start(
+                TurnStartOptions {
                     turn_trigger: Some("command_monitor".to_string()),
                     ..Default::default()
-                }),
+                },
+            ),
             Uuid::now_v7().to_string(),
             TurnStartKind::Monitor,
             /*expected_previous_turn_id*/ None,

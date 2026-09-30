@@ -927,6 +927,25 @@ impl ExecServerClient {
         &self,
         process_id: &ProcessId,
     ) -> Result<TerminateResponse, ExecServerError> {
+        self.terminate_with_mode(process_id, /*mode*/ None).await
+    }
+
+    pub async fn force_terminate(
+        &self,
+        process_id: &ProcessId,
+    ) -> Result<TerminateResponse, ExecServerError> {
+        self.terminate_with_mode(
+            process_id,
+            Some(crate::protocol::ProcessTerminationMode::Force),
+        )
+        .await
+    }
+
+    async fn terminate_with_mode(
+        &self,
+        process_id: &ProcessId,
+        mode: Option<crate::protocol::ProcessTerminationMode>,
+    ) -> Result<TerminateResponse, ExecServerError> {
         // A close notification may arrive before the termination response.
         if let Some(session) = self.inner.get_session(process_id) {
             session
@@ -938,6 +957,7 @@ impl ExecServerClient {
             EXEC_TERMINATE_METHOD,
             &TerminateParams {
                 process_id: process_id.clone(),
+                mode,
             },
         )
         .await
@@ -1671,6 +1691,12 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) async fn force_terminate(&self) -> Result<(), ExecServerError> {
+        self.client.force_terminate(&self.process_id).await?;
+        self.cancel_network_policy_decisions();
+        Ok(())
+    }
+
     pub(crate) fn cancel_network_policy_decisions(&self) {
         self.state
             .network_policy
@@ -1975,6 +2001,73 @@ mod tests {
             .write_all(format!("{encoded}\n").as_bytes())
             .await
             .expect("json-rpc line should write");
+    }
+
+    #[tokio::test]
+    async fn force_terminate_propagates_mode_without_changing_regular_request() {
+        let (client_stdin, server_reader) = duplex(1 << 20);
+        let (mut server_writer, client_stdout) = duplex(1 << 20);
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let initialize = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: initialize.id,
+                    result: serde_json::json!({"sessionId": "force-stop-test"}),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                read_jsonrpc_line(&mut lines).await,
+                JSONRPCMessage::Notification(notification) if notification.method == INITIALIZED_METHOD
+            ));
+            for expected in [
+                serde_json::json!({"processId": "owned-process"}),
+                serde_json::json!({"processId": "owned-process", "mode": "force"}),
+            ] {
+                let request = match read_jsonrpc_line(&mut lines).await {
+                    JSONRPCMessage::Request(request)
+                        if request.method == super::EXEC_TERMINATE_METHOD =>
+                    {
+                        request
+                    }
+                    other => panic!("expected terminate, got {other:?}"),
+                };
+                assert_eq!(request.params, Some(expected));
+                write_jsonrpc_line(
+                    &mut server_writer,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::json!({"running": false}),
+                    }),
+                )
+                .await;
+            }
+            finish_rx.await.expect("test should complete");
+        });
+        let client = ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(
+                client_stdout,
+                client_stdin,
+                "force-stop-client".to_string(),
+            ),
+            ExecServerClientConnectOptions::default(),
+        )
+        .await
+        .expect("client should connect");
+        let process_id = ProcessId::from("owned-process");
+        client.terminate(&process_id).await.expect("regular stop");
+        client
+            .force_terminate(&process_id)
+            .await
+            .expect("force stop");
+        finish_tx.send(()).expect("test should finish");
+        server.await.expect("server should finish");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -209,6 +209,7 @@ pub use protocol::NetworkPolicyRequestParams;
 pub use protocol::NetworkPolicyRequestResponse;
 pub use protocol::ProcessOutputChunk;
 pub use protocol::ProcessSignal;
+pub use protocol::ProcessTerminationMode;
 pub use protocol::ReadParams;
 pub use protocol::ReadResponse;
 pub use protocol::ShellInfo;

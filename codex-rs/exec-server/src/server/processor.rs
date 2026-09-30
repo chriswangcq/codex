@@ -604,7 +604,10 @@ mod tests {
             &mut second_writer,
             /*id*/ 2,
             EXEC_TERMINATE_METHOD,
-            &TerminateParams { process_id },
+            &TerminateParams {
+                process_id,
+                mode: None,
+            },
         )
         .await;
         let _: TerminateResponse = read_response(&mut second_lines, /*expected_id*/ 2).await;

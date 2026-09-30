@@ -229,8 +229,8 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
-mod config_refresh;
 mod command_monitor;
+mod config_refresh;
 pub(crate) mod context_window;
 mod daemon_recovery;
 mod environment;
@@ -282,9 +282,9 @@ use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
 use self::session::SessionConfiguration;
-use self::session::SessionSettingsCommit;
 #[cfg(test)]
 use self::session::SessionRuntimeGate;
+use self::session::SessionSettingsCommit;
 pub(crate) use self::session::SessionSettingsUpdate;
 #[cfg(test)]
 use self::turn::AssistantMessageStreamParsers;

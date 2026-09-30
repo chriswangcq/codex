@@ -395,6 +395,36 @@ async fn replayed_completed_monitor_renders_completion_and_aggregate() {
 }
 
 #[tokio::test]
+async fn replayed_monitor_completion_clears_running_state() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut item = begin_monitor(
+        &mut chat,
+        "monitor-call-1",
+        "401",
+        "wait-for-ready",
+        "deployment readiness",
+        "bmonitor1",
+        /*timeout_ms*/ 300_000,
+    );
+    drain_insert_history(&mut rx);
+    assert_eq!(
+        chat.bottom_pane.background_process_summary().as_deref(),
+        Some("1 monitor · ↓ to manage")
+    );
+    let AppServerThreadItem::CommandExecution {
+        status, exit_code, ..
+    } = &mut item
+    else {
+        panic!("expected command execution item");
+    };
+    *status = AppServerCommandExecutionStatus::Completed;
+    *exit_code = Some(0);
+    chat.replay_thread_item(item, "turn-1".to_string(), ReplayKind::ThreadSnapshot);
+    assert!(chat.unified_exec_processes.is_empty());
+    assert_eq!(chat.bottom_pane.background_process_summary(), None);
+}
+
+#[tokio::test]
 async fn replayed_timed_out_monitor_does_not_render_failed_exit() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     let _ = drain_insert_history(&mut rx);

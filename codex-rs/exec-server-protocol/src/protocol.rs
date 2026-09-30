@@ -533,6 +533,16 @@ pub struct SignalResponse {}
 #[serde(rename_all = "camelCase")]
 pub struct TerminateParams {
     pub process_id: ProcessId,
+    /// A checked monitor stop may terminate the retained process tree after root exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ProcessTerminationMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessTerminationMode {
+    Regular,
+    Force,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1181,6 +1191,25 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::CapabilityRootDiscoverRequest;
+
+    #[test]
+    fn process_terminate_mode_preserves_legacy_requests() -> serde_json::Result<()> {
+        let legacy = serde_json::json!({"processId": "owned-process"});
+        let params: super::TerminateParams = serde_json::from_value(legacy.clone())?;
+        assert_eq!(params.mode, None);
+        assert_eq!(serde_json::to_value(params)?, legacy);
+        let forced = super::TerminateParams {
+            process_id: "owned-process".into(),
+            mode: Some(super::ProcessTerminationMode::Force),
+        };
+        let wire = serde_json::json!({"processId": "owned-process", "mode": "force"});
+        assert_eq!(serde_json::to_value(&forced)?, wire);
+        assert_eq!(
+            serde_json::from_value::<super::TerminateParams>(wire)?,
+            forced
+        );
+        Ok(())
+    }
     #[test]
     fn discovery_v2_support_defaults_off_for_older_executors() -> serde_json::Result<()> {
         let legacy: super::EnvironmentCapabilities = serde_json::from_value(serde_json::json!({}))?;

@@ -730,12 +730,25 @@ impl LocalProcess {
                     if let Some(network_policy_shutdown) = &process.network_policy_shutdown {
                         network_policy_shutdown.cancel();
                     }
-                    if process.exit_code.is_some() {
-                        return Ok(TerminateResponse { running: false });
+                    if params.mode == Some(crate::protocol::ProcessTerminationMode::Force) {
+                        // Closed processes no longer own a live tree. Never signal a
+                        // cached numeric process group after its ownership has ended.
+                        if process.closed {
+                            return Ok(TerminateResponse { running: false });
+                        }
+                        process.session.try_request_terminate().map_err(|err| {
+                            internal_error(format!("failed to terminate process tree: {err}"))
+                        })?;
+                        process.termination_requested = true;
+                        process.exit_code.is_none()
+                    } else {
+                        if process.exit_code.is_some() {
+                            return Ok(TerminateResponse { running: false });
+                        }
+                        process.termination_requested = true;
+                        process.session.terminate();
+                        true
                     }
-                    process.termination_requested = true;
-                    process.session.terminate();
-                    true
                 }
                 Some(ProcessEntry::Starting(_)) => {
                     process_map.remove(&params.process_id);
@@ -866,6 +879,17 @@ impl LocalExecProcess {
     async fn terminate(&self) -> Result<(), ExecServerError> {
         self.backend.terminate(&self.process_id).await
     }
+
+    async fn force_terminate(&self) -> Result<(), ExecServerError> {
+        self.backend
+            .terminate_process(TerminateParams {
+                process_id: self.process_id.clone(),
+                mode: Some(crate::protocol::ProcessTerminationMode::Force),
+            })
+            .await
+            .map_err(map_handler_error)?;
+        Ok(())
+    }
 }
 
 impl ExecProcess for LocalExecProcess {
@@ -900,6 +924,10 @@ impl ExecProcess for LocalExecProcess {
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(LocalExecProcess::terminate(self))
+    }
+
+    fn force_terminate(&self) -> ExecProcessFuture<'_, ()> {
+        Box::pin(LocalExecProcess::force_terminate(self))
     }
 }
 
@@ -955,6 +983,7 @@ impl LocalProcess {
     async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError> {
         self.terminate_process(TerminateParams {
             process_id: process_id.clone(),
+            mode: None,
         })
         .await
         .map_err(map_handler_error)?;
@@ -1599,6 +1628,7 @@ mod tests {
             backend
                 .terminate_process(TerminateParams {
                     process_id: process.process_id.clone(),
+                    mode: None,
                 })
                 .await
                 .expect("terminate process"),
@@ -1635,6 +1665,7 @@ mod tests {
             backend
                 .terminate_process(TerminateParams {
                     process_id: process.process_id.clone(),
+                    mode: None,
                 })
                 .await
                 .expect("terminate exited process"),

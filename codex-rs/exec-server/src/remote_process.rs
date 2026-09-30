@@ -89,6 +89,11 @@ impl RemoteExecProcess {
         trace!("exec process terminate");
         self.session.terminate().await
     }
+
+    async fn force_terminate(&self) -> Result<(), crate::ExecServerError> {
+        trace!("exec process force terminate");
+        self.session.force_terminate().await
+    }
 }
 
 impl ExecProcess for RemoteExecProcess {
@@ -123,6 +128,10 @@ impl ExecProcess for RemoteExecProcess {
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(RemoteExecProcess::terminate(self))
+    }
+
+    fn force_terminate(&self) -> ExecProcessFuture<'_, ()> {
+        Box::pin(RemoteExecProcess::force_terminate(self))
     }
 }
 

@@ -132,14 +132,18 @@ fn monitor_tool_matches_command_contract() {
         serde_json::Value::Bool(false)
     );
     assert_eq!(
-        function.output_schema.as_ref(),
-        Some(&monitor_output_schema())
+        function
+            .output_schema
+            .as_ref()
+            .map(codex_tools::ToolOutputSchema::to_value),
+        Some(monitor_output_schema())
     );
     assert_eq!(
         function
             .output_schema
             .as_ref()
-            .expect("monitor output schema")["required"],
+            .expect("monitor output schema")
+            .to_value()["required"],
         serde_json::json!(["taskId", "timeoutMs", "persistent"])
     );
 }

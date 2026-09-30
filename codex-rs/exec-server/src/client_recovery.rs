@@ -562,6 +562,7 @@ impl Inner {
                             EXEC_TERMINATE_METHOD,
                             &TerminateParams {
                                 process_id: process_id.clone(),
+                                mode: None,
                             },
                         )
                         .await

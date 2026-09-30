@@ -180,6 +180,7 @@ impl ChatWidget {
         if let Some(monitor) = monitor {
             if from_replay {
                 self.suppressed_exec_calls.remove(id);
+                let _ = self.track_unified_exec_process_end(id, process_id.as_deref());
                 self.add_to_history(history_cell::new_monitor_completed(
                     monitor.description.clone(),
                     monitor.task_id.clone(),
@@ -188,7 +189,6 @@ impl ChatWidget {
                     aggregated_output.clone(),
                     *exit_code,
                 ));
-                self.transcript.had_work_activity = true;
                 return;
             }
             let already_rendered = self.suppressed_exec_calls.remove(id);
@@ -202,7 +202,6 @@ impl ChatWidget {
             }
 
             let _ = self.track_unified_exec_process_end(id, process_id.as_deref());
-            self.transcript.had_work_activity = true;
             return;
         }
         if from_replay

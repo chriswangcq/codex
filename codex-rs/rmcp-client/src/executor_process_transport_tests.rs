@@ -85,6 +85,10 @@ impl ExecProcess for BlockingFirstWriteProcess {
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+
+    fn force_terminate(&self) -> ExecProcessFuture<'_, ()> {
+        self.terminate()
+    }
 }
 
 struct RetainedReadProcess {
@@ -124,6 +128,10 @@ impl ExecProcess for RetainedReadProcess {
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn force_terminate(&self) -> ExecProcessFuture<'_, ()> {
+        self.terminate()
     }
 }
 

@@ -804,6 +804,24 @@ class CommandMigration(BaseModel):
     name: str
 
 
+class CommandMonitorInfo(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    description: str
+    persistent: bool
+    task_id: Annotated[str, Field(alias="taskId")]
+    timeout_ms: Annotated[int, Field(alias="timeoutMs", ge=0)]
+
+
+class CommandMonitorTerminationReason(Enum):
+    timed_out = "timedOut"
+    user_stopped = "userStopped"
+    session_shutdown = "sessionShutdown"
+    capacity = "capacity"
+    stopped = "stopped"
+
+
 class ComputerUseMacosConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9847,6 +9865,10 @@ class CommandExecutionThreadItem(BaseModel):
         int | None, Field(alias="exitCode", description="The command's exit code.")
     ] = None
     id: str
+    monitor: CommandMonitorInfo | None = None
+    monitor_termination_reason: Annotated[
+        CommandMonitorTerminationReason | None, Field(alias="monitorTerminationReason")
+    ] = None
     plugin_id: Annotated[
         str | None,
         Field(

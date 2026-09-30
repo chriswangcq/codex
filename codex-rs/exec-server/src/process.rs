@@ -215,6 +215,10 @@ pub trait ExecProcess: Send + Sync {
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()>;
+
+    /// Requests a checked stop of the owned process tree, including descendants
+    /// that retain output pipes after the root process has exited.
+    fn force_terminate(&self) -> ExecProcessFuture<'_, ()>;
 }
 
 pub type ExecProcessFuture<'a, T> =

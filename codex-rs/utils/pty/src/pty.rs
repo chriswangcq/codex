@@ -171,12 +171,6 @@ fn pty_read_error_is_eof(error: &std::io::Error) -> bool {
     ) {
         return true;
     }
-    #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::EIO) {
-        // Linux PTY masters conventionally report EIO when the final slave
-        // closes; this is the PTY equivalent of a clean EOF.
-        return true;
-    }
     false
 }
 

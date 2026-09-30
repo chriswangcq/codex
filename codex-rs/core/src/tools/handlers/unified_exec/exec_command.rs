@@ -126,7 +126,7 @@ impl MonitorToolOutput {
 }
 
 impl ToolOutput for MonitorToolOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         self.response_text()
     }
 
@@ -513,17 +513,17 @@ impl ExecCommandHandler {
             None
         } else {
             intercept_apply_patch(
-            &command,
-            &cwd,
-            fs.as_ref(),
-            turn_environment.clone(),
-            context.session.clone(),
-            Arc::clone(&context.step_context),
-            context.cancellation_token.clone(),
-            Some(&tracker),
-            &context.call_id,
-            "exec_command",
-        )
+                &command,
+                &cwd,
+                fs.as_ref(),
+                turn_environment.clone(),
+                context.session.clone(),
+                Arc::clone(&context.step_context),
+                context.cancellation_token.clone(),
+                Some(&tracker),
+                &context.call_id,
+                "exec_command",
+            )
             .await?
         };
         if let Some(output) = intercepted_patch {
@@ -591,7 +591,7 @@ impl ExecCommandHandler {
                     }));
                 }
                 Ok(boxed_tool_output(response))
-            },
+            }
             Err(UnifiedExecError::SandboxDenied {
                 output,
                 original_token_count,

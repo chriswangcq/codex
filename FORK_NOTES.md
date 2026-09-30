@@ -1,29 +1,30 @@
 # Codex Command Monitor Fork Notes
 
 This document is the maintenance contract for the local command-monitor fork of Codex CLI. It
-describes the frozen upstream baseline, the behavior this fork intends to preserve, what has and
+describes the upstream baseline, the behavior this fork intends to preserve, what has and
 has not been validated, and the boundaries that matter if upstream synchronization is considered
 later.
 
 This is a local fork. It is not an upstream proposal or a public compatibility promise. The
-artifact recorded below is the stable local P0/P1 build for the validated host only.
+release evidence applies only to the recorded source and validated host.
 
 ## Status Snapshot
 
 - Fork branch: `codex/command-monitor`
 - Upstream repository: `https://github.com/openai/codex.git`
-- Frozen upstream commit: `57f42a81131ccf5933e7ec5dc659c381eeb5d72b`
-- Upstream commit date: 2026-08-06
-- Upstream commit subject: `Avoid cloning immutable metadata on tool search cache hits (#37279)`
+- Upstream baseline: `eefe0ce1a8e39788a4de7ef5bafd47e51339610b`
+- Upstream commit date: 2026-09-30
+- Upstream commit subject: `Bind the app-server time provider to a local variable (#49411)`
 - Claude Code behavioral reference: 2.1.223, inspected locally on 2026-08-07
-- Current status: stable local P0/P1 release recorded against code commit `4c5e9ff572`; P2 is
-  intentionally paused
-- Synchronization policy: do not merge or rebase upstream unless a separate synchronization
-  decision is made
+- Current status: command-monitor feature rebased onto the September 30 upstream baseline;
+  validation of the migrated release is in progress
+- Synchronization decision: the user requested and confirmed preservation of monitor while
+  rebasing onto current upstream on 2026-09-30
 - P2 status: paused; additional platforms, remote monitor support, and WebSocket monitor support
   are not on the current implementation plan
 
-The frozen SHA, not a moving upstream branch, is the authority for the base of this fork.
+The recorded SHA is the authority for this release baseline. The original August fork is
+preserved by `backup/command-monitor-before-rebase-20260930`.
 
 ## What This Fork Adds
 
@@ -232,9 +233,28 @@ TUI output is intentionally bounded:
 Ordinary background terminals retain their existing behavior; monitor metadata is optional, so
 old command history and non-monitor commands remain representable.
 
-## Validation Ledger
+## Upstream synchronization (2026-09-30)
 
-This ledger records evidence against the current P0/P1 implementation on 2026-08-07. Counts include
+The monitor feature and its documentation commits have been rebased onto
+`eefe0ce1a8e39788a4de7ef5bafd47e51339610b`. Monitor remains an extension of unified exec.
+The migration preserves upstream atomic pending/transcript buffering, AsyncFd PTY reads,
+executor environments, Guardian policy, plugin metrics, task timeouts, latest model selection,
+and paginated history. Monitor wakeups use the current turn-input admission path, with a
+reservation check so a delayed monitor start cannot overwrite newer user work.
+
+Stable and experimental app-server exports, JSON schemas, TypeScript types, and Python SDK
+types have been regenerated from the merged protocol. The released CLI must have a real
+client version rather than the upstream development placeholder `0.0.0`: the service uses
+that version for model-catalog eligibility. The release preparation records the package
+version and exact code commit alongside the installed artifact.
+
+Current validation results will be recorded here when the migrated checks complete. The
+August evidence below remains historical, and additional platforms remain unvalidated.
+
+## Historical Validation Ledger (2026-08-07)
+
+These results apply to the original August baseline and do not validate the September migration.
+Counts include
 the current optional termination-reason path and regenerated protocol artifacts.
 
 Status vocabulary:
@@ -312,26 +332,32 @@ Release finalization completed on 2026-08-07:
 
 ## Reproducible Build and Installation
 
-The stable local artifact was built from the committed P0/P1 code with locked dependencies. Use
-the same command when rebuilding it:
+The September release uses a separate, detached preparation checkout of the recorded code
+commit. In that checkout, set `[workspace.package].version` in `codex-rs/Cargo.toml` to
+`0.161.0-monitor.20260930`, then run `cargo update --workspace --offline` from `codex-rs`.
+This updates workspace package versions in the lockfile without changing external dependency
+versions. Keep the development checkout at the upstream version, and record this release-only
+patch alongside the artifact. A CLI built as `0.0.0` can be denied newer models by the service.
 
-From `codex-rs`:
+Build with the pinned toolchain from that preparation checkout's `codex-rs` directory:
 
 ```sh
 rustc -V
 cargo -V
-cargo build --locked --release -p codex-cli --bin codex
-cargo build --locked --release -p codex-code-mode-host --bin codex-code-mode-host
+cargo rustc --locked --release -p codex-cli --bin codex -- -C lto=no
+cargo rustc --locked --release -p codex-code-mode-host --bin codex-code-mode-host -- -C lto=no
 ./target/release/codex --version
 ./target/release/codex-code-mode-host --help
 shasum -a 256 target/release/codex target/release/codex-code-mode-host
 ```
 
-The repository pins Rust 1.95.0 in `codex-rs/rust-toolchain.toml`. Record the exact `rustc -V`,
+The September build retains release optimization and cached optimized dependencies, and disables
+LTO only for the final executable to reduce link time. The repository pins Rust 1.95.0 in
+`codex-rs/rust-toolchain.toml`. Record the exact `rustc -V`,
 `cargo -V`, fork commit, baseline commit, target triple, and SHA-256 alongside any distributed
 binary.
 
-### Recorded local artifact
+### Historical local artifact (2026-08-07)
 
 | Property | Recorded value |
 | --- | --- |

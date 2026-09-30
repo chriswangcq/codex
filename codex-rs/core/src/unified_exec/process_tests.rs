@@ -99,6 +99,10 @@ impl ExecProcess for MockExecProcess {
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(MockExecProcess::terminate(self))
     }
+
+    fn force_terminate(&self) -> ExecProcessFuture<'_, ()> {
+        ExecProcess::terminate(self)
+    }
 }
 
 pub(super) async fn remote_process(
@@ -446,9 +450,19 @@ async fn remote_process_preserves_executor_sandbox_type() {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum TerminationTestRoute {
+    DirectPty,
+    LocalExecBackend,
+}
+
+#[cfg(unix)]
+#[test_case::test_case(TerminationTestRoute::DirectPty; "direct_pty")]
+#[test_case::test_case(TerminationTestRoute::LocalExecBackend; "default_local_exec_backend")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_terminate_confirmed_kills_descendant_after_shell_exit_and_closes_output()
--> anyhow::Result<()> {
+async fn terminate_confirmed_kills_descendant_after_shell_exit_and_closes_output(
+    route: TerminationTestRoute,
+) -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let pid_file = temp_dir.path().join("background.pid");
     let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
@@ -456,25 +470,65 @@ async fn local_terminate_confirmed_kills_descendant_after_shell_exit_and_closes_
         "CODEX_MONITOR_TEST_PID_FILE".to_string(),
         pid_file.to_string_lossy().into_owned(),
     );
-    let spawned = codex_utils_pty::spawn_pipe_process(
-        "/bin/sh",
-        &[
-            "-c".to_string(),
-            "sleep 300 & bg=$!; printf '%s' \"$bg\" >\"$CODEX_MONITOR_TEST_PID_FILE\"".to_string(),
-        ],
-        std::path::Path::new("."),
-        &env,
-        &None,
-        &[],
-    )
-    .await?;
-    let process = UnifiedExecProcess::from_spawned(
-        spawned,
-        codex_sandboxing::SandboxType::None,
-        Box::new(crate::unified_exec::NoopSpawnLifecycle),
-        /*capture_monitor_output*/ true,
-    )
-    .await?;
+    let command = vec![
+        "-c".to_string(),
+        "sleep 300 & bg=$!; printf '%s' \"$bg\" >\"$CODEX_MONITOR_TEST_PID_FILE\"".to_string(),
+    ];
+    let (process, executor_process) = match route {
+        TerminationTestRoute::DirectPty => {
+            let spawned = codex_utils_pty::spawn_pipe_process(
+                "/bin/sh",
+                &command,
+                temp_dir.path(),
+                &env,
+                &None,
+                &[],
+            )
+            .await?;
+            (
+                UnifiedExecProcess::from_spawned(
+                    spawned,
+                    codex_sandboxing::SandboxType::None,
+                    Box::new(crate::unified_exec::NoopSpawnLifecycle),
+                    /*capture_monitor_output*/ true,
+                )
+                .await?,
+                None,
+            )
+        }
+        TerminationTestRoute::LocalExecBackend => {
+            let environment = codex_exec_server::Environment::default_for_tests();
+            let mut argv = vec!["/bin/sh".to_string()];
+            argv.extend(command);
+            let started = environment
+                .get_exec_backend()
+                .start(codex_exec_server::ExecParams {
+                    process_id: "monitor-force-descendant".to_string().into(),
+                    metadata: None,
+                    argv,
+                    cwd: codex_utils_path_uri::PathUri::from_host_native_path(temp_dir.path())?,
+                    env_policy: None,
+                    shell_snapshot: None,
+                    env,
+                    tty: false,
+                    pipe_stdin: false,
+                    arg0: None,
+                    sandbox: None,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                    network_proxy: None,
+                })
+                .await?;
+            let executor_process = Arc::clone(&started.process);
+            (
+                UnifiedExecProcess::from_exec_server_started(
+                    started, /*capture_monitor_output*/ true,
+                )
+                .await?,
+                Some(executor_process),
+            )
+        }
+    };
     let mut capture_rx = process
         .output_handles()
         .take_monitor_capture()
@@ -507,6 +561,18 @@ async fn local_terminate_confirmed_kills_descendant_after_shell_exit_and_closes_
             .load(Ordering::Acquire),
         "the descendant should still hold the output pipes open"
     );
+
+    if let Some(executor_process) = executor_process {
+        executor_process.terminate().await?;
+        assert!(unix_process_exists(background_pid)?);
+        assert!(
+            !process
+                .output_handles()
+                .output_closed
+                .load(Ordering::Acquire),
+            "regular executor termination preserves post-root-exit descendants"
+        );
+    }
 
     process.terminate_confirmed().await?;
 
@@ -559,6 +625,94 @@ fn unix_process_exists(pid: i32) -> std::io::Result<bool> {
     } else {
         Err(err)
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_capture_reports_retained_output_gap_from_default_local_exec_backend()
+-> anyhow::Result<()> {
+    const OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+    let directory = tempfile::tempdir()?;
+    let environment = codex_exec_server::Environment::default_for_tests();
+    let started = environment
+        .get_exec_backend()
+        .start(codex_exec_server::ExecParams {
+            process_id: "monitor-retained-output-gap".to_string().into(),
+            metadata: None,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("head -c {OUTPUT_BYTES} /dev/zero"),
+            ],
+            cwd: codex_utils_path_uri::PathUri::from_host_native_path(directory.path())?,
+            env_policy: None,
+            shell_snapshot: None,
+            env: std::env::vars().collect(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    let executor_process = Arc::clone(&started.process);
+    let process =
+        UnifiedExecProcess::from_exec_server_started(started, /*capture_monitor_output*/ true)
+            .await?;
+    let mut capture = process
+        .output_handles()
+        .take_monitor_capture()
+        .expect("monitor capture should be available");
+
+    // Hold off archive consumption until the executor has produced more than
+    // its retained window. Capture backpressure cannot stop the executor's
+    // broadcast producer, so recovery must acknowledge the missing bytes.
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        loop {
+            let response = executor_process
+                .read(
+                    /*after_seq*/ None,
+                    /*max_bytes*/ Some(1),
+                    /*wait_ms*/ Some(0),
+                )
+                .await?;
+            if response.closed && capture.is_full() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        Ok::<(), codex_exec_server::ExecServerError>(())
+    })
+    .await??;
+
+    let (gap_reported, captured_bytes) =
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let mut gap_reported = false;
+            let mut captured_bytes = 0;
+            while let Some(chunk) = capture.recv().await {
+                match chunk {
+                    MonitorOutputChunk::Output { bytes, .. } => captured_bytes += bytes.len(),
+                    MonitorOutputChunk::StdoutClosed => {}
+                    MonitorOutputChunk::ArchiveGap => gap_reported = true,
+                }
+            }
+            (gap_reported, captured_bytes)
+        })
+        .await?;
+    assert!(
+        captured_bytes < OUTPUT_BYTES,
+        "test must exceed retained output"
+    );
+    assert!(
+        gap_reported,
+        "lost executor output must mark the archive incomplete"
+    );
+    assert!(process.has_exited());
+    assert!(process.output_completed_normally());
+    assert!(process.output_task_finished());
+    Ok(())
 }
 
 #[tokio::test]

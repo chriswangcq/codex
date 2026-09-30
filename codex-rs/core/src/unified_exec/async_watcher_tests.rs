@@ -121,6 +121,8 @@ async fn completed_output_preserves_bytes_before_subscription(
         Instant::now(),
         /*network_denial_monitor*/ None,
         /*plugin_metrics_sidecar*/ None,
+        /*monitor*/ None,
+        /*monitor_done*/ None,
     );
     stdout_tx.send(late_output.to_vec())?;
     drop(stdout_tx);

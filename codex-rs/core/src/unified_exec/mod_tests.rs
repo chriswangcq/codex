@@ -297,6 +297,10 @@ impl ExecProcess for BlockingTerminateExecProcess {
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(BlockingTerminateExecProcess::terminate(self))
     }
+
+    fn force_terminate(&self) -> ExecProcessFuture<'_, ()> {
+        ExecProcess::terminate(self)
+    }
 }
 
 async fn blocking_terminate_unified_process(

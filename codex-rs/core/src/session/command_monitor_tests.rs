@@ -1011,16 +1011,55 @@ async fn monitor_idle_notification_wakes_plan_mode() {
         crate::session::tests::make_session_and_context_with_rx().await;
     let mut collaboration_mode = session.collaboration_mode().await;
     collaboration_mode.mode = codex_protocol::config_types::ModeKind::Plan;
-    session.update_settings(super::super::session::SessionSettingsUpdate {
-        step_settings: super::super::step_settings::StepSettingsUpdate {
-            collaboration_mode: Some(collaboration_mode),
+    session
+        .update_settings(super::super::session::SessionSettingsUpdate {
+            step_settings: super::super::step_settings::StepSettingsUpdate {
+                collaboration_mode: Some(collaboration_mode),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    }).await.expect("apply Plan mode");
+        })
+        .await
+        .expect("apply Plan mode");
     assert!(matches!(
-        session.try_start_monitor_turn_if_idle(text_response_item("monitor event".to_string())).await,
+        session
+            .try_start_monitor_turn_if_idle(text_response_item("monitor event".to_string()))
+            .await,
         Ok(TurnInputSubmission::Started { .. }),
     ));
-    session.abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted).await;
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+}
+
+// Hold the active-turn lock to replace the reservation before installation resumes.
+#[allow(clippy::await_holding_invalid_type)]
+#[tokio::test]
+async fn replaced_monitor_reservation_cannot_start_over_user_work() {
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut active = session.active_turn.lock().await;
+    let reserved = crate::state::ActiveTurn::default();
+    let reserved_state = Arc::clone(&reserved.turn_state);
+    *active = Some(reserved);
+    let mut start = Box::pin(session.start_task_with_reservation(
+        turn_context,
+        Vec::new(),
+        RunCountingTask {
+            runs: Arc::clone(&runs),
+        },
+        Some(&reserved_state),
+    ));
+    assert!(matches!(futures::poll!(start.as_mut()), Poll::Pending));
+    let replacement = crate::state::ActiveTurn::default();
+    let replacement_state = Arc::clone(&replacement.turn_state);
+    *active = Some(replacement);
+    drop(active);
+    assert!(!start.await);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    let active = session.active_turn.lock().await;
+    assert!(active.as_ref().is_some_and(|turn| {
+        turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, &replacement_state)
+    }));
 }

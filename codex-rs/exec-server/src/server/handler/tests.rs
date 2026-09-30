@@ -151,6 +151,7 @@ async fn terminate_reports_false_after_process_exit() {
         let response = handler
             .terminate(TerminateParams {
                 process_id: ProcessId::from("proc-1"),
+                mode: None,
             })
             .await
             .expect("terminate response");

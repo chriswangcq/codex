@@ -151,7 +151,7 @@ pub(crate) fn create_monitor_tool(include_environment_id: bool) -> ToolSpec {
             Some(vec!["command".to_string(), "description".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(monitor_output_schema()),
+        output_schema: Some(monitor_output_schema().into()),
     })
 }
 

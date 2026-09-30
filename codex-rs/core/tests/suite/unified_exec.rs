@@ -2508,7 +2508,7 @@ async fn command_monitor_output_starts_a_follow_up_turn() -> Result<()> {
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     let args = serde_json::json!({
         "command": "sleep 1; printf 'deployment-ready\\n'; sleep 2",
         "description": "deployment readiness",
@@ -2581,7 +2581,7 @@ async fn command_monitor_timeout_survives_output_streams_closing_before_process_
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     let pid_path = test.workspace_path("closed-monitor-streams.pid");
     let command = format!(
         "printf '%s' $$ > '{}'; exec 1>&- 2>&-; exec sleep 3000",
@@ -2719,7 +2719,7 @@ async fn task_stop_terminates_a_persistent_command_monitor_by_task_id() -> Resul
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     let pid_path = test.workspace_path("monitor.pid");
     let pid_path_str = pid_path.to_string_lossy();
     let command = format!("printf '%s' $$ > '{pid_path_str}' && exec sleep 3000");

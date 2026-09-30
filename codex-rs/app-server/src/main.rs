@@ -4,7 +4,6 @@ use clap::Parser;
 use codex_app_server::AppServerCodeModeHostArgs;
 use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
-use codex_app_server::PluginStartupTasks;
 use codex_app_server::run_main_with_transport_options;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;

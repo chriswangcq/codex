@@ -2646,6 +2646,8 @@ mod tests {
         .await;
         let _started = recv_broadcast_notification(&mut rx).await?;
         let expected_item = ThreadItem::CommandExecution {
+            model_context: completion_item.model_context.clone(),
+            sandbox_type: None,
             id: "cmd-1".to_string(),
             plugin_id: completion_item.plugin_id.clone(),
             script_path: completion_item.script_path.clone(),
@@ -2954,6 +2956,7 @@ mod tests {
                 &conversation_id,
                 execve_turn_id.to_string(),
                 execve_item_id.to_string(),
+                execve_parent.model_context.clone(),
                 execve_parent.plugin_id.clone(),
                 execve_parent.script_path.clone(),
                 execve_parent.command.clone(),

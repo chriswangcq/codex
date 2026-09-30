@@ -233,7 +233,7 @@ impl ChatWidget {
             && !self.unified_exec_processes.is_empty()
         {
             self.show_background_processes();
-            return;
+            return KeyEventAction::None;
         }
 
         match key_event {

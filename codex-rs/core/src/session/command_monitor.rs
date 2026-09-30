@@ -2093,7 +2093,7 @@ async fn enqueue_monitor_items(session: &Arc<Session>, input: Vec<TurnInput>) {
     let items = input
         .into_iter()
         .filter_map(|input| match input {
-            TurnInput::ResponseItem(item) => Some(item.item),
+            TurnInput::ResponseItem(item) | TurnInput::FunctionCallOutput(item) => Some(item.item),
             TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => None,
         })
         .collect::<Vec<_>>();

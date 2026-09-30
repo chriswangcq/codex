@@ -2002,7 +2002,7 @@ async fn turn_complete_footer_includes_running_monitor() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        combined.contains("Baked for 1m 01s · 1 monitor still running"),
+        combined.contains("Baked for 1m 1s · 1 monitor still running"),
         "expected running monitor in the existing turn footer, got:\n{combined}"
     );
     assert_chatwidget_snapshot!("turn_complete_footer_running_monitor", combined);

@@ -644,7 +644,7 @@ impl UnifiedExecProcess {
                         return Err(UnifiedExecError::process_failed(message));
                     }
                     let mut state_rx = self.state_rx.clone();
-                    let terminate_request = process_handle.terminate();
+                    let terminate_request = process_handle.force_terminate();
                     tokio::pin!(terminate_request);
                     let mut terminate_acknowledged = false;
                     loop {
@@ -948,6 +948,7 @@ impl UnifiedExecProcess {
         tokio::spawn(async move {
             let mut output_task_guard = output_task_guard;
             let mut last_seq: u64 = 0;
+            let mut exit_observed = false;
             loop {
                 let event = match events.recv().await {
                     Ok(event) => Some(event),
@@ -1004,12 +1005,35 @@ impl UnifiedExecProcess {
                         failure,
                         sandbox_denied,
                     } = response;
+                    // A retained read covers the whole requested interval because
+                    // max_bytes is unset. Every sequence belongs to output, Exited,
+                    // or Closed. Account for lifecycle events before declaring any
+                    // missing output, including late output after root exit.
+                    let retained_output_events =
+                        u64::try_from(chunks.iter().filter(|chunk| chunk.seq > last_seq).count())
+                            .unwrap_or(u64::MAX);
+                    let unobserved_lifecycle_events =
+                        u64::from(exited && !exit_observed) + u64::from(closed);
+                    let expected_events = next_seq.saturating_sub(last_seq.saturating_add(1));
+                    if expected_events
+                        > retained_output_events.saturating_add(unobserved_lifecycle_events)
+                    {
+                        send_monitor_capture(
+                            &monitor_capture,
+                            &monitor_stop_pending,
+                            &monitor_stop_pending_notify,
+                            MonitorOutputChunk::ArchiveGap,
+                        )
+                        .await;
+                    }
+                    exit_observed |= exited;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let is_stdout = chunk.stream == ExecOutputStream::Stdout;
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(&bytes);
-                        drop(guard);
+                        {
+                            let mut guard = output_buffer.lock().await;
+                            guard.push_chunk(&bytes);
+                        }
                         if let Some(stream_output) = &monitor_stream_output {
                             stream_output.push_chunk(bytes.clone(), is_stdout).await;
                         }
@@ -1061,9 +1085,10 @@ impl UnifiedExecProcess {
                         last_seq = chunk.seq;
                         let is_stdout = chunk.stream == ExecOutputStream::Stdout;
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(&bytes);
-                        drop(guard);
+                        {
+                            let mut guard = output_buffer.lock().await;
+                            guard.push_chunk(&bytes);
+                        }
                         if let Some(stream_output) = &monitor_stream_output {
                             stream_output.push_chunk(bytes.clone(), is_stdout).await;
                         }
@@ -1089,6 +1114,7 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = seq;
+                        exit_observed = true;
                         let mut state = state_tx.borrow().clone();
                         state.sandbox_denied |= sandbox_denied.unwrap_or(false);
                         let _ = state_tx.send_replace(state.exited(Some(exit_code)));

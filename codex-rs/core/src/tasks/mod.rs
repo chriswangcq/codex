@@ -287,8 +287,12 @@ impl Session {
         task: T,
     ) -> bool {
         self.start_task_with_reservation(
-            turn_context, input, task, /*expected_turn_state*/ None,
-        ).await
+            turn_context,
+            input,
+            task,
+            /*expected_turn_state*/ None,
+        )
+        .await
     }
 
     #[expect(
@@ -364,9 +368,9 @@ impl Session {
             return false;
         };
         if expected_turn_state.is_some_and(|expected| {
-            active.as_ref().is_none_or(|turn| {
-                turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, expected)
-            })
+            active
+                .as_ref()
+                .is_none_or(|turn| turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, expected))
         }) {
             return false;
         }
