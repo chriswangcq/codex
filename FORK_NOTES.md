@@ -17,7 +17,7 @@ release evidence applies only to the recorded source and validated host.
 - Upstream commit subject: `Bind the app-server time provider to a local variable (#49411)`
 - Claude Code behavioral reference: 2.1.223, inspected locally on 2026-08-07
 - Current status: command-monitor feature rebased onto the September 30 upstream baseline;
-  focused automated validation passed; live-model smoke and installation remain pending
+  focused automated validation, final live-model/monitor smoke, and local installation passed
 - Current validated code commit: `ed0991f270`
 - September release version: `0.161.0-monitor.20260930`
 - Synchronization decision: the user requested and confirmed preservation of monitor while
