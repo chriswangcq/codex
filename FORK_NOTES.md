@@ -344,16 +344,15 @@ Build with the pinned toolchain from that preparation checkout's `codex-rs` dire
 ```sh
 rustc -V
 cargo -V
-cargo rustc --locked --release -p codex-cli --bin codex -- -C lto=no
-cargo rustc --locked --release -p codex-code-mode-host --bin codex-code-mode-host -- -C lto=no
+cargo build --locked --release -p codex-cli --bin codex
+cargo build --locked --release -p codex-code-mode-host --bin codex-code-mode-host
 ./target/release/codex --version
 ./target/release/codex-code-mode-host --help
 shasum -a 256 target/release/codex target/release/codex-code-mode-host
 ```
 
-The September build retains release optimization and cached optimized dependencies, and disables
-LTO only for the final executable to reduce link time. The repository pins Rust 1.95.0 in
-`codex-rs/rust-toolchain.toml`. Record the exact `rustc -V`,
+The release uses the repository default optimization and thin LTO settings. The repository pins
+Rust 1.95.0 in `codex-rs/rust-toolchain.toml`. Record the exact `rustc -V`,
 `cargo -V`, fork commit, baseline commit, target triple, and SHA-256 alongside any distributed
 binary.
 
