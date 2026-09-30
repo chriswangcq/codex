@@ -204,7 +204,11 @@ impl HistoryCell for UnifiedExecProcessesCell {
             if shown >= max_processes {
                 break;
             }
-            let command = process.display_label();
+            let command = process
+                .display_label()
+                .replace("\r\n", "↵")
+                .replace('\n', "↵");
+            let command = ansi_line_text(&command);
             let (snippet, snippet_truncated) = {
                 let max_graphemes = 80;
                 let mut graphemes = command.graphemes(true);

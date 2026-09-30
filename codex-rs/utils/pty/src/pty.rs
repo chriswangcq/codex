@@ -267,9 +267,8 @@ async fn spawn_process_portable(
                 match reader.read(&mut buf) {
                     Ok(0) => return true,
                     Ok(n) => {
-                        if stdout_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                            return false;
-                        }
+                        // A closed output receiver must not block the child's exit.
+                        let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                     }
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(ref e) if e.kind() == ErrorKind::WouldBlock => {

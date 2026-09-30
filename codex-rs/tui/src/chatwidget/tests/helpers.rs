@@ -1892,7 +1892,7 @@ pub(crate) fn normalize_completion_timestamps(
     }
     static COMPLETION_FOOTER: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(
         || {
-            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:<1s|(?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s) • )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2}(?: (?:AM|PM))?(?P<padding>[ \t]*)$")
+            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>(?P<verb>Worked|Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Sautéed) for (?:<1s|(?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s) • )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2}(?: (?:AM|PM))?(?P<background_summary> · [^\n]+)?(?P<padding>[ \t]*)$")
                 .expect("valid completion footer pattern")
         },
     );
@@ -1900,12 +1900,15 @@ pub(crate) fn normalize_completion_timestamps(
         .replace_all(&value.to_string(), |captures: &regex_lite::Captures<'_>| {
             let indent = &captures["indent"];
             let padding = &captures["padding"];
-            let duration = if captures.name("duration").is_some() {
-                "Worked for [duration] • "
-            } else {
-                ""
-            };
-            format!("{indent}{duration}[completion time]{padding}")
+            let duration = captures
+                .name("verb")
+                .map(|verb| format!("{} for [duration] • ", verb.as_str()))
+                .unwrap_or_default();
+            let background_summary = captures
+                .name("background_summary")
+                .map(|summary| summary.as_str())
+                .unwrap_or_default();
+            format!("{indent}{duration}[completion time]{background_summary}{padding}")
         })
         .into_owned()
 }

@@ -1439,7 +1439,7 @@ async fn pty_dropped_output_receiver_keeps_draining_child() -> anyhow::Result<()
         "import signal, sys\nsignal.alarm(10)\nsys.stdout.buffer.write(b'x' * (4 * 1024 * 1024))";
     for inherited_fds in [&[][..], &[preserved_fd.as_raw_fd()][..]] {
         let SpawnedProcess {
-            session: _session,
+            session,
             stdout_rx,
             exit_rx,
             ..
@@ -1456,6 +1456,11 @@ async fn pty_dropped_output_receiver_keeps_draining_child() -> anyhow::Result<()
         drop(stdout_rx);
         let code = tokio::time::timeout(std::time::Duration::from_secs(2), exit_rx).await??;
         assert_eq!(code, 0, "child should finish even when output is discarded");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.wait_for_output_closed(),
+        )
+        .await?;
     }
     Ok(())
 }

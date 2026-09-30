@@ -10,10 +10,7 @@ expression: combined
   ⎿  Monitor started · task task-monitor-1 · timeout 300s
 
 
-────────────────────────────────────────────────────────────────────────────────
-
-
 • The monitor is still running.
 
 
-─ Baked for 1m 01s · 1 monitor still running ───────────────────────────────────
+  Baked for [duration] • [completion time] · 1 monitor still running

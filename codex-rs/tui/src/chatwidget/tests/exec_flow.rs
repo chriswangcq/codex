@@ -1995,14 +1995,14 @@ async fn turn_complete_footer_includes_running_monitor() {
     );
     handle_turn_completed(&mut chat, "turn-1", Some(61_000));
 
-    let cells = drain_insert_history(&mut rx);
+    let cells = drain_insert_history_normalized(&mut rx);
     let combined = cells
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        combined.contains("Baked for 1m 1s · 1 monitor still running"),
+        combined.contains("Baked for [duration] • [completion time] · 1 monitor still running"),
         "expected running monitor in the existing turn footer, got:\n{combined}"
     );
     assert_chatwidget_snapshot!("turn_complete_footer_running_monitor", combined);
