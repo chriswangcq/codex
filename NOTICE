@@ -4,3 +4,8 @@ Copyright 2025 OpenAI
 This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
 Copyright (c) 2016-2022 Florian Dehau
 Copyright (c) 2023-2025 The Ratatui Developers
+
+Independent command-monitor fork maintained in chriswangcq/codex.
+This fork modifies command monitoring, process lifecycle handling, event delivery,
+protocol/history integration, and the TUI. See FORK_NOTES.md for the change scope
+and upstream baseline. This notice does not imply OpenAI endorsement.

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Upstream Codex documentation
+    url: https://developers.openai.com/codex/
+    about: General documentation for shared upstream CLI features.
+  - name: Upstream Codex issue tracker
+    url: https://github.com/openai/codex/issues
+    about: Report official Codex problems there; report this fork's monitor behavior here.

@@ -1,81 +1,118 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Command Monitor — a Codex CLI fork
 
----
+**Let local command output bring the agent back to work.**
 
-## Quickstart
+[中文](README.zh-CN.md) · [Try the demo](docs/monitor-demo.md) · [Report your experience](https://github.com/chriswangcq/codex/issues) · [Implementation and validation](FORK_NOTES.md)
 
-### Installing and running Codex CLI
+This independent community fork adds a `monitor` tool to Codex CLI. Start a local
+command, let the conversation become idle, and let stdout lines
+trigger follow-up work in the same conversation. The watched command chooses what
+to emit; monitor does not semantically classify its output. When a turn is already running,
+notifications join its existing input flow.
 
-Run the following on Mac or Linux to install Codex CLI:
+Use it with application logs, existing test watchers, and long-running local jobs.
+The monitor runtime does not require the model to repeatedly ask for status.
+Event handling still uses model calls; we have not measured a token-saving percentage.
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+## Preview status
+
+- Based on **Codex CLI 0.169.0**, with the monitor migration at `443d3df224`.
+- **Source preview for Apple Silicon macOS.** Other platforms have not been validated.
+- The migration passed **2,825 Rust tests**, **9 Python contract tests**, schema
+  generation, formatting and Clippy for 16 affected crates. This was a selected
+  regression matrix, not the entire workspace. See [the evidence](FORK_NOTES.md#migration-validation).
+- This source preview has no new prebuilt installer. Live-model end-to-end
+  validation has not been performed for the 0.169.0 migration; the automated
+  scenarios use model fixtures. The older 0.161.0 release is a different build.
+- This is an independent fork, not an official OpenAI release. Model access and
+  authentication use the underlying Codex configuration; no model service is included.
+
+## What you can do
+
+| Workflow | What the fork provides |
+| --- | --- |
+| Follow a local application log | Stdout lines can trigger contextual follow-up without another user prompt. |
+| Use an existing test/build watcher | The watcher detects changes; monitor delivers its output to the agent. |
+| Observe a long-running job | Receive bounded progress events and inspect the process from the CLI. |
+| Manage active work | Use `/ps`, `/stop`, and the Down-arrow process manager to inspect or stop processes. |
+
+Monitors reuse the existing command approval, sandbox and process lifecycle.
+Stdout events are batched and rate-limited. Stderr is archived for inspection;
+redirect `2>&1` explicitly if you want stderr to become live events too.
+`task_stop` stops an individual monitor. `/stop` stops background terminals and monitors.
+
+## Build and try this fork
+
+The official npm package, Homebrew cask and OpenAI installer install upstream Codex,
+not this fork. For this source preview, use the repository's package builder.
+
+Prerequisites: Git, Python 3.11+, Rust via rustup, `just`, and the Xcode command-line
+tools. The workspace selects its pinned Rust toolchain. The first build downloads
+verified native dependencies and can take a while.
+
+```sh
+git clone --branch codex/monitor-preview https://github.com/chriswangcq/codex.git command-monitor
+cd command-monitor
+just assemble-codex-package \
+  --target aarch64-apple-darwin \
+  --cargo-profile dev-small \
+  --package-dir "$PWD/dist/command-monitor"
+
+./dist/command-monitor/bin/codex --version
+./dist/command-monitor/bin/codex
 ```
 
-Run the following on Windows to install Codex CLI:
+Keep the complete package directory: the CLI needs its Code Mode host, executor,
+resources and manifest. Run the explicit path above to select this build. The
+binary version remains `0.169.0`; include `git rev-parse HEAD` in reports to identify
+the fork revision. Build and packaging details are in the
+[upstream package-builder guide](scripts/codex_package/README.md).
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
+Then follow the [two-terminal demo](docs/monitor-demo.md): start a monitor, wait for
+the conversation to become idle, append a log line, and observe the follow-up.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    Tool[monitor tool] --> Exec[Shared unified_exec lifecycle]
+    Exec --> Command[Local command]
+    Command -->|stdout and stderr| Archive[Bounded output archive]
+    Command -->|stdout| Policy[Line framing, batching and rate limits]
+    Policy --> Input[Existing Session input queue and admission]
+    Input --> Agent[Agent follow-up]
+    Exec --> UI[TUI, app-server and history]
 ```
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+The implementation separates output policy, archiving, worker coordination,
+recovery and delivery. Unified exec owns process state; the existing Session owns
+input admission. [Read the maintenance contract](FORK_NOTES.md).
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
+## Boundaries
 
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
+- `persistent: true` removes the normal timeout **within the current session**.
+  Monitors do not survive closing or restarting the session.
+- Monitor commands run locally with `tty: false`. Remote execution and native
+  WebSocket monitoring are unsupported.
+- Of command output, only stdout produces live events; stderr is archived.
+  Lifecycle notifications can also trigger follow-up. Limits can truncate, suppress or stop noisy output;
+  this is not an every-line delivery or complete-log retention guarantee.
+- Notifications do not forcibly interrupt an in-flight model response or arbitrary
+  tool execution. Delivery latency depends on the active turn.
+- The app-server monitoring endpoints are experimental. This fork does not install
+  or replace the official desktop app or IDE extension.
 
-Codex CLI can also be installed via the following package managers:
+## Help validate the workflow
 
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
+We are looking for a small first group of Apple Silicon users who regularly work
+with local logs, watch-mode tests, or long jobs. [Open a feedback issue](https://github.com/chriswangcq/codex/issues)
+with your command, platform, fork commit, expected follow-up and observed result.
+Installation failures and noisy or missing notifications are especially useful.
+Remove credentials and private log content before posting.
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+## License and upstream
 
-Then simply run `codex` to get started.
-
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
-
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
-
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
-
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
-
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+[Apache-2.0](LICENSE). Existing OpenAI and third-party attributions are retained in
+[NOTICE](NOTICE). This fork's changes and validation scope are documented in
+[FORK_NOTES.md](FORK_NOTES.md). General upstream CLI documentation is available
+from [OpenAI](https://developers.openai.com/codex/).

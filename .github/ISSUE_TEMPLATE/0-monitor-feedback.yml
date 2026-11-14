@@ -1,0 +1,42 @@
+name: Monitor preview feedback
+description: Report a trial, installation problem, or monitor behavior in this community fork.
+title: "[monitor] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the independent command-monitor fork, not the official Codex issue tracker.
+        Both successful trials and failures help. Remove credentials and private log content.
+  - type: input
+    id: revision
+    attributes:
+      label: Fork revision and CLI version
+      description: Paste git rev-parse HEAD and the explicit fork binary's --version output.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Platform and selected model
+      description: Include macOS version, CPU architecture, and model name.
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Command and workflow
+      description: What are you watching, and what useful follow-up should happen?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Observed result
+      description: Did setup, startup, idle follow-up, repeated events, and stop work? Include whether the turn was busy.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence or reproduction
+      description: Include a short transcript, command, or recording when useful.
