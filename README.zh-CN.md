@@ -16,19 +16,40 @@
 ## 当前状态
 
 - 基于 **Codex CLI 0.169.0**；monitor 迁移提交为 `443d3df224`。
-- **Apple Silicon macOS 源码预览版**，其他平台尚未完成实机验证。
+- **Apple Silicon macOS 可下载预览版**，其他平台尚未完成实机验证。
 - 已通过选定范围内的 **2,825 项 Rust 测试、9 项 Python 契约测试**，以及
   schema、格式和 16 个相关 crate 的 Clippy 检查；不代表整个工作区或所有平台通过。
-- 本轮尚未提供新的预编译安装包，也尚未完成 0.169.0 的真实模型端到端验证；
-  自动化场景使用模型夹具。仓库已有的 0.161.0 Release 是另一个版本。
+- [0.169.0 预览 Release](https://github.com/chriswangcq/codex/releases/tag/monitor-v0.169.0-20261114)
+  提供完整 CLI 包，采用剥离符号的未优化 `dev` 构建，未进行 Apple Developer ID 签名或公证。
+- 尚未完成 0.169.0 的真实模型端到端验证；自动化场景使用模型夹具。
+  仓库已有的 0.161.0 Release 是另一个版本。
 - 本项目不是 OpenAI 官方发行版，也不提供模型服务或订阅权益。
 
-## 试用
+## 下载试用
 
-官方 npm、Homebrew 和 OpenAI 安装器安装的是上游版本。请使用本 fork 的源码：
+下载 macOS ARM64 包，核对校验和后解压运行：
 
 ```sh
-git clone --branch codex/monitor-preview https://github.com/chriswangcq/codex.git command-monitor
+mkdir codex-monitor-0.169.0-preview
+cd codex-monitor-0.169.0-preview
+curl -fLO https://github.com/chriswangcq/codex/releases/download/monitor-v0.169.0-20261114/codex-monitor-0.169.0-macos-arm64-preview.tar.gz
+curl -fLO https://github.com/chriswangcq/codex/releases/download/monitor-v0.169.0-20261114/codex-monitor-0.169.0-macos-arm64-preview.tar.gz.sha256
+shasum -a 256 -c codex-monitor-0.169.0-macos-arm64-preview.tar.gz.sha256
+tar -xzf codex-monitor-0.169.0-macos-arm64-preview.tar.gz
+./bin/codex --version
+./bin/codex
+```
+
+请完整保留解压目录。`BUILD.json` 记录实际 fork 提交；`--version` 和包 manifest
+显示上游基线版本 `0.169.0`。本预览包不提供上游自动更新，请从本仓库下载后续版本。
+macOS 下载批准方式、删除方式及验证范围见[发布说明](docs/release-0.169.0.md)。
+
+## 从源码构建
+
+官方 npm、Homebrew 和 OpenAI 安装器安装的是上游版本。构建本 fork：
+
+```sh
+git clone --branch master https://github.com/chriswangcq/codex.git command-monitor
 cd command-monitor
 just assemble-codex-package \
   --target aarch64-apple-darwin \

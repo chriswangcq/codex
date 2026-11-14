@@ -17,13 +17,15 @@ Event handling still uses model calls; we have not measured a token-saving perce
 ## Preview status
 
 - Based on **Codex CLI 0.169.0**, with the monitor migration at `443d3df224`.
-- **Source preview for Apple Silicon macOS.** Other platforms have not been validated.
+- **Downloadable preview for Apple Silicon macOS.** Other platforms have not been validated.
 - The migration passed **2,825 Rust tests**, **9 Python contract tests**, schema
   generation, formatting and Clippy for 16 affected crates. This was a selected
   regression matrix, not the entire workspace. See [the evidence](FORK_NOTES.md#migration-validation).
-- This source preview has no new prebuilt installer. Live-model end-to-end
-  validation has not been performed for the 0.169.0 migration; the automated
-  scenarios use model fixtures. The older 0.161.0 release is a different build.
+- The [0.169.0 preview](https://github.com/chriswangcq/codex/releases/tag/monitor-v0.169.0-20261114)
+  includes the complete CLI package. It uses a symbol-stripped, unoptimized `dev`
+  build and is not Apple Developer ID signed or notarized.
+- Live-model end-to-end validation has not been performed for the 0.169.0 migration;
+  the automated scenarios use model fixtures. The older 0.161.0 release is a different build.
 - This is an independent fork, not an official OpenAI release. Model access and
   authentication use the underlying Codex configuration; no model service is included.
 
@@ -41,17 +43,38 @@ Stdout events are batched and rate-limited. Stderr is archived for inspection;
 redirect `2>&1` explicitly if you want stderr to become live events too.
 `task_stop` stops an individual monitor. `/stop` stops background terminals and monitors.
 
-## Build and try this fork
+## Download and try
 
-The official npm package, Homebrew cask and OpenAI installer install upstream Codex,
-not this fork. For this source preview, use the repository's package builder.
+Download the complete [macOS ARM64 preview](https://github.com/chriswangcq/codex/releases/tag/monitor-v0.169.0-20261114), verify its checksum and extract it:
+
+```sh
+mkdir codex-monitor-0.169.0-preview
+cd codex-monitor-0.169.0-preview
+curl -fLO https://github.com/chriswangcq/codex/releases/download/monitor-v0.169.0-20261114/codex-monitor-0.169.0-macos-arm64-preview.tar.gz
+curl -fLO https://github.com/chriswangcq/codex/releases/download/monitor-v0.169.0-20261114/codex-monitor-0.169.0-macos-arm64-preview.tar.gz.sha256
+shasum -a 256 -c codex-monitor-0.169.0-macos-arm64-preview.tar.gz.sha256
+tar -xzf codex-monitor-0.169.0-macos-arm64-preview.tar.gz
+./bin/codex --version
+./bin/codex
+```
+
+Keep the entire extracted directory. `BUILD.json` identifies the fork revision;
+`--version` and the package manifest report the upstream baseline, `0.169.0`.
+This preview does not offer the upstream automatic updater. Download future fork
+releases from this repository. For macOS download approval and removal instructions,
+see the [release notes](docs/release-0.169.0.md).
+
+## Build from source
+
+The official npm package, Homebrew cask and OpenAI installer install upstream Codex.
+To build this fork, use the repository's package builder.
 
 Prerequisites: Git, Python 3.11+, Rust via rustup, `just`, and the Xcode command-line
 tools. The workspace selects its pinned Rust toolchain. The first build downloads
 verified native dependencies and can take a while.
 
 ```sh
-git clone --branch codex/monitor-preview https://github.com/chriswangcq/codex.git command-monitor
+git clone --branch master https://github.com/chriswangcq/codex.git command-monitor
 cd command-monitor
 just assemble-codex-package \
   --target aarch64-apple-darwin \

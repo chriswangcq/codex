@@ -5,8 +5,22 @@ describes the upstream baseline, the behavior this fork intends to preserve, wha
 has not been validated, and the boundaries that matter if upstream synchronization is considered
 later.
 
-This is a local fork. It is not an upstream proposal or a public compatibility promise. The
+This is an independently maintained community fork. It is not an upstream proposal or a public compatibility promise. The
 release evidence applies only to the recorded source and validated host.
+
+## 0.169.0 Binary Preview (2026-11-14)
+
+The default development branch is `master`. The macOS ARM64 preview is published
+under `monitor-v0.169.0-20261114`; see the [release notes](docs/release-0.169.0.md).
+The complete package contains `codex`, `codex-code-mode-host`, `codex-exec-server`,
+ripgrep and the canonical package manifest, plus build provenance and licenses.
+The CLI/package version remains `0.169.0`; `BUILD.json` identifies the exact fork
+source commit and package-specific checks.
+
+This preview uses the existing validated `dev` build with package-copy symbols
+stripped. It is unoptimized, ad-hoc signed and not notarized. The development
+profile excludes the upstream TUI update checker. There is no installed global
+command replacement. Live-model and additional-platform validation remain open.
 
 ## 0.169.0 Migration (2026-11-14)
 
@@ -86,8 +100,9 @@ leaks are impossible. Final filters, binary metadata and raw logs are retained l
 `.agent/migration-0169-20261114/`, with `validation-progress.json` identifying the final logs.
 Earlier interrupted or diagnostic logs do not supersede the final results.
 
-No installable release package, installation, live-model smoke, or additional host-platform
-validation was performed for this migration.
+At the migration milestone, no installable release package, installation, live-model smoke,
+or additional host-platform validation had been performed. The subsequent binary preview
+is documented above; the following migration evidence remains scoped to that milestone.
 
 ## Previous Release Status Snapshot
 
@@ -135,9 +150,9 @@ The 0.169.0 canonical package layout is defined by `scripts/codex_package/layout
 - `codex-path/rg`, `codex-package.json`, and `codex-resources/`;
 - additional platform resources selected by the official package builder.
 
-The migration builds local test executables, not an installable package. The app-server test
-helper named `exec-server` is distinct from the packaged `codex-exec-server`, which comes from
-`codex-exec-server-cli`. No package has been assembled or installed for this migration.
+The migration initially built local test executables. The subsequent binary preview uses
+the canonical package builder. The app-server test helper named `exec-server` is distinct
+from the packaged `codex-exec-server`, which comes from `codex-exec-server-cli`.
 
 `InstallContext` still supports an adjacent `codex-code-mode-host` for loose development
 executables. That fallback does not define the complete release layout; use the official package

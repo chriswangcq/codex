@@ -3,6 +3,12 @@
 Prepared on 2026-11-14. The owner chose open-source adoption and demand validation
 before monetization. This document contains research, outreach copy and publication records.
 
+## Current distribution
+
+Development now uses `master`. The [0.169.0 macOS ARM64 binary preview](https://github.com/chriswangcq/codex/releases/tag/monitor-v0.169.0-20261114)
+adds a complete download package. The first outreach comment below predates this
+release; its exact published text is retained as a historical record.
+
 ## Publication record
 
 - 2026-11-14: Draft 1 published by `chriswangcq` to
@@ -14,8 +20,8 @@ before monetization. This document contains research, outreach copy and publicat
 
 Local command output can trigger useful follow-up in the same Codex conversation.
 The first audience is Apple Silicon CLI users working with logs, existing test
-watchers, and long-running local jobs. The distribution is a community source
-preview, with a bounded feature set and explicit platform/validation evidence.
+watchers, and long-running local jobs. The distribution is a community preview with source and macOS ARM64 binaries,
+a bounded feature set and explicit platform/validation evidence.
 
 The existing repository is already a public fork. Its previous default homepage
 pointed to upstream installation, and feedback issues were disabled. The preview
