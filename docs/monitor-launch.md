@@ -1,7 +1,14 @@
 # Open-source preview launch
 
 Prepared on 2026-11-14. The owner chose open-source adoption and demand validation
-before monetization. This document contains research and **unsent** outreach drafts.
+before monetization. This document contains research, outreach copy and publication records.
+
+## Publication record
+
+- 2026-11-14: Draft 1 published by `chriswangcq` to
+  [openai/codex #29922](https://github.com/openai/codex/issues/29922#issuecomment-6874870145)
+  after owner approval. The posted text was read back and matched the approved draft.
+- Draft 2 for #22003 remains unsent.
 
 ## Positioning
 
