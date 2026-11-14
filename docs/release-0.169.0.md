@@ -28,6 +28,10 @@ Intel macOS, Linux and Windows binaries are not included.
   verified Codex V8 152.2.0 artifacts. Symbols are stripped from the package copies.
   This is an unoptimized preview, so size and performance differ from an optimized
   production build.
+- The packaged ripgrep 15.2.0 statically links PCRE2 10.49 with JIT and `-P` support.
+  Its source patch, locked dependencies and build/runtime version evidence are in
+  `build-provenance/ripgrep/`. The macOS ARM64 source-builder resource is pinned to
+  the matching separately downloadable archive with size and SHA256 verification.
 - The development profile excludes the upstream TUI update checker. Download
   subsequent fork releases from this repository; official installers install
   upstream Codex.

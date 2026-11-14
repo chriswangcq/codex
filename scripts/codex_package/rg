@@ -4,14 +4,14 @@
   "name": "rg",
   "platforms": {
     "macos-aarch64": {
-      "size": 1764284,
+      "size": 2466173,
       "hash": "sha256",
-      "digest": "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4",
+      "digest": "fc0ae0e36fbeac73e42428617068b178304e0bf7472c2051982c0b35dd308d01",
       "format": "tar.gz",
-      "path": "ripgrep-15.2.0-aarch64-apple-darwin/rg",
+      "path": "ripgrep-15.2.0-pcre2-10.49-aarch64-apple-darwin/rg",
       "providers": [
         {
-          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-apple-darwin.tar.gz"
+          "url": "https://github.com/chriswangcq/codex/releases/download/monitor-v0.169.0-20261114/ripgrep-15.2.0-pcre2-10.49-aarch64-apple-darwin.tar.gz"
         }
       ]
     },
