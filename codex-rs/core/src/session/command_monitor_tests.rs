@@ -1,13 +1,23 @@
+use super::delivery::admit_monitor_output_delta;
+use super::delivery::deliver_monitor_event;
+use super::delivery::deliver_monitor_item;
+use super::delivery::text_response_item;
+use super::recovery::await_while_draining_capture;
+use super::recovery::claim_and_deliver_fatal_monitor;
+use super::recovery::run_fatal_monitor_recovery;
+use super::worker::monitor_worker_ready_to_finalize;
+use super::worker::run_monitor_worker;
 use super::*;
+use crate::session::input_queue::TurnInput;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
+use crate::unified_exec::MonitorOutputChunk;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::turn_input::TurnInputSubmission;
 use pretty_assertions::assert_eq;
-use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
-use std::task::Context;
 use std::task::Poll;
-use tokio::io::AsyncWrite;
 
 struct RunCountingTask {
     runs: Arc<AtomicUsize>,
@@ -475,588 +485,6 @@ async fn failed_fatal_kill_keeps_worker_owner_until_an_external_stop() {
     );
 }
 
-#[test]
-fn physical_lines_are_trimmed_and_blank_lines_are_skipped() {
-    let mut framer = PhysicalLineFramer::default();
-
-    assert_eq!(framer.push(b"  first  \n\r\n sec"), vec!["first"]);
-    assert_eq!(framer.push(b"ond \r\n"), vec!["second"]);
-    assert_eq!(framer.finish(), None);
-}
-
-#[test]
-fn whitespace_only_stdout_counts_as_produced_output_without_emitting_an_event() {
-    let mut lines = PhysicalLineFramer::default();
-    let mut batch = MonitorBatch::default();
-    let mut produced_output = false;
-
-    ingest_stdout(
-        b"  \t\n",
-        &mut lines,
-        &mut batch,
-        &mut produced_output,
-        Instant::now(),
-    );
-
-    assert!(produced_output);
-    assert_eq!(batch.take(), None);
-    assert_eq!(
-        monitor_completion_summary(false, produced_output, Some(0), None),
-        " stream ended"
-    );
-}
-
-#[test]
-fn physical_line_trims_ecmascript_bom_whitespace() {
-    let mut framer = PhysicalLineFramer::default();
-
-    assert_eq!(
-        framer.push("\u{FEFF}event\u{FEFF}\n".as_bytes()),
-        vec!["event".to_string()]
-    );
-}
-
-#[test]
-fn physical_line_preserves_non_ecmascript_next_line_character() {
-    let mut framer = PhysicalLineFramer::default();
-
-    assert_eq!(
-        framer.push("\u{0085}event\u{0085}\n".as_bytes()),
-        vec!["\u{0085}event\u{0085}".to_string()]
-    );
-}
-
-#[test]
-fn physical_line_limit_counts_javascript_utf16_units() {
-    let exactly_500_units = "😀".repeat(250);
-    let over_500_units = "😀".repeat(251);
-
-    assert_eq!(
-        truncate_utf16(&exactly_500_units, MAX_LINE_UTF16_UNITS, false),
-        exactly_500_units
-    );
-    assert_eq!(
-        truncate_utf16(&over_500_units, MAX_LINE_UTF16_UNITS, false),
-        format!("{}{}", "😀".repeat(250), TRUNCATION_SUFFIX)
-    );
-}
-
-#[test]
-fn pending_physical_line_is_bounded_and_marked_truncated() {
-    let mut framer = PhysicalLineFramer::default();
-    let mut bytes = vec![b'a'; MAX_PENDING_UTF16_UNITS + 100];
-    bytes.push(b'\n');
-
-    let lines = framer.push(&bytes);
-
-    assert_eq!(framer.pending_utf16_units, 0);
-    assert_eq!(lines.len(), 1);
-    assert_eq!(
-        lines[0],
-        format!("{}{}", "a".repeat(MAX_LINE_UTF16_UNITS), TRUNCATION_SUFFIX)
-    );
-}
-
-#[test]
-fn pending_line_keeps_the_last_utf16_units_across_split_code_points() {
-    let mut framer = PhysicalLineFramer::default();
-    let mut bytes = format!("HEAD{}TAIL", "😀".repeat(MAX_PENDING_UTF16_UNITS / 2)).into_bytes();
-    let split = bytes.len() - "TAIL".len() - 2;
-    let tail = bytes.split_off(split);
-
-    assert!(framer.push(&bytes).is_empty());
-    let mut tail_with_newline = tail;
-    tail_with_newline.push(b'\n');
-    let lines = framer.push(&tail_with_newline);
-
-    assert_eq!(lines.len(), 1);
-    assert!(lines[0].starts_with('😀'));
-    assert!(lines[0].ends_with(TRUNCATION_SUFFIX));
-}
-
-#[test]
-fn batch_limit_counts_utf16_units_and_uses_batch_suffix() {
-    let now = Instant::now();
-    let mut batch = MonitorBatch::default();
-    for _ in 0..7 {
-        batch.push_line(&"x".repeat(MAX_LINE_UTF16_UNITS), now);
-    }
-
-    let framed = batch.take().expect("batch should contain output");
-    let prefix = framed
-        .strip_suffix(&format!("\n{TRUNCATION_SUFFIX}"))
-        .expect("batch should carry its truncation suffix");
-    assert_eq!(utf16_units(prefix), MAX_BATCH_UTF16_UNITS);
-}
-
-#[test]
-fn batch_window_is_two_hundred_milliseconds() {
-    let now = Instant::now();
-    let mut batch = MonitorBatch::default();
-    batch.push_line("event", now);
-
-    assert_eq!(batch.deadline(), Some(now + Duration::from_millis(200)));
-}
-
-#[test]
-fn token_bucket_starts_with_ten_tokens_and_refills_one_every_two_seconds() {
-    let start = Instant::now();
-    let mut limiter = MonitorRateLimiter::new(start);
-    for index in 0..RATE_LIMIT_CAPACITY {
-        let dispatch = limiter.submit(format!("event-{index}"), start, true);
-        assert_eq!(dispatch.deliveries, vec![format!("event-{index}")]);
-        assert_eq!(dispatch.stop_message, None);
-    }
-
-    let suppressed = limiter.submit("event-10".to_string(), start, true);
-    assert_eq!(suppressed.deliveries, Vec::<String>::new());
-    assert_eq!(suppressed.stop_message, None);
-
-    let after_refill = limiter.submit(
-        "event-11".to_string(),
-        start + RATE_LIMIT_REFILL_INTERVAL,
-        true,
-    );
-    assert_eq!(after_refill.deliveries, vec![suppression_message(1)]);
-    assert_eq!(after_refill.stop_message, None);
-}
-
-#[test]
-fn sustained_overload_stops_after_thirty_seconds() {
-    let start = Instant::now();
-    let mut limiter = MonitorRateLimiter::new(start);
-    for index in 0..RATE_LIMIT_CAPACITY {
-        let _ = limiter.submit(format!("initial-{index}"), start, true);
-    }
-
-    let mut stopped = None;
-    for tick in 0..=151 {
-        let now = start + Duration::from_millis(tick * 200);
-        let dispatch = limiter.submit(format!("overload-{tick}"), now, true);
-        if dispatch.stop_message.is_some() {
-            stopped = dispatch.stop_message;
-            break;
-        }
-    }
-
-    let stopped = stopped.expect("continuous overload should stop the monitor");
-    assert!(stopped.starts_with("[Monitor stopped — too much output ("));
-    assert!(stopped.contains(" events suppressed over 30s)"));
-    assert!(stopped.ends_with("Restart with a more selective source.]"));
-}
-
-#[test]
-fn sustained_overload_does_not_stop_at_exactly_thirty_seconds() {
-    let start = Instant::now();
-    let mut limiter = MonitorRateLimiter::new(start);
-    for index in 0..RATE_LIMIT_CAPACITY {
-        let _ = limiter.submit(format!("initial-{index}"), start, true);
-    }
-    let _ = limiter.submit("suppressed".to_string(), start, true);
-
-    let dispatch = limiter.submit(
-        "exact-boundary".to_string(),
-        start + OVERLOAD_STOP_AFTER,
-        true,
-    );
-
-    assert_eq!(dispatch.stop_message, None);
-}
-
-#[test]
-fn successful_refill_delivery_does_not_reset_continuous_overload() {
-    let start = Instant::now();
-    let mut limiter = MonitorRateLimiter::new(start);
-    for index in 0..RATE_LIMIT_CAPACITY {
-        let _ = limiter.submit(format!("initial-{index}"), start, true);
-    }
-    let _ = limiter.submit("suppressed".to_string(), start, true);
-
-    let dispatch = limiter.submit(
-        "delivered-after-refill".to_string(),
-        start + Duration::from_secs(4),
-        true,
-    );
-
-    assert_eq!(dispatch.deliveries.len(), 2);
-    assert_eq!(limiter.overload_started, Some(start));
-}
-
-#[test]
-fn quiet_gap_resets_overload_tracking_without_emitting_a_notice() {
-    let start = Instant::now();
-    let mut limiter = MonitorRateLimiter::new(start);
-    for index in 0..RATE_LIMIT_CAPACITY {
-        let _ = limiter.submit(format!("initial-{index}"), start, true);
-    }
-    let _ = limiter.submit("suppressed".to_string(), start, true);
-
-    let dispatch = limiter.submit(
-        "after-quiet".to_string(),
-        start + OVERLOAD_QUIET_RESET_AFTER + Duration::from_nanos(1),
-        true,
-    );
-
-    assert_eq!(dispatch.deliveries, vec!["after-quiet"]);
-    assert_eq!(dispatch.stop_message, None);
-    assert_eq!(limiter.overload_started, None);
-    assert_eq!(limiter.suppressed_since_notice, 0);
-}
-
-#[test]
-fn suppression_and_overload_messages_match_the_monitor_contract() {
-    assert_eq!(
-        suppression_message(7),
-        "[7 events suppressed — output rate too high. Consider using TaskStop to restart this monitor with a more selective filter.]"
-    );
-    assert_eq!(
-        overload_stop_message(42, Duration::from_secs(31)),
-        "[Monitor stopped — too much output (42 events suppressed over 31s). Restart with a more selective source.]"
-    );
-}
-
-#[test]
-fn natural_no_output_summary_includes_zero_exit_code() {
-    assert_eq!(
-        monitor_completion_summary(false, false, Some(0), None),
-        " ended without producing output (exit 0)"
-    );
-}
-
-#[test]
-fn natural_output_summary_omits_zero_exit_code() {
-    assert_eq!(
-        monitor_completion_summary(false, true, Some(0), None),
-        " stream ended"
-    );
-    assert_eq!(
-        monitor_completion_summary(true, true, Some(7), None),
-        " script failed (exit 7)"
-    );
-}
-
-#[test]
-fn output_delta_uses_turn_id_and_keeps_tool_use_id_in_payload() {
-    let event = monitor_output_delta_event("turn-123", "call-456", "framed");
-
-    assert_eq!(event.id, "turn-123");
-    let EventMsg::ExecCommandOutputDelta(delta) = event.msg else {
-        panic!("expected output delta");
-    };
-    assert_eq!(delta.call_id, "call-456");
-    assert_eq!(delta.stream, ExecOutputStream::Stdout);
-    assert_eq!(delta.chunk, b"framed");
-}
-
-#[tokio::test]
-async fn output_file_creation_never_truncates_an_existing_task_file() {
-    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-    let path = temp_dir.path().join("b00000000.output");
-    let mut file = create_output_file(&path)
-        .await
-        .expect("first creation should succeed");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            tokio::fs::metadata(temp_dir.path())
-                .await
-                .expect("archive directory metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert_eq!(
-            file.metadata()
-                .await
-                .expect("archive metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-    file.write_all(b"preserve")
-        .await
-        .expect("fixture should be written");
-    file.flush().await.expect("fixture should be flushed");
-
-    let err = create_output_file(&path)
-        .await
-        .expect_err("second creation should fail");
-
-    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-    assert_eq!(
-        tokio::fs::read(&path)
-            .await
-            .expect("existing file should remain readable"),
-        b"preserve"
-    );
-}
-
-#[tokio::test]
-async fn archive_keeps_both_streams_but_framer_consumes_only_stdout() {
-    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-    let path = temp_dir.path().join("b00000001.output");
-    let file = create_output_file(&path)
-        .await
-        .expect("output file should be created");
-    let mut file = MonitorArchiveWriter::new(file, MonitorArchiveBudget::with_cap(u64::MAX));
-    let mut lines = PhysicalLineFramer::default();
-    let mut batch = MonitorBatch::default();
-    let mut produced_output = false;
-
-    handle_capture_chunk(
-        MonitorOutputChunk::Output {
-            bytes: b"stderr-only\n".to_vec(),
-            is_stdout: false,
-        },
-        &mut file,
-        &mut lines,
-        &mut batch,
-        &mut produced_output,
-        true,
-    )
-    .await
-    .expect("stderr should be archived");
-    handle_capture_chunk(
-        MonitorOutputChunk::Output {
-            bytes: b"stdout-only\n".to_vec(),
-            is_stdout: true,
-        },
-        &mut file,
-        &mut lines,
-        &mut batch,
-        &mut produced_output,
-        true,
-    )
-    .await
-    .expect("stdout should be archived and framed");
-    file.flush().await.expect("archive should flush");
-
-    assert_eq!(
-        tokio::fs::read(path)
-            .await
-            .expect("archive should be readable"),
-        b"stderr-only\nstdout-only\n"
-    );
-    assert_eq!(batch.take(), Some("stdout-only".to_string()));
-    assert!(produced_output);
-}
-
-#[tokio::test]
-async fn stdout_close_flushes_a_partial_line_while_stderr_stays_open() {
-    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-    let path = temp_dir.path().join("b00000002.output");
-    let file = create_output_file(&path)
-        .await
-        .expect("output file should be created");
-    let mut file = MonitorArchiveWriter::new(file, MonitorArchiveBudget::with_cap(u64::MAX));
-    let mut lines = PhysicalLineFramer::default();
-    let mut batch = MonitorBatch::default();
-    let mut produced_output = false;
-
-    handle_capture_chunk(
-        MonitorOutputChunk::Output {
-            bytes: b"partial".to_vec(),
-            is_stdout: true,
-        },
-        &mut file,
-        &mut lines,
-        &mut batch,
-        &mut produced_output,
-        true,
-    )
-    .await
-    .expect("stdout should be archived");
-    handle_capture_chunk(
-        MonitorOutputChunk::StdoutClosed,
-        &mut file,
-        &mut lines,
-        &mut batch,
-        &mut produced_output,
-        true,
-    )
-    .await
-    .expect("stdout close should flush the framer");
-
-    assert_eq!(batch.take().as_deref(), Some("partial"));
-    assert!(produced_output);
-    file.flush().await.expect("archive should flush");
-    assert_eq!(
-        tokio::fs::read(path)
-            .await
-            .expect("archive should be readable"),
-        b"partial"
-    );
-}
-
-#[tokio::test]
-async fn archive_gap_event_writes_one_bounded_marker() {
-    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-    let path = temp_dir.path().join("b00000003.output");
-    let file = create_output_file(&path)
-        .await
-        .expect("output file should be created");
-    let mut writer = MonitorArchiveWriter::new(file, MonitorArchiveBudget::with_cap(u64::MAX));
-
-    archive_capture_chunk(MonitorOutputChunk::ArchiveGap, &mut writer)
-        .await
-        .expect("the archive gap marker should be writable");
-    archive_capture_chunk(MonitorOutputChunk::ArchiveGap, &mut writer)
-        .await
-        .expect("a duplicate archive gap should be harmless");
-    writer.flush().await.expect("archive should flush");
-
-    assert_eq!(
-        tokio::fs::read(path)
-            .await
-            .expect("archive should be readable"),
-        ARCHIVE_CAPTURE_GAP_MARKER,
-        "one monitor writes at most one fixed-size gap marker"
-    );
-}
-
-#[tokio::test]
-async fn archive_discards_the_crossing_chunk_and_writes_one_disk_cap_marker() {
-    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-    let path = temp_dir.path().join("b00000002.output");
-    let file = create_output_file(&path)
-        .await
-        .expect("output file should be created");
-    let mut writer = MonitorArchiveWriter::with_cap_and_budget(
-        file,
-        5,
-        MonitorArchiveBudget::with_cap(u64::MAX),
-    );
-
-    writer
-        .write_chunk(b"1234")
-        .await
-        .expect("chunk within cap should be written");
-    writer
-        .write_chunk(b"56")
-        .await
-        .expect("crossing chunk should be replaced by marker");
-    writer
-        .write_chunk(b"ignored")
-        .await
-        .expect("later chunks should be discarded");
-    writer.flush().await.expect("archive should flush");
-
-    let mut expected = b"1234".to_vec();
-    expected.extend_from_slice(ARCHIVE_TRUNCATION_MARKER);
-    assert_eq!(
-        tokio::fs::read(path)
-            .await
-            .expect("archive should be readable"),
-        expected
-    );
-}
-
-#[tokio::test]
-async fn multiple_archive_writers_share_one_session_content_budget() {
-    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-    let first_path = temp_dir.path().join("b00000003.output");
-    let second_path = temp_dir.path().join("b00000004.output");
-    let first_file = create_output_file(&first_path)
-        .await
-        .expect("first output file should be created");
-    let second_file = create_output_file(&second_path)
-        .await
-        .expect("second output file should be created");
-    let budget = MonitorArchiveBudget::with_cap(5);
-    let mut first = MonitorArchiveWriter::with_cap_and_budget(first_file, 5, Arc::clone(&budget));
-    let mut second = MonitorArchiveWriter::with_cap_and_budget(second_file, 5, Arc::clone(&budget));
-
-    let (first_result, second_result) =
-        tokio::join!(first.write_chunk(b"1234"), second.write_chunk(b"5678"),);
-    first_result.expect("one writer should reserve content bytes");
-    second_result.expect("the other writer should write only its cap marker");
-    first.flush().await.expect("first archive should flush");
-    second.flush().await.expect("second archive should flush");
-
-    assert_eq!(budget.content_bytes(), 4);
-    let contents = [
-        tokio::fs::read(first_path)
-            .await
-            .expect("first archive should be readable"),
-        tokio::fs::read(second_path)
-            .await
-            .expect("second archive should be readable"),
-    ];
-    assert_eq!(
-        contents
-            .iter()
-            .filter(|content| content.as_slice() == b"1234" || content.as_slice() == b"5678")
-            .count(),
-        1
-    );
-    assert_eq!(
-        contents
-            .iter()
-            .filter(|content| content.as_slice() == ARCHIVE_TRUNCATION_MARKER)
-            .count(),
-        1
-    );
-}
-
-struct FailAfterWriter {
-    written: usize,
-    fail_after: usize,
-}
-
-impl AsyncWrite for FailAfterWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if self.written >= self.fail_after {
-            return Poll::Ready(Err(io::Error::other("injected archive write failure")));
-        }
-        let written = bytes.len().min(self.fail_after - self.written);
-        self.written += written;
-        Poll::Ready(Ok(written))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-#[tokio::test]
-async fn archive_write_failure_releases_only_unwritten_reservation() {
-    let budget = MonitorArchiveBudget::with_cap(10);
-    let mut failing = MonitorArchiveWriter::with_cap_and_budget(
-        FailAfterWriter {
-            written: 0,
-            fail_after: 2,
-        },
-        10,
-        Arc::clone(&budget),
-    );
-
-    failing
-        .write_chunk(b"12345")
-        .await
-        .expect_err("fixture should fail after a partial write");
-
-    assert_eq!(budget.content_bytes(), 2);
-    let mut succeeding =
-        MonitorArchiveWriter::with_cap_and_budget(tokio::io::sink(), 10, Arc::clone(&budget));
-    succeeding
-        .write_chunk(b"12345678")
-        .await
-        .expect("rolled-back bytes should remain available to another writer");
-    assert_eq!(budget.content_bytes(), 10);
-}
-
 #[tokio::test]
 async fn fatal_termination_drains_more_than_capture_channel_capacity() {
     const CAPACITY: usize = 128;
@@ -1141,4 +569,114 @@ async fn replaced_monitor_reservation_cannot_start_over_user_work() {
     assert!(active.as_ref().is_some_and(|turn| {
         turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, &replacement_state)
     }));
+}
+
+#[tokio::test]
+async fn monitor_delivery_waits_for_finishing_then_respects_shutdown() {
+    for closing in [false, true] {
+        let (session, _turn_context, _events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let finishing = CancellationToken::new();
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn {
+            finishing: Some(finishing.clone()),
+            ..Default::default()
+        });
+        let weak = Arc::downgrade(&session);
+        let mut delivery = Box::pin(deliver_monitor_item(
+            &weak,
+            text_response_item("monitor after finishing".to_string()),
+        ));
+        assert!(matches!(futures::poll!(delivery.as_mut()), Poll::Pending));
+        if closing {
+            // Shutdown must release the delivery even if transcript recording is still blocked.
+            session.begin_session_runtime_shutdown();
+        } else {
+            finishing.cancel();
+            *session.active_turn.lock().await = None;
+            session.active_turn_changed.notify_waiters();
+        }
+        delivery.await;
+
+        assert!(session.active_turn.lock().await.is_some());
+        if closing {
+            assert!(!finishing.is_cancelled());
+        }
+        session
+            .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn monitor_delivery_waits_without_spinning_after_transcript_recording() {
+    struct WakeCounter(AtomicUsize);
+    impl futures::task::ArcWake for WakeCounter {
+        fn wake_by_ref(counter: &Arc<Self>) {
+            counter.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let (session, _turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let finishing = CancellationToken::new();
+    finishing.cancel();
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn {
+        finishing: Some(finishing),
+        ..Default::default()
+    });
+    let weak = Arc::downgrade(&session);
+    let mut delivery = Box::pin(deliver_monitor_item(
+        &weak,
+        text_response_item("monitor after transcript recording".to_string()),
+    ));
+    // Start the manual poll with a fresh cooperative budget.
+    tokio::task::yield_now().await;
+    let wakes = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = futures::task::waker_ref(&wakes);
+    let mut context = std::task::Context::from_waker(&waker);
+    assert!(matches!(
+        std::future::Future::poll(delivery.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    // Rechecking an already-cancelled transcript token would consume the cooperative
+    // budget and wake itself. The lifecycle wait remains asleep until admission changes.
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    delivery.await;
+    assert!(session.active_turn.lock().await.is_some());
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+}
+
+#[tokio::test]
+async fn monitor_delivery_keeps_running_turn_and_queues_an_internal_item() {
+    let (session, _turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let active = crate::state::ActiveTurn::default();
+    let turn_state = Arc::clone(&active.turn_state);
+    *session.active_turn.lock().await = Some(active);
+    let item = text_response_item("monitor event".to_string());
+
+    deliver_monitor_item(&Arc::downgrade(&session), item.clone()).await;
+
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| { Arc::ptr_eq(&active.turn_state, &turn_state) })
+    );
+    assert_eq!(
+        session
+            .input_queue
+            .take_pending_input_for_turn_state(&turn_state)
+            .await,
+        vec![TurnInput::ResponseItem(item.into())],
+    );
 }

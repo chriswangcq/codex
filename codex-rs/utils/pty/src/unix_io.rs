@@ -45,7 +45,7 @@ impl PtyIo {
         stdout_tx: mpsc::Sender<Vec<u8>>,
         mut writer_rx: mpsc::Receiver<Vec<u8>>,
         stdin_close: StdinCloseBehavior,
-    ) -> (JoinHandle<()>, JoinHandle<()>) {
+    ) -> (JoinHandle<io::Result<()>>, JoinHandle<()>) {
         let fd = self.fd;
         let reader = Arc::clone(&fd);
         let reader_handle = tokio::spawn(async move {
@@ -55,7 +55,7 @@ impl PtyIo {
                     .async_io(Interest::READABLE, |mut file| file.read(&mut buf))
                     .await
                 {
-                    Ok(0) => break,
+                    Ok(0) => return Ok(()),
                     Ok(count) => {
                         // Output caps may close the receiver before the child exits.
                         // Keep draining so a child that fills the PTY can reach EOF.
@@ -63,8 +63,8 @@ impl PtyIo {
                     }
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                     // Unix PTYs may report EIO rather than EOF when the slave closes.
-                    Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
-                    Err(err) => panic!("PTY output reader failed before EOF: {err}"),
+                    Err(err) if err.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                    Err(err) => return Err(err),
                 }
             }
         });

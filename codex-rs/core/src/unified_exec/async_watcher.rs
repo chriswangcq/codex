@@ -1,3 +1,4 @@
+use codex_protocol::openai_models::CatalogModel;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -8,7 +9,6 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
 
-use super::MonitorStreamOutput;
 use super::SharedPluginMetricsSidecar;
 use super::UnifiedExecContext;
 use super::process::OutputBuffers;
@@ -26,7 +26,6 @@ use crate::tools::events::ToolEventStage;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
-use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::CommandMonitorInfo;
 use codex_protocol::protocol::CommandMonitorTerminationReason;
 use codex_protocol::protocol::EventMsg;
@@ -189,7 +188,6 @@ pub(crate) fn spawn_exit_watcher(
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
     let interaction_lock = process.interaction_lock();
-    let monitor_stream_output = process.output_handles().monitor_stream_output.clone();
 
     tokio::spawn(async move {
         exit_token.cancelled().await;
@@ -228,7 +226,6 @@ pub(crate) fn spawn_exit_watcher(
                 String::new(),
                 message,
                 duration,
-                monitor_stream_output,
                 monitor,
                 monitor_termination_reason,
             )
@@ -260,7 +257,6 @@ pub(crate) fn spawn_exit_watcher(
                 exit_code,
                 duration,
                 timed_out,
-                monitor_stream_output,
                 monitor,
                 monitor_termination_reason,
             )
@@ -359,7 +355,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     sandbox_type: Option<codex_protocol::sandbox::SandboxType>,
     session_ref: Arc<Session>,
     turn_ref: Arc<TurnContext>,
-    model_info: Arc<ModelInfo>,
+    model_info: Arc<CatalogModel>,
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
@@ -370,23 +366,14 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     exit_code: i32,
     duration: Duration,
     timed_out: bool,
-    monitor_stream_output: Option<MonitorStreamOutput>,
     monitor: Option<CommandMonitorInfo>,
     monitor_termination_reason: Option<CommandMonitorTerminationReason>,
 ) {
-    let fallback_aggregated = resolve_aggregated_output(&output_buffer, fallback_output).await;
-    let (stdout, stderr, aggregated_output) = match monitor_stream_output {
-        Some(output) => output.snapshot().await,
-        None => (
-            fallback_aggregated.clone(),
-            String::new(),
-            fallback_aggregated,
-        ),
-    };
+    let aggregated_output = resolve_aggregated_output(&output_buffer, fallback_output).await;
     let output = ExecToolCallOutput {
         exit_code,
-        stdout: StreamOutput::new(stdout),
-        stderr: StreamOutput::new(stderr),
+        stdout: StreamOutput::new(aggregated_output.clone()),
+        stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
         timed_out,
@@ -432,7 +419,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     sandbox_type: Option<codex_protocol::sandbox::SandboxType>,
     session_ref: Arc<Session>,
     turn_ref: Arc<TurnContext>,
-    model_info: Arc<ModelInfo>,
+    model_info: Arc<CatalogModel>,
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
@@ -442,37 +429,23 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     fallback_output: String,
     message: String,
     duration: Duration,
-    monitor_stream_output: Option<MonitorStreamOutput>,
     monitor: Option<CommandMonitorInfo>,
     monitor_termination_reason: Option<CommandMonitorTerminationReason>,
 ) {
-    let fallback_combined = if fallback_output.is_empty() {
-        resolve_aggregated_output(&output_buffer, fallback_output.clone()).await
+    let stdout = if fallback_output.is_empty() {
+        resolve_aggregated_output(&output_buffer, fallback_output).await
     } else {
         fallback_output
     };
-    let (stdout, captured_stderr, captured_combined) = match monitor_stream_output {
-        Some(output) => output.snapshot().await,
-        None => (
-            fallback_combined.clone(),
-            String::new(),
-            fallback_combined.clone(),
-        ),
-    };
-    let stderr = if captured_stderr.is_empty() {
+    let aggregated_output = if stdout.is_empty() {
         message.clone()
     } else {
-        format!("{captured_stderr}\n{message}")
-    };
-    let aggregated_output = if captured_combined.is_empty() {
-        message.clone()
-    } else {
-        format!("{captured_combined}\n{message}")
+        format!("{stdout}\n{message}")
     };
     let output = ExecToolCallOutput {
         exit_code: -1,
         stdout: StreamOutput::new(stdout),
-        stderr: StreamOutput::new(stderr),
+        stderr: StreamOutput::new(message),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
         timed_out: false,

@@ -9,7 +9,6 @@ use super::utf8_boundary;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecProcessManager;
-use crate::unified_exec::process::NoopSpawnLifecycle;
 use crate::unified_exec::process::OutputBuffers;
 use crate::unified_exec::process::UnifiedExecProcess;
 use codex_protocol::items::CommandExecutionStatus;
@@ -54,7 +53,6 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         UnifiedExecProcess::from_spawned(
             spawned,
             SandboxType::None,
-            Box::new(NoopSpawnLifecycle),
             /*capture_monitor_output*/ false,
         )
         .await?,
@@ -368,13 +366,6 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
             Some("LATE_DENIAL")
         )
     );
-    assert_eq!(
-        item.formatted_output,
-        Some(codex_utils_output_truncation::formatted_truncate_text(
-            "LATE_DENIAL",
-            codex_utils_output_truncation::TruncationPolicy::Bytes(4),
-        ))
-    );
     assert!(
         elapsed >= Duration::from_millis(10) && elapsed < TRAILING_OUTPUT_GRACE,
         "completion should wait for denial without falling back to the output grace: {elapsed:?}"
@@ -384,7 +375,8 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
 }
 
 #[tokio::test]
-async fn monitor_exit_event_preserves_stdout_and_stderr_streams() -> anyhow::Result<()> {
+async fn monitor_exit_event_preserves_aggregated_output_and_termination_reason()
+-> anyhow::Result<()> {
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
     let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
@@ -404,7 +396,6 @@ async fn monitor_exit_event_preserves_stdout_and_stderr_streams() -> anyhow::Res
         UnifiedExecProcess::from_spawned(
             spawned,
             SandboxType::None,
-            Box::new(NoopSpawnLifecycle),
             /*capture_monitor_output*/ true,
         )
         .await?,
@@ -465,14 +456,13 @@ async fn monitor_exit_event_preserves_stdout_and_stderr_streams() -> anyhow::Res
         item.monitor_termination_reason,
         Some(CommandMonitorTerminationReason::TimedOut)
     );
-    assert_eq!(item.stdout.as_deref(), Some("stdout-only\n"));
-    assert_eq!(item.stderr.as_deref(), Some("stderr-only\n"));
     let aggregated = item
         .aggregated_output
         .as_deref()
         .expect("monitor completion should retain combined output");
-    assert!(aggregated.contains("stdout-only\n"));
-    assert!(aggregated.contains("stderr-only\n"));
+    let mut lines = aggregated.lines().collect::<Vec<_>>();
+    lines.sort_unstable();
+    assert_eq!(lines, vec!["stderr-only", "stdout-only"]);
 
     Ok(())
 }

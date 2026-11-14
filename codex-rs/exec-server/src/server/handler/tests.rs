@@ -12,6 +12,7 @@ use uuid::Uuid;
 use super::ExecServerHandler;
 use crate::ExecServerRuntimeOptions;
 use crate::ProcessId;
+use crate::discover_v2::capability_manager::CapabilityManager;
 use crate::protocol::ExecParams;
 use crate::protocol::InitializeParams;
 use crate::protocol::ReadParams;
@@ -94,6 +95,7 @@ async fn initialized_handler() -> Arc<ExecServerHandler> {
     let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let handler = Arc::new(ExecServerHandler::new(
         registry,
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(outgoing_tx),
         test_runtime_paths(),
         test_http_client_factory(),
@@ -174,6 +176,7 @@ async fn long_poll_read_fails_after_session_resume() {
     let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let first_handler = Arc::new(ExecServerHandler::new(
         Arc::clone(&registry),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(first_tx),
         test_runtime_paths(),
         test_http_client_factory(),
@@ -218,6 +221,7 @@ async fn long_poll_read_fails_after_session_resume() {
     let (second_tx, _second_rx) = mpsc::channel(16);
     let second_handler = Arc::new(ExecServerHandler::new(
         registry,
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(second_tx),
         test_runtime_paths(),
         test_http_client_factory(),
@@ -252,6 +256,7 @@ async fn active_session_resume_is_rejected() {
     let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let first_handler = Arc::new(ExecServerHandler::new(
         Arc::clone(&registry),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(first_tx),
         test_runtime_paths(),
         test_http_client_factory(),
@@ -267,6 +272,7 @@ async fn active_session_resume_is_rejected() {
     let (second_tx, _second_rx) = mpsc::channel(16);
     let second_handler = Arc::new(ExecServerHandler::new(
         registry,
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(second_tx),
         test_runtime_paths(),
         test_http_client_factory(),
@@ -296,6 +302,7 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let handler = Arc::new(ExecServerHandler::new(
         SessionRegistry::new(crate::ExecServerTelemetry::default()),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(outgoing_tx),
         test_runtime_paths(),
         test_http_client_factory(),

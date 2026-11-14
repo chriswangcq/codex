@@ -1,11 +1,14 @@
+use super::monitor_lifecycle::MONITOR_WORKER_SHUTDOWN_GRACE_PERIOD;
 use super::*;
-use crate::shell::Shell;
-use crate::shell::ShellInvocation;
-use crate::shell::ShellType;
+use crate::tools::handlers::unified_exec::preparation::ExecCommandLifetime;
+use crate::tools::handlers::unified_exec::preparation::ParsedExecCommand;
+use crate::unified_exec::TerminateMonitorResult;
 use crate::unified_exec::clamp_yield_time;
+use codex_exec_server::ExecOutputStream;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
+use std::path::PathBuf;
 use tokio::sync::Notify;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -59,6 +62,65 @@ async fn deterministic_process_ids_are_not_reused_after_removal() {
     let second = manager.allocate_process_id().await;
 
     assert_eq!((first, second), (1000, 1001));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn deterministic_process_ids_are_not_reused_after_registered_process_stops() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+        CancellationToken::new(),
+        "call-registered-id".to_string(),
+    );
+    let manager = UnifiedExecProcessManager::default();
+    let process_id = manager.allocate_process_id().await;
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let fixture = test_process_entry(
+        process_id,
+        Arc::clone(&process),
+        ProcessPurpose::Terminal,
+        &turn,
+    );
+    start_streaming_output(&process, &context, /*emit_output_deltas*/ false);
+    manager
+        .store_process(
+            Arc::clone(&process),
+            &context,
+            &["test command".to_string()],
+            fixture.hook_command,
+            fixture.cwd,
+            fixture.environment_id,
+            fixture.permissions,
+            /*plugin_attribution*/ None,
+            Instant::now(),
+            process_id,
+            /*tty*/ false,
+            /*network_approval*/ None,
+            /*network_denial_monitor*/ None,
+            /*metrics_sidecar*/ None,
+            Arc::clone(&process.output_handles().output_buffer),
+            Arc::new(AtomicBool::new(false)),
+            ProcessPurpose::Terminal,
+            /*monitor_done*/ None,
+        )
+        .await;
+    assert!(manager.resolve_terminal(process_id).await.is_ok());
+
+    assert!(manager.terminate_process(process_id).await);
+
+    assert!(manager.process_store.lock().await.processes.is_empty());
+    assert_eq!(manager.allocate_process_id().await, process_id + 1);
 }
 
 #[test]
@@ -354,10 +416,11 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
         output_notify: Arc::clone(&output_notify),
         monitor_capture: Arc::new(std::sync::Mutex::new(None)),
         monitor_capture_rx: Arc::new(std::sync::Mutex::new(None)),
-        monitor_stream_output: None,
         output_closed: Arc::clone(&output_closed),
         output_closed_notify: Arc::clone(&output_closed_notify),
         cancellation_token: cancellation_token.clone(),
+        collection_finished: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
     };
 
     let collect = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -367,7 +430,10 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
     );
     let produce = async {
         for chunk in chunks {
-            output_buffer.lock().await.push_chunk(chunk);
+            output_buffer
+                .lock()
+                .await
+                .push_chunk(ExecOutputStream::Stdout, chunk);
             output_notify.notify_one();
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
@@ -399,8 +465,8 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
 #[tokio::test]
 async fn output_collection_preserves_omissions_from_drained_buffer() {
     let mut buffered_output = OutputBuffers::<10>::default();
-    buffered_output.push_chunk(&[b'a'; 10]);
-    buffered_output.push_chunk(b"overflow");
+    buffered_output.push_chunk(ExecOutputStream::Stdout, &[b'a'; 10]);
+    buffered_output.push_chunk(ExecOutputStream::Stdout, b"overflow");
     let mut expected = HeadTailBuffer::<10>::default();
     expected.push_chunk(&[b'a'; 10]);
     expected.push_chunk(b"overflow");
@@ -415,10 +481,11 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
         output_notify,
         monitor_capture: Arc::new(std::sync::Mutex::new(None)),
         monitor_capture_rx: Arc::new(std::sync::Mutex::new(None)),
-        monitor_stream_output: None,
         output_closed,
         output_closed_notify,
         cancellation_token,
+        collection_finished: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
     };
 
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -1028,22 +1095,17 @@ async fn monitor_full_exit_requires_normal_transport_output_completion() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pending_monitor_cleanup_releases_id_only_after_confirmed_termination() {
+async fn pending_monitor_cleanup_preserves_deterministic_id_history() {
     let process = remote_process_with_root_exit(/*output_closed*/ true).await;
     let manager = UnifiedExecProcessManager::default();
-    manager.register_pending_monitor_process(1000, Arc::clone(&process));
-    manager
-        .process_store
-        .lock()
-        .await
-        .reserved_process_ids
-        .insert(1000);
+    let process_id = manager.allocate_process_id().await;
+    manager.register_pending_monitor_process(process_id, Arc::clone(&process));
 
-    finish_pending_monitor_start_cleanup(process, 1000, &manager).await;
+    finish_pending_monitor_start_cleanup(process, process_id, &manager).await;
 
-    let store = manager.process_store.lock().await;
-    assert!(!store.reserved_process_ids.contains(&1000));
-    assert!(!store.processes.contains_key(&1000));
+    assert!(manager.pending_monitor_processes_snapshot().is_empty());
+    assert!(manager.process_store.lock().await.processes.is_empty());
+    assert_eq!(manager.allocate_process_id().await, process_id + 1);
 }
 
 #[cfg(unix)]
@@ -1242,7 +1304,9 @@ async fn monitor_registration_retains_root_exited_process_until_output_closes() 
     );
 
     assert!(matches!(
-        manager.refresh_process_state(1000, true).await,
+        manager
+            .refresh_process_state(1000, &process, OutputRetention::UntilCollected)
+            .await,
         ProcessStatus::Alive { .. }
     ));
     assert!(
@@ -1256,7 +1320,9 @@ async fn monitor_registration_retains_root_exited_process_until_output_closes() 
 
     mark_remote_output_completed(&process).await;
     assert!(matches!(
-        manager.refresh_process_state(1000, true).await,
+        manager
+            .refresh_process_state(1000, &process, OutputRetention::UntilCollected)
+            .await,
         ProcessStatus::Exited { .. }
     ));
     assert!(
@@ -1317,7 +1383,7 @@ async fn failed_task_stop_keeps_monitor_registered_and_running() {
 
 #[cfg(unix)]
 #[tokio::test(start_paused = true)]
-async fn failed_capacity_termination_reinserts_monitor_without_false_killed_status() {
+async fn failed_capacity_termination_keeps_monitor_without_false_killed_status() {
     let (_, turn) = crate::session::tests::make_session_and_context().await;
     let process = Arc::new(
         crate::unified_exec::blocking_terminate_remote_process(
@@ -1330,7 +1396,7 @@ async fn failed_capacity_termination_reinserts_monitor_without_false_killed_stat
     let entry = test_process_entry(1000, Arc::clone(&process), purpose.clone(), &turn);
     {
         let mut store = manager.process_store.lock().await;
-        store.reserved_process_ids.insert(1000);
+        store.processes.insert(1000, entry);
         store
             .monitor_statuses
             .insert("bcapacity".to_string(), MonitorTaskStatus::Running);
@@ -1340,13 +1406,15 @@ async fn failed_capacity_termination_reinserts_monitor_without_false_killed_stat
                 process: Arc::clone(&process),
                 process_id: 1000,
                 command: "capacity command".to_string(),
-                purpose,
+                purpose: purpose.clone(),
             },
         );
     }
     let candidate = CapacityPruneCandidate {
         monitor_stop_guard: Some(process.begin_monitor_stop()),
-        entry,
+        process_id: 1000,
+        process: Arc::clone(&process),
+        purpose,
     };
     let prune = tokio::spawn({
         let manager = Arc::clone(&manager);
@@ -1377,21 +1445,69 @@ async fn failed_capacity_termination_reinserts_monitor_without_false_killed_stat
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cancelled_capacity_termination_keeps_monitor_addressable() {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
+    let process = Arc::new(
+        crate::unified_exec::blocking_terminate_remote_process(
+            /*capture_monitor_output*/ true,
+        )
+        .await,
+    );
+    let manager = UnifiedExecProcessManager::default();
+    let (purpose, stop_rx) = test_monitor_purpose("bcancelprune");
+    manager.process_store.lock().await.processes.insert(
+        1000,
+        test_process_entry(1000, Arc::clone(&process), purpose.clone(), &turn),
+    );
+    let candidate = CapacityPruneCandidate {
+        process_id: 1000,
+        process: Arc::clone(&process),
+        purpose,
+        monitor_stop_guard: Some(process.begin_monitor_stop()),
+    };
+    let mut prune = Box::pin(manager.finish_capacity_prune(candidate));
+    assert!(futures::poll!(&mut prune).is_pending());
+    assert!(process.is_monitor_stop_pending());
+
+    drop(prune);
+
+    let terminal = manager
+        .resolve_terminal(1000)
+        .await
+        .expect("cancelled cleanup must leave the process addressable");
+    assert!(Arc::ptr_eq(&terminal.process, &process));
+    assert!(!process.is_monitor_stop_pending());
+    assert_eq!(*stop_rx.borrow(), None);
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .reserved_process_ids
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn completed_task_authority_wins_over_late_capacity_cleanup() {
     let (_, turn) = crate::session::tests::make_session_and_context().await;
     let process = remote_process_with_root_exit(/*output_closed*/ true).await;
     let manager = UnifiedExecProcessManager::default();
     let (purpose, stop_rx) = test_monitor_purpose("bcapacitydone");
-    let entry = test_process_entry(1000, Arc::clone(&process), purpose, &turn);
-    manager
-        .process_store
-        .lock()
-        .await
-        .monitor_statuses
-        .insert("bcapacitydone".to_string(), MonitorTaskStatus::Completed);
+    let entry = test_process_entry(1000, Arc::clone(&process), purpose.clone(), &turn);
+    {
+        let mut store = manager.process_store.lock().await;
+        store.processes.insert(1000, entry);
+        store
+            .monitor_statuses
+            .insert("bcapacitydone".to_string(), MonitorTaskStatus::Completed);
+    }
     let candidate = CapacityPruneCandidate {
         monitor_stop_guard: Some(process.begin_monitor_stop()),
-        entry,
+        process_id: 1000,
+        process: Arc::clone(&process),
+        purpose,
     };
 
     manager.finish_capacity_prune(candidate).await;
@@ -1413,8 +1529,10 @@ async fn completed_task_authority_wins_over_late_capacity_cleanup() {
 async fn failed_session_shutdown_termination_keeps_process_addressable() {
     let (_, turn) = crate::session::tests::make_session_and_context().await;
     let process = Arc::new(
-        crate::unified_exec::blocking_terminate_remote_process(
-            /*capture_monitor_output*/ false,
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            Some("termination denied".to_string()),
+            codex_sandboxing::SandboxType::None,
         )
         .await,
     );
@@ -1426,17 +1544,38 @@ async fn failed_session_shutdown_termination_keeps_process_addressable() {
             test_process_entry(45, process, ProcessPurpose::Terminal, &turn),
         );
     }
-    let shutdown = tokio::spawn({
-        let manager = Arc::clone(&manager);
-        async move { manager.terminate_all_processes().await }
-    });
-    tokio::task::yield_now().await;
-    tokio::time::advance(crate::unified_exec::TERMINATE_CONFIRMATION_TIMEOUT).await;
-    shutdown.await.expect("session termination should finish");
+    manager.terminate_all_processes().await;
 
     let store = manager.process_store.lock().await;
     assert!(store.processes.contains_key(&45));
     assert!(!store.reserved_process_ids.contains(&45));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_shutdown_accepts_ordinary_termination_without_output_closure() {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let manager = UnifiedExecProcessManager::default();
+    manager.process_store.lock().await.processes.insert(
+        45,
+        test_process_entry(45, Arc::clone(&process), ProcessPurpose::Terminal, &turn),
+    );
+    assert!(!process.has_exited());
+    assert!(!process.output_completed_normally());
+
+    tokio::time::timeout(Duration::from_secs(1), manager.terminate_all_processes())
+        .await
+        .expect("ordinary cleanup should require only executor acknowledgement");
+
+    assert!(manager.process_store.lock().await.processes.is_empty());
 }
 
 #[tokio::test]
@@ -1449,16 +1588,121 @@ async fn network_denial_fallback_message_names_sandbox_network_proxy() {
     );
 }
 
-#[tokio::test]
-async fn late_network_denial_grace_observes_cancellation_after_exit() {
-    let cancellation = CancellationToken::new();
-    let cancellation_for_task = cancellation.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        cancellation_for_task.cancel();
-    });
+#[tokio::test(start_paused = true)]
+async fn late_network_denial_grace_observes_cancellation_after_exit() -> anyhow::Result<()> {
+    use crate::environment_selection::EnvironmentAttachment;
+    use crate::environment_selection::TurnEnvironmentSnapshot;
+    use crate::environment_selection::TurnEnvironmentState;
+    use crate::guardian::GuardianNetworkAccessTrigger;
+    use crate::tools::network_approval::NetworkApprovalSpec;
+    use crate::tools::network_approval::begin_network_approval;
+    use crate::tools::network_approval::build_blocked_request_observer;
+    use codex_network_proxy::BlockedRequest;
+    use codex_network_proxy::BlockedRequestArgs;
+    use codex_network_proxy::EnvironmentNetworkPolicy;
+    use codex_tools::ToolName;
 
-    assert!(wait_for_late_network_denial(Some(cancellation)).await);
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    Arc::make_mut(&mut turn.config).permissions.network = None;
+    let mut remote = turn
+        .initial_environments
+        .primary()
+        .expect("primary environment")
+        .clone();
+    let remote_id = codex_exec_server::REMOTE_ENVIRONMENT_ID;
+    let (attachment, _guard, _) = EnvironmentAttachment::new(
+        remote_id,
+        Arc::new(codex_exec_server::Environment::create_for_tests(Some(
+            "ws://127.0.0.1:1".into(),
+        ))?),
+    );
+    remote.attachment = attachment;
+    remote.selection.environment_id = remote_id.to_string();
+    remote.config_mut().permission_profile =
+        codex_protocol::models::PermissionProfileSnapshot::legacy(
+            codex_protocol::models::PermissionProfile::workspace_write(),
+        );
+    remote.config_mut().network_policy = Some(EnvironmentNetworkPolicy::from_config(
+        &codex_network_proxy::NetworkProxyConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        /*managed_allowed_domains_only*/ false,
+    ));
+    let environments = TurnEnvironmentSnapshot {
+        environments: vec![TurnEnvironmentState::Ready(remote)],
+    };
+    let remote = environments.primary().expect("remote environment");
+
+    for register_shared_listener in [false, true] {
+        let approval = begin_network_approval(
+            &session,
+            &turn,
+            &environments,
+            /*managed_network_active*/ true,
+            Some(NetworkApprovalSpec {
+                network: None,
+                environment_id: remote_id.to_string(),
+                tool_name: ToolName::plain("exec_command"),
+                command: "pwd".into(),
+                trigger: GuardianNetworkAccessTrigger {
+                    call_id: "exec".into(),
+                    tool_name: "exec_command".into(),
+                    command: vec!["pwd".into()],
+                    cwd: remote.cwd().clone(),
+                    sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                    additional_permissions: None,
+                    justification: None,
+                    tty: None,
+                },
+                permission_profile: remote.permission_profile().clone(),
+                network_policy: remote.config().network_policy.clone(),
+            }),
+        )
+        .await
+        .expect("build network proxy")
+        .expect("network approval");
+        let callback = approval
+            .execution_proxy()
+            .remote_policy_decider(/*allow_local_binding*/ true)
+            .expect("remote policy callback");
+        let finish = finish_deferred_network_approval_after_process_exit_for_session(
+            Some(&session),
+            approval.into_deferred(),
+        );
+        tokio::pin!(finish);
+        assert!(futures::poll!(&mut finish).is_pending());
+
+        let observer = register_shared_listener.then(|| {
+            build_blocked_request_observer(Arc::clone(&session.services.network_approval))
+        });
+        drop(callback);
+        if let Some(observer) = observer {
+            // A shared listener started during the command and can report an untagged denial.
+            tokio::time::advance(Duration::from_millis(10)).await;
+            assert!(futures::poll!(&mut finish).is_pending());
+            let blocked = BlockedRequest::new(BlockedRequestArgs {
+                host: "blocked.example".into(),
+                protocol: "http".into(),
+                port: Some(80),
+                reason: "not_allowed".into(),
+                decision: Some("deny".into()),
+                source: Some("decider".into()),
+                client: None,
+                method: None,
+                mode: None,
+            });
+            let expected = crate::network_policy_decision::denied_network_policy_message(&blocked)
+                .expect("blocked request must describe the denied host");
+            observer.on_blocked_request(blocked).await;
+            assert_eq!(finish.await, Err(expected));
+        } else {
+            assert_eq!(futures::poll!(&mut finish), std::task::Poll::Ready(Ok(())));
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -1470,56 +1714,39 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         tokio_util::sync::CancellationToken::new(),
         "call-unified-denied".to_string(),
     );
+    let environment = turn
+        .initial_environments
+        .primary()
+        .expect("primary environment");
+    let prepared = ParsedExecCommand::parse(
+        r#"{"cmd":"echo before"}"#,
+        &session,
+        &context.step_context,
+        environment,
+    )
+    .expect("parse command")
+    .prepare(ExecCommandLifetime::Interactive)
+    .expect("prepare command");
     let request = ExecCommandRequest {
-        command: vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            "echo before".to_string(),
-        ],
-        shell: ShellInvocation {
-            shell: Shell {
-                shell_type: ShellType::Sh,
-                shell_path: "sh".into(),
-            },
-            use_login_shell: true,
-        },
-        hook_command: "echo before".to_string(),
+        prepared,
         process_id: 123,
-        yield_time_ms: 1000,
-        max_output_tokens: None,
-        #[allow(deprecated)]
-        cwd: turn.cwd.clone().into(),
-        #[allow(deprecated)]
-        sandbox_cwd: turn.cwd.clone().into(),
-        turn_environment: turn
-            .initial_environments
-            .primary()
-            .cloned()
-            .expect("primary environment"),
-        shell_mode: codex_tools::UnifiedExecShellMode::Direct,
         network: None,
-        tty: true,
-        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
-        additional_permissions: None,
-        additional_permissions_preapproved: false,
-        justification: None,
-        prefix_rule: None,
-        monitor: None,
     };
 
     let output_buffer = Arc::new(tokio::sync::Mutex::new(OutputBuffers::default()));
-    output_buffer.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
+    output_buffer
+        .lock()
+        .await
+        .push_chunk(ExecOutputStream::Stdout, b"PARTIAL_TRANSCRIPT");
 
     emit_failed_initial_exec_end_if_unstored(
-        /*process_started_alive*/ false,
+        /*process_stored*/ false,
         Some(codex_protocol::sandbox::SandboxType::WindowsMxc),
         &context,
         &request,
-        #[allow(deprecated)]
-        turn.cwd.clone().into(),
+        request.prepared.cwd.clone(),
         /*plugin_attribution*/ None,
         output_buffer,
-        /*monitor_stream_output*/ None,
         "PRE_DENIAL_MARKER".to_string(),
         "Network access denied".to_string(),
         Duration::from_millis(7),
@@ -1652,7 +1879,9 @@ async fn capacity_prune_raises_monitor_stop_before_returning_candidate() {
     let candidate = UnifiedExecProcessManager::prune_processes_if_needed(&mut store)
         .expect("capacity should select the oldest monitor");
 
-    assert_eq!(candidate.entry.process_id, 1);
+    assert_eq!(candidate.process_id, 1);
+    assert_eq!(store.processes.len(), MAX_UNIFIED_EXEC_PROCESSES);
+    assert!(store.processes.contains_key(&1));
     assert!(process.is_monitor_stop_pending());
     drop(candidate);
     assert!(!process.is_monitor_stop_pending());
@@ -1722,7 +1951,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
 
     assert_eq!(
         (
-            pruned.map(|candidate| candidate.entry.process_id),
+            pruned.map(|candidate| candidate.process_id),
             store.processes.len()
         ),
         (None, MAX_UNIFIED_EXEC_PROCESSES)

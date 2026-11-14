@@ -138,14 +138,13 @@ async fn checked_terminate_propagates_kill_failure_and_retains_terminator() {
     let exit_code = Arc::new(StdMutex::new(None));
     let exit_notify = Arc::new(tokio::sync::Notify::new());
     let reader_handle = tokio::spawn(std::future::pending());
-    let reader_abort_handle = reader_handle.abort_handle();
     let session = ProcessHandle::new(
         writer_tx,
         Box::new(FailOnceTerminator {
             attempts: Arc::clone(&attempts),
         }),
-        reader_handle,
-        vec![reader_abort_handle],
+        Some(reader_handle),
+        /*stderr_reader*/ None,
         tokio::spawn(async {}),
         tokio::spawn(std::future::pending()),
         exit_status,
@@ -172,15 +171,14 @@ async fn checked_terminate_uses_force_mode_after_root_exit() {
     let force_attempts = Arc::new(AtomicUsize::new(0));
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
     let reader_handle = tokio::spawn(std::future::pending());
-    let reader_abort_handle = reader_handle.abort_handle();
     let session = ProcessHandle::new(
         writer_tx,
         Box::new(CheckedModeTerminator {
             regular_attempts: Arc::clone(&regular_attempts),
             force_attempts: Arc::clone(&force_attempts),
         }),
-        reader_handle,
-        vec![reader_abort_handle],
+        Some(reader_handle),
+        /*stderr_reader*/ None,
         tokio::spawn(async {}),
         tokio::spawn(async {}),
         Arc::new(AtomicBool::new(true)),
@@ -199,7 +197,7 @@ async fn checked_terminate_uses_force_mode_after_root_exit() {
 }
 
 #[tokio::test]
-async fn aborted_reader_wrapper_does_not_claim_output_eof() {
+async fn aborted_reader_does_not_claim_output_eof() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
     let session = ProcessHandle::new(
@@ -207,8 +205,8 @@ async fn aborted_reader_wrapper_does_not_claim_output_eof() {
         Box::new(CountingTerminator {
             attempts: Arc::clone(&attempts),
         }),
-        tokio::spawn(std::future::pending()),
-        Vec::new(),
+        Some(tokio::spawn(std::future::pending())),
+        /*stderr_reader*/ None,
         tokio::spawn(async {}),
         tokio::spawn(std::future::pending()),
         Arc::new(AtomicBool::new(false)),
@@ -219,9 +217,126 @@ async fn aborted_reader_wrapper_does_not_claim_output_eof() {
     );
 
     session.terminate();
-    tokio::task::yield_now().await;
+    let mut completion = session.output_completion();
+    let outcome = completion
+        .wait_for(Option::is_some)
+        .await
+        .expect("cancelled reader reports an outcome");
 
+    assert_eq!(*outcome, Some(false));
     assert!(!session.output_closed());
+}
+
+#[tokio::test]
+async fn output_closure_requires_both_readers_and_confirmation_requires_root_exit() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let (stdout_eof_tx, stdout_eof_rx) = tokio::sync::oneshot::channel();
+    let (stderr_eof_tx, stderr_eof_rx) = tokio::sync::oneshot::channel();
+    let exit_status = Arc::new(AtomicBool::new(false));
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(CountingTerminator {
+            attempts: Arc::clone(&attempts),
+        }),
+        Some(tokio::spawn(async move {
+            stdout_eof_rx.await.expect("stdout EOF signal");
+            Ok(())
+        })),
+        Some(tokio::spawn(async move {
+            stderr_eof_rx.await.expect("stderr EOF signal");
+            Ok(())
+        })),
+        tokio::spawn(async {}),
+        tokio::spawn(async {}),
+        Arc::clone(&exit_status),
+        Arc::new(StdMutex::new(None)),
+        Arc::new(tokio::sync::Notify::new()),
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+
+    stdout_eof_tx.send(()).expect("complete stdout");
+    let stdout_reader = session.stdout_reader().expect("stdout reader");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !stdout_reader.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stdout reader finishes");
+    assert!(!session.output_closed());
+
+    stderr_eof_tx.send(()).expect("complete stderr");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        session.wait_for_output_closed(),
+    )
+    .await
+    .expect("both EOFs close output");
+    assert_eq!(
+        session
+            .confirm_termination()
+            .expect_err("root still runs")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    exit_status.store(true, Ordering::SeqCst);
+    session
+        .confirm_termination()
+        .expect("root and output exited");
+    session.try_request_terminate().expect("already terminated");
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stderr_read_failure_keeps_checked_termination_unconfirmed() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let session = ProcessHandle::new(
+        writer_tx,
+        Box::new(CountingTerminator {
+            attempts: Arc::clone(&attempts),
+        }),
+        Some(tokio::spawn(async { Ok(()) })),
+        Some(tokio::spawn(async {
+            Err(io::Error::other("injected read failure"))
+        })),
+        tokio::spawn(async {}),
+        tokio::spawn(async {}),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(StdMutex::new(Some(0))),
+        Arc::new(tokio::sync::Notify::new()),
+        /*pty_handles*/ None,
+        /*resizer*/ None,
+    );
+    let mut completion = session.output_completion();
+    assert_eq!(
+        *completion
+            .wait_for(Option::is_some)
+            .await
+            .expect("read failure reports an outcome"),
+        Some(false)
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            session.wait_for_output_closed(),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        session
+            .confirm_termination()
+            .expect_err("read failure is not EOF")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    session
+        .try_request_terminate()
+        .expect("terminator remains available");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -233,8 +348,8 @@ async fn checked_terminate_is_idempotent_after_root_and_output_exit() {
         Box::new(CountingTerminator {
             attempts: Arc::clone(&attempts),
         }),
-        tokio::spawn(async {}),
-        Vec::new(),
+        Some(tokio::spawn(async { Ok(()) })),
+        /*stderr_reader*/ None,
         tokio::spawn(async {}),
         tokio::spawn(async {}),
         Arc::new(AtomicBool::new(true)),
@@ -267,8 +382,8 @@ async fn ordinary_cleanup_retires_terminator_after_root_and_output_eof() {
         Box::new(CountingTerminator {
             attempts: Arc::clone(&attempts),
         }),
-        tokio::spawn(async {}),
-        Vec::new(),
+        Some(tokio::spawn(async { Ok(()) })),
+        /*stderr_reader*/ None,
         tokio::spawn(async {}),
         tokio::spawn(async {}),
         Arc::new(AtomicBool::new(true)),
@@ -359,15 +474,14 @@ async fn ordinary_post_exit_cleanup_preserves_force_retry_on_windows() {
     let force_attempts = Arc::new(AtomicUsize::new(0));
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
     let reader_handle = tokio::spawn(std::future::pending());
-    let reader_abort_handle = reader_handle.abort_handle();
     let session = ProcessHandle::new(
         writer_tx,
         Box::new(CheckedModeTerminator {
             regular_attempts: Arc::clone(&regular_attempts),
             force_attempts: Arc::clone(&force_attempts),
         }),
-        reader_handle,
-        vec![reader_abort_handle],
+        Some(reader_handle),
+        /*stderr_reader*/ None,
         tokio::spawn(async {}),
         tokio::spawn(async {}),
         Arc::new(AtomicBool::new(true)),
@@ -1987,3 +2101,7 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[path = "spawn_helper_tests.rs"]
+pub(crate) mod spawn_helper_tests;

@@ -124,43 +124,20 @@ type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 pub struct ProcessHandle {
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
-    reader_handle: StdMutex<Option<JoinHandle<()>>>,
-    reader_abort_handles: StdMutex<Vec<AbortHandle>>,
+    stdout_reader: Option<AbortHandle>,
+    stderr_reader: Option<AbortHandle>,
     writer_handle: StdMutex<Option<JoinHandle<()>>>,
     wait_handle: StdMutex<Option<JoinHandle<()>>>,
     exit_status: Arc<AtomicBool>,
     exit_code: Arc<StdMutex<Option<i32>>>,
     exit_notify: Arc<Notify>,
-    output_closed: Arc<AtomicBool>,
-    output_closed_notify: Arc<Notify>,
+    output_completion: watch::Receiver<Option<bool>>,
     // PtyHandles must be preserved because the process will receive Control+C if the
     // slave is closed
     _pty_handles: StdMutex<Option<PtyHandles>>,
     // Optional resize hook for driver-backed sessions that proxy PTY control to
     // another backend instead of owning local PTY handles.
     resizer: StdMutex<Option<ResizeFn>>,
-}
-
-struct OutputClosedGuard {
-    output_closed: Arc<AtomicBool>,
-    output_closed_notify: Arc<Notify>,
-    completed: bool,
-}
-
-impl OutputClosedGuard {
-    fn mark_completed(&mut self) {
-        self.completed = true;
-    }
-}
-
-impl Drop for OutputClosedGuard {
-    fn drop(&mut self) {
-        if self.completed {
-            self.output_closed
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        self.output_closed_notify.notify_waiters();
-    }
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -174,8 +151,8 @@ impl ProcessHandle {
     pub(crate) fn new(
         writer_tx: mpsc::Sender<Vec<u8>>,
         killer: Box<dyn ChildTerminator>,
-        reader_handle: JoinHandle<()>,
-        reader_abort_handles: Vec<AbortHandle>,
+        stdout_reader: Option<JoinHandle<io::Result<()>>>,
+        stderr_reader: Option<JoinHandle<io::Result<()>>>,
         writer_handle: JoinHandle<()>,
         wait_handle: JoinHandle<()>,
         exit_status: Arc<AtomicBool>,
@@ -184,37 +161,40 @@ impl ProcessHandle {
         pty_handles: Option<PtyHandles>,
         resizer: Option<ResizeFn>,
     ) -> Self {
-        let output_closed = Arc::new(AtomicBool::new(false));
-        let output_closed_notify = Arc::new(Notify::new());
-        let reader_handle = tokio::spawn({
-            let output_closed = Arc::clone(&output_closed);
-            let output_closed_notify = Arc::clone(&output_closed_notify);
-            async move {
-                let mut guard = OutputClosedGuard {
-                    output_closed,
-                    output_closed_notify,
-                    completed: false,
-                };
-                if reader_handle.await.is_ok() {
-                    guard.mark_completed();
-                }
+        let (output_completion_tx, output_completion) = watch::channel(None);
+        let stdout_abort = stdout_reader.as_ref().map(JoinHandle::abort_handle);
+        let stderr_abort = stderr_reader.as_ref().map(JoinHandle::abort_handle);
+        tokio::spawn(async move {
+            // Consumers can observe channel closure before these joins finish.
+            // Publish one authoritative outcome, including failure or cancellation.
+            let mut completed_normally = true;
+            for reader in [stdout_reader, stderr_reader].into_iter().flatten() {
+                completed_normally &= matches!(reader.await, Ok(Ok(())));
             }
+            let _ = output_completion_tx.send_replace(Some(completed_normally));
         });
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
-            reader_handle: StdMutex::new(Some(reader_handle)),
-            reader_abort_handles: StdMutex::new(reader_abort_handles),
+            stdout_reader: stdout_abort,
+            stderr_reader: stderr_abort,
             writer_handle: StdMutex::new(Some(writer_handle)),
             wait_handle: StdMutex::new(Some(wait_handle)),
             exit_status,
             exit_code,
             exit_notify,
-            output_closed,
-            output_closed_notify,
+            output_completion,
             _pty_handles: StdMutex::new(pty_handles),
             resizer: StdMutex::new(resizer),
         }
+    }
+
+    pub fn stdout_reader(&self) -> Option<AbortHandle> {
+        self.stdout_reader.clone()
+    }
+
+    pub fn stderr_reader(&self) -> Option<AbortHandle> {
+        self.stderr_reader.clone()
     }
 
     /// Returns a channel sender for writing raw bytes to the child stdin.
@@ -253,23 +233,27 @@ impl ProcessHandle {
         }
     }
 
-    /// True once all stdout/stderr producers have stopped and their reader
-    /// tasks have released the output channel senders.
+    /// True only after every stdout/stderr reader reaches EOF successfully and
+    /// releases its output sender. Cancellation and read errors are not EOF.
     pub fn output_closed(&self) -> bool {
-        self.output_closed
-            .load(std::sync::atomic::Ordering::Acquire)
+        *self.output_completion.borrow() == Some(true)
     }
 
-    /// Wait until every stdout/stderr reader has stopped producing output.
+    /// Authoritative reader outcome: pending, successful EOF, or failure/cancellation.
+    pub fn output_completion(&self) -> watch::Receiver<Option<bool>> {
+        self.output_completion.clone()
+    }
+
+    /// Wait until every stdout/stderr reader reaches EOF successfully.
     pub async fn wait_for_output_closed(&self) {
-        loop {
-            let notified = self.output_closed_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.output_closed() {
-                return;
-            }
-            notified.await;
+        let mut completion = self.output_completion();
+        if completion
+            .wait_for(|outcome| *outcome == Some(true))
+            .await
+            .is_err()
+        {
+            // A failed reader cannot prove EOF, even after the publisher is gone.
+            std::future::pending::<()>().await;
         }
     }
 
@@ -422,15 +406,11 @@ impl ProcessHandle {
     pub fn terminate(&self) {
         self.request_terminate();
 
-        if let Ok(mut h) = self.reader_handle.lock()
-            && let Some(handle) = h.take()
+        for reader in [&self.stdout_reader, &self.stderr_reader]
+            .into_iter()
+            .flatten()
         {
-            handle.abort();
-        }
-        if let Ok(mut handles) = self.reader_abort_handles.lock() {
-            for handle in handles.drain(..) {
-                handle.abort();
-            }
+            reader.abort();
         }
         if let Ok(mut h) = self.writer_handle.lock()
             && let Some(handle) = h.take()
@@ -562,7 +542,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     let ProcessDriver {
         writer_tx,
         stdout_rx: stdout_driver_rx,
-        stderr_rx: mut stderr_driver_rx,
+        stderr_rx: stderr_driver_rx,
         exit_rx,
         terminator,
         writer_handle,
@@ -576,62 +556,25 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
 
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (exit_seen_tx, exit_seen_rx) = watch::channel(false);
-    let spawn_stream_reader =
-        |mut output_rx: broadcast::Receiver<Vec<u8>>,
-         output_tx: mpsc::Sender<Vec<u8>>,
-         mut exit_seen_rx: watch::Receiver<bool>| {
-            tokio::spawn(async move {
-                loop {
-                    let recv_result = if *exit_seen_rx.borrow() {
-                        // Once exit has been observed, we no longer want a timer here. Some
-                        // backends publish the exit code before their final stdout/stderr bytes
-                        // have been forwarded through the broadcast channel, so a fixed grace
-                        // period can still drop the tail of the stream under load.
-                        //
-                        // Instead, keep waiting until the driver closes the broadcast sender.
-                        // That makes the shutdown contract explicit: the backend is responsible
-                        // for dropping its sender when it has truly finished forwarding output.
-                        output_rx.recv().await
-                    } else {
-                        tokio::select! {
-                            _ = exit_seen_rx.changed() => {
-                                continue;
-                            }
-                            result = output_rx.recv() => result,
-                        }
-                    };
-                    match recv_result {
-                        Ok(chunk) => {
-                            if output_tx.send(chunk).await.is_err() {
-                                return false;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
+    let spawn_stream_reader = |mut output_rx: broadcast::Receiver<Vec<u8>>,
+                               output_tx: mpsc::Sender<Vec<u8>>| {
+        tokio::spawn(async move {
+            // Drivers may report root exit before forwarding the final bytes.
+            // Only a closed sender establishes EOF; keep draining even if the
+            // consumer no longer needs output.
+            loop {
+                match output_rx.recv().await {
+                    Ok(chunk) => {
+                        let _ = output_tx.send(chunk).await;
                     }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
-            })
-        };
-    let stdout_reader_handle =
-        spawn_stream_reader(stdout_driver_rx, stdout_tx, exit_seen_rx.clone());
-    let stderr_reader_handle = stderr_driver_rx
-        .take()
-        .map(|rx| spawn_stream_reader(rx, stderr_tx, exit_seen_rx));
-    let mut reader_abort_handles = vec![stdout_reader_handle.abort_handle()];
-    if let Some(handle) = stderr_reader_handle.as_ref() {
-        reader_abort_handles.push(handle.abort_handle());
-    }
-    let reader_handle = tokio::spawn(async move {
-        let mut completed = matches!(stdout_reader_handle.await, Ok(true));
-        if let Some(handle) = stderr_reader_handle {
-            completed &= matches!(handle.await, Ok(true));
-        }
-        assert!(
-            completed,
-            "driver output reader task did not complete normally"
-        );
-    });
+            }
+        })
+    };
+    let stdout_reader = spawn_stream_reader(stdout_driver_rx, stdout_tx);
+    let stderr_reader = stderr_driver_rx.map(|rx| spawn_stream_reader(rx, stderr_tx));
 
     let writer_handle = writer_handle.unwrap_or_else(|| tokio::spawn(async {}));
 
@@ -649,7 +592,6 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         }
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         wait_exit_notify.notify_waiters();
-        let _ = exit_seen_tx.send(true);
         let _ = exit_tx.send(code);
     });
 
@@ -660,8 +602,8 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
             #[cfg(windows)]
             interrupt_terminates,
         }),
-        reader_handle,
-        reader_abort_handles,
+        Some(stdout_reader),
+        stderr_reader,
         writer_handle,
         wait_handle,
         exit_status,

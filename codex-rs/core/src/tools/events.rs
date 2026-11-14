@@ -36,8 +36,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::format_exec_output_str;
-
 const REJECTION_MESSAGE_MAX_TOKENS: usize = 900;
 
 pub(super) fn truncate_rejection_message(message: &str) -> String {
@@ -189,17 +187,14 @@ async fn emit_exec_command_begin(ctx: ToolEventCtx<'_>, exec_input: &ExecCommand
                 monitor: exec_input.monitor.cloned(),
                 monitor_termination_reason: exec_input.monitor_termination_reason,
                 status: CommandExecutionStatus::InProgress,
-                stdout: None,
-                stderr: None,
                 aggregated_output: None,
                 exit_code: None,
                 duration: None,
-                formatted_output: None,
             }),
         )
         .await;
 }
-// Concrete, allocation-free emitter: avoid trait objects and boxed futures.
+// Concrete emitter: avoid trait objects and boxed futures.
 pub(crate) enum ToolEmitter {
     ApplyPatch {
         changes: HashMap<PathBuf, FileChange>,
@@ -213,7 +208,7 @@ pub(crate) enum ToolEmitter {
         parsed_cmd: Vec<ParsedCommand>,
         process_id: Option<String>,
         plugin_attribution: Option<PluginCommandAttribution>,
-        monitor: Option<CommandMonitorInfo>,
+        monitor: Option<Box<CommandMonitorInfo>>,
         monitor_termination_reason: Option<CommandMonitorTerminationReason>,
     },
 }
@@ -267,7 +262,7 @@ impl ToolEmitter {
             parsed_cmd,
             process_id: Some(process_id),
             plugin_attribution,
-            monitor: Some(monitor),
+            monitor: Some(Box::new(monitor)),
             monitor_termination_reason,
         }
     }
@@ -405,7 +400,7 @@ impl ToolEmitter {
                         /*interaction_input*/ None,
                         process_id.as_deref(),
                         plugin_attribution.as_ref(),
-                        monitor.as_ref(),
+                        monitor.as_deref(),
                         *monitor_termination_reason,
                     ),
                     stage,
@@ -551,12 +546,9 @@ impl<'a> ExecCommandInput<'a> {
 }
 
 struct ExecCommandResult {
-    stdout: String,
-    stderr: String,
     aggregated_output: String,
     exit_code: i32,
     duration: Duration,
-    formatted_output: String,
     status: ExecCommandStatus,
 }
 
@@ -572,15 +564,9 @@ async fn emit_exec_stage(
         ToolEventStage::Success { output, .. }
         | ToolEventStage::Failure(ToolEventFailure::Output(output)) => {
             let exec_result = ExecCommandResult {
-                stdout: output.stdout.text.clone(),
-                stderr: output.stderr.text.clone(),
-                aggregated_output: output.aggregated_output.text.clone(),
+                aggregated_output: output.aggregated_output.text,
                 exit_code: output.exit_code,
                 duration: output.duration,
-                formatted_output: format_exec_output_str(
-                    &output,
-                    ctx.model_info.truncation_policy.into(),
-                ),
                 status: if output.exit_code == 0 {
                     ExecCommandStatus::Completed
                 } else {
@@ -592,12 +578,9 @@ async fn emit_exec_stage(
         ToolEventStage::Failure(ToolEventFailure::Message(message)) => {
             let text = message.to_string();
             let exec_result = ExecCommandResult {
-                stdout: String::new(),
-                stderr: text.clone(),
-                aggregated_output: text.clone(),
+                aggregated_output: text,
                 exit_code: -1,
                 duration: Duration::ZERO,
-                formatted_output: text,
                 status: ExecCommandStatus::Failed,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
@@ -605,12 +588,9 @@ async fn emit_exec_stage(
         ToolEventStage::Failure(ToolEventFailure::Rejected { message, .. }) => {
             let text = message.to_string();
             let exec_result = ExecCommandResult {
-                stdout: String::new(),
-                stderr: text.clone(),
-                aggregated_output: text.clone(),
+                aggregated_output: text,
                 exit_code: -1,
                 duration: Duration::ZERO,
-                formatted_output: text,
                 status: ExecCommandStatus::Declined,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
@@ -638,16 +618,13 @@ async fn emit_exec_end(
                 cwd: exec_input.cwd.clone(),
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
                 source: exec_input.source,
-                interaction_input: exec_input.interaction_input.map(str::to_owned),
+                interaction_input: None,
                 monitor: exec_input.monitor.cloned(),
                 monitor_termination_reason: exec_input.monitor_termination_reason,
                 status: exec_result.status.into(),
-                stdout: Some(exec_result.stdout),
-                stderr: Some(exec_result.stderr),
                 aggregated_output: Some(exec_result.aggregated_output),
                 exit_code: Some(exec_result.exit_code),
                 duration: Some(exec_result.duration),
-                formatted_output: Some(exec_result.formatted_output),
             }),
         )
         .await;

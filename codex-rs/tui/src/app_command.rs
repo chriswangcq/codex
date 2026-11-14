@@ -9,12 +9,12 @@ use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::UserVerificationErrorDetails;
 use codex_app_server_protocol::UserVerificationProof;
 use codex_config::types::ApprovalsReviewer;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::GuardianAssessmentEvent;
 use codex_protocol::config_types::CollaborationMode;
-use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
@@ -94,6 +94,18 @@ impl Serialize for RealtimeSpeechText {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum CloudSubmissionIntent {
+    /// Use the TUI's known turn for explicit operations such as safety retries.
+    UseKnownTurn,
+    /// Enter lets the server choose whether to start or steer the current turn.
+    StartOrSteer,
+    /// A message leaving the local queue starts a fresh turn.
+    StartIfIdle,
+    /// Use Cloud admission for answers, with steering enabled during a running turn.
+    QuestionAnswer { during_turn: bool },
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) enum AppCommand {
@@ -120,6 +132,8 @@ pub(crate) enum AppCommand {
         command: String,
     },
     UserTurn {
+        turn_trigger: &'static str,
+        cloud_submission: CloudSubmissionIntent,
         client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
@@ -132,7 +146,6 @@ pub(crate) enum AppCommand {
         service_tier: Option<Option<String>>,
         final_output_json_schema: Option<Value>,
         collaboration_mode: Option<CollaborationMode>,
-        personality: Option<Personality>,
     },
     OverrideTurnContext {
         cwd: Option<PathBuf>,
@@ -145,7 +158,6 @@ pub(crate) enum AppCommand {
         summary: Option<ReasoningSummaryConfig>,
         service_tier: Option<Option<String>>,
         collaboration_mode: Option<CollaborationMode>,
-        personality: Option<Personality>,
     },
     ExecApproval {
         id: String,
@@ -202,6 +214,16 @@ pub(crate) enum UserVerificationResponse {
         proof: UserVerificationProof,
     },
     Cancel,
+    Failed {
+        error: UserVerificationErrorDetails,
+    },
+}
+
+/// Carries only a safe display message and the closed native error category.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserVerificationFailure {
+    pub(crate) message: &'static str,
+    pub(crate) details: UserVerificationErrorDetails,
 }
 
 impl AppCommand {
@@ -223,6 +245,8 @@ impl AppCommand {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn user_turn(
+        turn_trigger: &'static str,
+        cloud_submission: CloudSubmissionIntent,
         client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
@@ -234,9 +258,10 @@ impl AppCommand {
         service_tier: Option<Option<String>>,
         final_output_json_schema: Option<Value>,
         collaboration_mode: Option<CollaborationMode>,
-        personality: Option<Personality>,
     ) -> Self {
         Self::UserTurn {
+            turn_trigger,
+            cloud_submission,
             client_user_message_id,
             items,
             cwd,
@@ -249,7 +274,6 @@ impl AppCommand {
             service_tier,
             final_output_json_schema,
             collaboration_mode,
-            personality,
         }
     }
 
@@ -265,7 +289,6 @@ impl AppCommand {
         summary: Option<ReasoningSummaryConfig>,
         service_tier: Option<Option<String>>,
         collaboration_mode: Option<CollaborationMode>,
-        personality: Option<Personality>,
     ) -> Self {
         Self::OverrideTurnContext {
             cwd,
@@ -278,7 +301,6 @@ impl AppCommand {
             summary,
             service_tier,
             collaboration_mode,
-            personality,
         }
     }
 

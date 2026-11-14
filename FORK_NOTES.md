@@ -8,7 +8,88 @@ later.
 This is a local fork. It is not an upstream proposal or a public compatibility promise. The
 release evidence applies only to the recorded source and validated host.
 
-## Status Snapshot
+## 0.169.0 Migration (2026-11-14)
+
+- Working branch: `codex/command-monitor-0169`.
+- Official stable baseline: `rust-v0.169.0`, commit
+  `d32063f96c2dff1dc96af839b3952abb6acfeda4`.
+- Previous fork retained on `codex/command-monitor` at
+  `e21abce79b7177c59509430c283111da2e3835be`.
+- Source migration and affected-area automated validation are complete. Results below apply
+  to the merge containing this ledger. No installed executable has been replaced.
+- Monitor command preparation now uses the official `PreparedExecCommand`; approval, sandbox,
+  executor selection and hooks remain on the unified-exec path.
+- Completion events reuse the official aggregated output transcript. The redundant per-monitor
+  stdout/stderr completion buffers have been removed; stdout line events and combined archives
+  retain their separate purposes.
+- Notification delivery uses the existing internal input queue and idle-turn admission.
+  The monitor worker, output policy, archive and delivery code have explicit module boundaries;
+  the TUI manager separates input/state, output refresh and rendering.
+- Checked process termination keeps a failed stop addressable in the existing process store.
+  The TUI keeps unconfirmed processes visible after `/stop` and refreshes through the existing
+  background-terminal list/restore path. Individual stops remain available after a policy halt.
+
+The experimental `ShellSnapshotV2` path retains two pre-existing ExecServer limitations: it
+has no separate stdout EOF event, so a final partial stdout line can wait for full stream closure;
+and its `Closed` event does not independently distinguish a reader error from normal EOF.
+`ShellSnapshotV2` remains disabled by default. The default direct-local monitor path retains
+per-stream EOF and checked termination. Remote monitors remain unsupported by the tool.
+
+An inherited flood-stop race can produce a flood explanation while a concurrent user stop or
+deadline supplies the final termination reason. The confirmed-stop and single-completion
+contracts remain intact; this migration does not redefine that reason priority.
+
+The native Cargo build uses the Codex V8 152.2.0 artifact pair, not the default Denoland
+download location. `scripts/codex_package/v8.py::resolve_codex_v8_cargo_env`, with
+`TARGET_SPECS["aarch64-apple-darwin"]`, checks the repository-pinned release manifest and both
+artifact hashes. Set `CODEX_REPO_ROOT` before importing that helper and pass its
+`RUSTY_V8_ARCHIVE` and `RUSTY_V8_SRC_BINDING_PATH` together to Cargo builds and tests. The
+`ptrcomp_sandbox_release` artifact profile also applies to a Cargo debug build.
+
+### Migration Validation
+
+Recorded on macOS Apple Silicon with Rust 1.95.0. This is an affected-area regression matrix,
+not a full-workspace or cross-platform certification.
+
+| Scope | Result |
+| --- | --- |
+| Complete foundation suites: PTY, head/tail buffer, core/app-server/exec-server protocols, rollout trace, thread store, rollout and Guardian reviewer | 1,412 passed; 2 intentional helper skips |
+| Core monitor/shared execution and admission, TUI/background manager/history, app-server background RPC and thread lifecycle, executor process suites, MCP transport, exec JSON and approval analytics | 1,413 passed; no retries, failures, timeouts or LEAK annotations |
+| Python generated-contract checks | 9 passed |
+| Clippy with tests for all 16 affected crates, `--locked -- -D warnings` | Passed |
+| Standard and experimental app-server schema generation; final `just fmt-check` | Passed |
+| Native CLI and matching Code Mode/app-server/executor/MCP test helpers, built with `--locked` | Passed; CLI reports `codex-cli 0.169.0` |
+
+The two Rust groups cover different crates: **2,825 passing tests** in total. The foundation
+skips are the schema-writer helper (explicitly run in both schema-generation modes) and the
+macOS pipe-child helper (invoked by its passing parent test). The second group filters out
+14,243 unrelated cases; no failing case is excluded from the selected matrix. Its monitor RPC
+scenario covers persistence across turn completion, listing, termination, the terminal reason,
+and a subsequent turn. Twenty-two scenario snapshots were reviewed for intended tool-catalog
+additions and their resulting hashes. External dependency entries remain unchanged; Cargo.lock
+only normalizes 173 workspace package versions from the upstream development placeholder to
+`0.169.0`.
+
+This host keeps Cargo outputs on an external volume. Native macOS proxy/bundle discovery in
+the very large `target/debug/deps` directory caused unrelated HTTP deadlines and watcher
+teardown failures. Identical binaries passed from a small runtime directory. The final matrix
+therefore uses official nextest build reuse and `--target-dir-remap`, with 23 executable
+hardlinks checked against the freshly built originals and process-local loopback `NO_PROXY`.
+No production timeout or retry workaround was added. A local mock-proxy fixture explicitly
+allows local targets so ambient VPN fake-IP DNS does not reject its mock upstream; the
+production network policy is unchanged.
+
+An earlier parallel run of that seven-case proxy fixture passed with one nonfatal LEAK
+annotation. Its focused serial rerun and the final full selected matrix both passed without
+that annotation; the earlier diagnostic remains recorded rather than treated as proof that
+leaks are impossible. Final filters, binary metadata and raw logs are retained locally in
+`.agent/migration-0169-20261114/`, with `validation-progress.json` identifying the final logs.
+Earlier interrupted or diagnostic logs do not supersede the final results.
+
+No installable release package, installation, live-model smoke, or additional host-platform
+validation was performed for this migration.
+
+## Previous Release Status Snapshot
 
 - Fork branch: `codex/command-monitor`
 - Upstream repository: `https://github.com/openai/codex.git`
@@ -16,9 +97,9 @@ release evidence applies only to the recorded source and validated host.
 - Upstream commit date: 2026-09-30
 - Upstream commit subject: `Bind the app-server time provider to a local variable (#49411)`
 - Claude Code behavioral reference: 2.1.223, inspected locally on 2026-08-07
-- Current status: command-monitor feature rebased onto the September 30 upstream baseline;
+- September release status: command-monitor feature rebased onto the September 30 upstream baseline;
   focused automated validation, final live-model/monitor smoke, and local installation passed
-- Current validated code commit: `ed0991f270`
+- September validated code commit: `ed0991f270`
 - September release version: `0.161.0-monitor.20260930`
 - Synchronization decision: the user requested and confirmed preservation of monitor while
   rebasing onto current upstream on 2026-09-30
@@ -48,15 +129,19 @@ Unified exec remains the process-lifecycle authority.
 
 ## Local Release Bundle
 
-The source-built local release requires two adjacent executables:
+The 0.169.0 canonical package layout is defined by `scripts/codex_package/layout.py`:
 
-- `codex`, the CLI/TUI executable; and
-- `codex-code-mode-host`, the Code Mode execution sidecar.
+- `bin/codex`, `bin/codex-code-mode-host`, and `bin/codex-exec-server`;
+- `codex-path/rg`, `codex-package.json`, and `codex-resources/`;
+- additional platform resources selected by the official package builder.
 
-`InstallContext` resolves the sidecar next to the running CLI when no packaged resource layout is
-present. Building or copying only `codex` leaves ordinary chat available but breaks Code Mode and
-any tool path routed through it. Keep both executables in the same directory; the sidecar name must
-remain exactly `codex-code-mode-host` even if the main executable is privately renamed.
+The migration builds local test executables, not an installable package. The app-server test
+helper named `exec-server` is distinct from the packaged `codex-exec-server`, which comes from
+`codex-exec-server-cli`. No package has been assembled or installed for this migration.
+
+`InstallContext` still supports an adjacent `codex-code-mode-host` for loose development
+executables. That fallback does not define the complete release layout; use the official package
+builder and its layout validation when preparing a release.
 
 ## Platform Status
 
@@ -64,7 +149,7 @@ Only platforms that have been exercised on real hardware may be described as val
 
 | Platform or surface | Status | Evidence or boundary |
 | --- | --- | --- |
-| macOS 15.7.4, Apple Silicon (`arm64`) | Validated development platform | Current implementation and manual TUI work were exercised here. The repository toolchain is Rust 1.95.0 via `codex-rs/rust-toolchain.toml`. |
+| macOS 15.7.4, Apple Silicon (`arm64`) | Validated development platform | Recorded validation uses this host; see each release section for automated and manual coverage. The repository toolchain is Rust 1.95.0 via `codex-rs/rust-toolchain.toml`. |
 | macOS Intel (`x86_64`) | Experimental | No real-machine run has been recorded. |
 | Linux `x86_64` / `aarch64` | Experimental | Unix code paths exist, but no real Linux run has been recorded for this fork. |
 | Windows `x86_64` / `arm64` | Experimental | Job-object, legacy sandbox, and elevated paths have source coverage, but no real Windows run has been recorded. |
@@ -86,7 +171,8 @@ surface in the current cycle. P2 platform expansion is paused.
 - `description`: required short label used in events and TUI history;
 - `timeout_ms`: defaults to 300,000 ms and must be at least 1,000 ms;
 - `persistent`: defaults to `false`; and
-- `environment_id`: present only where multiple local environments require selection.
+- `environment_id`: available when multiple execution environments require selection;
+  monitors can select only a local environment.
 
 For a non-persistent monitor, `timeout_ms` may not exceed 3,600,000 ms. For a persistent monitor,
 the supplied deadline is ignored and the effective `timeoutMs` returned to the model is `0`.
@@ -109,6 +195,8 @@ started with `tty: false` and are not interactive terminal sessions.
   event.
 - The model is explicitly told not to poll or sleep after starting a monitor. An event can wake a
   turn even while Codex was waiting for the user; it is not treated as a user reply.
+- Delivery uses an internal `ResponseItem` containing `<task-notification>` XML with
+  `role=user`; it does not become `UserInput` or answer a pending user question.
 
 The line and batching limits intentionally use JavaScript-compatible UTF-16 units:
 
@@ -149,8 +237,8 @@ The timeout event text is:
 ```
 
 The optional termination reason is backward compatible: older history without the field is read
-as `None`. Current core, protocol, app-server, TUI, schema, replay, and hermetic TUI validation all
-exercise this path.
+as `None`. Automated coverage spans core, protocol, app-server, TUI, schema and replay.
+Historical manual TUI evidence is recorded in the corresponding release ledger.
 
 ### Output archive and cleanup
 
@@ -224,8 +312,9 @@ history model.
   capacity termination.
 - active monitors participate in the unified-exec footer.
 - `/ps` lists background terminals and monitors.
-- `/stop` stops running monitors.
-- pressing Down while the footer is active opens the background-process manager.
+- `/stop` stops background terminals and monitors, retaining any process whose stop is not confirmed.
+- pressing Down with an empty composer, no overlay and an active footer opens the process
+  manager: details for one process, or a list for multiple processes.
 - monitor details show recent combined stdout/stderr output and allow stop actions.
 
 TUI output is intentionally bounded:
@@ -239,7 +328,7 @@ TUI output is intentionally bounded:
 Ordinary background terminals retain their existing behavior; monitor metadata is optional, so
 old command history and non-monitor commands remain representable.
 
-## Upstream synchronization (2026-09-30)
+## Historical Upstream Synchronization (2026-09-30)
 
 The monitor feature and its documentation commits have been rebased onto
 `eefe0ce1a8e39788a4de7ef5bafd47e51339610b`. Monitor remains an extension of unified exec.
@@ -257,7 +346,7 @@ client version rather than the upstream development placeholder `0.0.0`: the ser
 that version for model-catalog eligibility. The release preparation records the package
 version and exact code commit alongside the installed artifact.
 
-### Current validation ledger (2026-09-30)
+### Historical validation ledger (2026-09-30)
 
 This ledger applies to code commit `ed0991f270`, rebased onto
 `eefe0ce1a8e39788a4de7ef5bafd47e51339610b`, for release
@@ -396,7 +485,7 @@ Release finalization completed on 2026-08-07:
 - the private install, checksum, clean-`CODEX_HOME` version smoke, and precise rollback passed; and
 - the exact baseline, build-helper, and Monitor code commits are recorded below.
 
-## Reproducible Build and Installation
+## Historical Build and Installation (2026-09-30)
 
 The September release uses a separate, detached preparation checkout of the recorded code
 commit. In that checkout, set `[workspace.package].version` in `codex-rs/Cargo.toml` to
@@ -450,7 +539,7 @@ its generated `arg0` links, and both temporary directories were then removed exp
 existing system command remained `/opt/homebrew/bin/codex`; it was never overwritten.
 
 Install the fork under a non-conflicting name or explicit private path. Do not overwrite the
-official `codex` binary during validation. One possible isolated smoke flow is:
+official `codex` binary during validation. The following is the historical two-binary smoke flow, not the 0.169.0 packaging procedure:
 
 ```sh
 MONITOR_INSTALL_DIR=/an/explicit/private/bin
@@ -484,23 +573,23 @@ byte-for-byte reproducibility is not claimed until it has been measured.
 - App-server monitor listing is experimental and requires `capabilities.experimentalApi`.
 - Hard process crashes can leave sensitive monitor archive files because cleanup is session-owned
   and there is no startup scavenger.
-- The unified-exec process cap is 64; capacity pressure can terminate a monitor.
+- Unified exec has a soft capacity of 64; capacity pressure can terminate a monitor. A failed
+  or cancelled cleanup retains the addressable process and can temporarily exceed that capacity.
 - Persistent monitors are session-scoped and are not durable or resumed after restart.
-- A source-built installation is incomplete without the adjacent `codex-code-mode-host` sidecar;
-  packaging only the main executable disables Code Mode execution.
+- A release must follow the canonical package layout above; distributing only the main
+  executable omits the Code Mode host, exec-server and required runtime resources.
 
-## Deferred Upstream-Synchronization Risk Map
+## Upstream-Synchronization Boundaries
 
-No large refactor is planned now. This section exists so a future synchronization effort does not
-mistake high-conflict modules or duplicated lifecycle responsibilities for stable extension
-points.
+The 0.169.0 migration separates monitor-specific policy from the official execution and input
+paths. Future synchronization should preserve these ownership boundaries.
 
 | Boundary | Current risk | Synchronization note |
 | --- | --- | --- |
-| `codex-rs/core/src/session/command_monitor.rs` | About 2,122 lines combining framing, rate limiting, archive I/O, delivery, recovery, and lifecycle | If upstream changes this area materially, first separate framing/rate/archive/delivery/lifecycle in a behavior-preserving commit. Do not do that refactor merely for style in the current cycle. |
-| `codex-rs/core/src/unified_exec/process_manager.rs` | About 2,564 lines; monitor registry, process capacity, shutdown, archive cleanup, and generic exec management meet here | Preserve unified exec as the sole process-lifecycle authority. Avoid adding a second monitor-owned process registry during conflict resolution. |
-| `codex-rs/core/src/unified_exec/process.rs` | About 1,166 lines and coupled to confirmed termination semantics | Reconcile upstream PTY/process termination changes before adapting monitor stop paths. |
-| `codex-rs/tui/src/bottom_pane/background_processes_view.rs` | About 1,620 lines containing state, polling controller, rendering, actions, and tests | If upstream TUI churn forces a rewrite, split controller/model/render boundaries before adding more states. |
+| Session monitor | A small entry module delegates output framing/rate policy, archive I/O, worker, delivery and recovery to dedicated modules | Keep notification policy separate from official queue admission and process ownership. |
+| Unified-exec process manager | Monitor start/stop/completion lives in `process_manager/monitor_lifecycle.rs` and shares the official process store | Preserve a single owner; remove an entry only after confirmed termination and identity checks. |
+| Unified-exec process capture | Per-stream EOF, reader failures, confirmed termination and final transcript capture interact | Reconcile upstream PTY changes before adapting monitor stop paths; retain the shared aggregated output transcript. |
+| TUI background-process manager | State/input, output polling, rendering and tests have separate modules | Preserve request identity checks and keep unconfirmed stops manageable through the existing restore path. |
 | Core protocol and rollout history | Monitor metadata and optional terminal outcome propagate through current and legacy events | Keep the terminal reason optional for backward compatibility and preserve one explicit outcome model. |
 | app-server protocol and generated schemas | Small semantic changes produce wide generated-file churn | Change source protocol types first, regenerate deterministically, and keep generated outputs with the source change. |
 | PTY and Windows sandbox paths | Unix, Windows legacy, elevated, and job-object termination paths interact | Treat source tests on macOS as insufficient; do not infer Windows support without real-platform validation. |
@@ -511,9 +600,9 @@ Refactor only when an upstream conflict or a new supported surface makes the bou
 P2 work—real Linux/Windows/Intel Mac validation, remote execution, and WebSocket monitoring—remains
 paused and is not implied by this risk map.
 
-## Local Commit Structure
+## Historical Commit Structure (2026-08-07)
 
-The fork uses a deliberately small buildable sequence on top of the frozen baseline:
+The original fork used a deliberately small buildable sequence on top of the frozen baseline:
 
 1. `b890de09ab` fixes the root schema-writer recipe without changing Rust behavior.
 2. `4c5e9ff572` contains the complete vertical Monitor slice: PTY and Windows termination
@@ -526,7 +615,7 @@ The functional code stays in one commit because the protocol fields, lifecycle a
 termination API, app-server consumers, and TUI consumers must change together to keep the
 intermediate tree buildable. Tests remain with the behavior they define.
 
-## Stable Release Checklist
+## Historical Stable Release Checklist (2026-08-07)
 
 A stable local release requires all of the following. This checklist closed on 2026-08-07:
 

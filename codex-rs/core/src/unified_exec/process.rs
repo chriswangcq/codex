@@ -29,6 +29,7 @@ use codex_protocol::protocol::TruncationPolicy;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::is_likely_sandbox_denied;
 use codex_sandboxing::record_filesystem_sandbox_violation;
+use codex_utils_head_tail_buffer::HeadTailBuffer;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
@@ -37,7 +38,6 @@ use codex_utils_pty::SpawnedPty;
 use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
-use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
 use crate::shell_snapshot::ShellSnapshotFile;
 
@@ -45,26 +45,7 @@ const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
 const MONITOR_OUTPUT_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(500);
 const MONITOR_CAPTURE_CHANNEL_CAPACITY: usize = 128;
 pub(crate) const TERMINATE_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
-    /// Returns file descriptors that must stay open across the child `exec()`.
-    ///
-    /// The returned descriptors must already be valid in the parent process and
-    /// stay valid until `after_spawn()` runs, which is the first point where
-    /// the parent may release its copies.
-    fn inherited_fds(&self) -> Vec<i32> {
-        Vec::new()
-    }
-
-    fn after_spawn(&mut self) {}
-}
-
-pub(crate) type SpawnLifecycleHandle = Box<dyn SpawnLifecycle>;
-
-#[derive(Debug, Default)]
-/// Spawn lifecycle that performs no extra setup around process launch.
-pub(crate) struct NoopSpawnLifecycle;
-
-impl SpawnLifecycle for NoopSpawnLifecycle {}
+const REMOTE_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Output pending model polling and the retained completion transcript.
 /// Append both under the same lock so cancellation cannot split an update.
@@ -75,53 +56,9 @@ pub(crate) struct OutputBuffers<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX
 }
 
 impl<const MAX_BYTES: usize> OutputBuffers<MAX_BYTES> {
-    pub(super) fn push_chunk(&mut self, chunk: &[u8]) {
+    pub(super) fn push_chunk(&mut self, _stream: ExecOutputStream, chunk: &[u8]) {
         self.pending.push_chunk(chunk);
         self.transcript.push_chunk(chunk);
-    }
-}
-
-pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
-
-#[derive(Clone)]
-pub(crate) struct MonitorStreamOutput {
-    combined: Arc<Mutex<OutputBuffers>>,
-    stdout: OutputBuffer,
-    stderr: OutputBuffer,
-}
-
-impl MonitorStreamOutput {
-    pub(crate) fn new(combined: Arc<Mutex<OutputBuffers>>) -> Self {
-        Self {
-            combined,
-            stdout: Arc::new(Mutex::new(HeadTailBuffer::default())),
-            stderr: Arc::new(Mutex::new(HeadTailBuffer::default())),
-        }
-    }
-
-    async fn push_chunk(&self, bytes: Vec<u8>, is_stdout: bool) {
-        let buffer = if is_stdout {
-            &self.stdout
-        } else {
-            &self.stderr
-        };
-        buffer.lock().await.push_chunk(&bytes);
-    }
-
-    pub(crate) async fn snapshot(&self) -> (String, String, String) {
-        let stdout = self.stdout.lock().await.to_bytes_with_omission_marker();
-        let stderr = self.stderr.lock().await.to_bytes_with_omission_marker();
-        let combined = self
-            .combined
-            .lock()
-            .await
-            .transcript
-            .to_bytes_with_omission_marker();
-        (
-            String::from_utf8_lossy(&stdout).into_owned(),
-            String::from_utf8_lossy(&stderr).into_owned(),
-            String::from_utf8_lossy(&combined).into_owned(),
-        )
     }
 }
 
@@ -291,10 +228,12 @@ pub(crate) struct OutputHandles<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX
     pub(crate) output_notify: Arc<Notify>,
     pub(crate) monitor_capture: Arc<StdMutex<Option<MonitorCaptureSender>>>,
     pub(crate) monitor_capture_rx: Arc<StdMutex<Option<MonitorCaptureReceiver>>>,
-    pub(crate) monitor_stream_output: Option<MonitorStreamOutput>,
     pub(crate) output_closed: Arc<AtomicBool>,
     pub(crate) output_closed_notify: Arc<Notify>,
     pub(crate) cancellation_token: CancellationToken,
+    pub(super) drain_policy: OutputDrainPolicy,
+    /// The initial exec call returned or was cancelled, so background draining may begin.
+    pub(crate) collection_finished: CancellationToken,
 }
 
 impl OutputHandles {
@@ -336,6 +275,15 @@ impl Drop for OutputTaskGuard {
     }
 }
 
+/// Controls whether process exit can start the collectors' bounded output drain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutputDrainPolicy {
+    /// Match direct local execution when descendants retain inherited output pipes.
+    BoundedAfterExit,
+    /// Remote foreground output may still be buffered or in transit after exit.
+    WaitForOutputClosure,
+}
+
 /// Transport-specific process handle used by unified exec.
 enum ProcessHandle {
     Local(Box<ExecCommandSession>),
@@ -359,7 +307,8 @@ pub(crate) struct UnifiedExecProcess {
     output_task_finished_notify: Arc<Notify>,
     monitor_stop_pending: Arc<AtomicUsize>,
     monitor_stop_pending_notify: Arc<Notify>,
-    _spawn_lifecycle: Option<SpawnLifecycleHandle>,
+    /// Explicit termination overrides retention of remote output after exit.
+    pub(super) termination_requested: AtomicBool,
     // The shell may still need to replay this file after process startup returns.
     pub(crate) _shell_snapshot: Option<Arc<ShellSnapshotFile>>,
 }
@@ -395,7 +344,7 @@ impl UnifiedExecProcess {
     fn new(
         process_handle: ProcessHandle,
         sandbox_type: Option<SandboxType>,
-        spawn_lifecycle: Option<SpawnLifecycleHandle>,
+        drain_policy: OutputDrainPolicy,
         capture_monitor_output: bool,
     ) -> Self {
         let (monitor_capture, monitor_capture_rx) = if capture_monitor_output {
@@ -405,17 +354,16 @@ impl UnifiedExecProcess {
             (None, None)
         };
         let output_buffer = Arc::new(Mutex::new(OutputBuffers::default()));
-        let monitor_stream_output =
-            capture_monitor_output.then(|| MonitorStreamOutput::new(Arc::clone(&output_buffer)));
         let output = OutputHandles {
             output_buffer,
             output_notify: Arc::new(Notify::new()),
             monitor_capture: Arc::new(StdMutex::new(monitor_capture)),
             monitor_capture_rx: Arc::new(StdMutex::new(monitor_capture_rx)),
-            monitor_stream_output,
             output_closed: Arc::new(AtomicBool::new(false)),
             output_closed_notify: Arc::new(Notify::new()),
             cancellation_token: CancellationToken::new(),
+            drain_policy,
+            collection_finished: CancellationToken::new(),
         };
         let output_drained = Arc::new(Notify::new());
         let output_task_finished = Arc::new(AtomicBool::new(false));
@@ -438,7 +386,7 @@ impl UnifiedExecProcess {
             monitor_stop_pending_notify: Arc::new(Notify::new()),
             sandbox_type,
             timed_out: AtomicBool::new(false),
-            _spawn_lifecycle: spawn_lifecycle,
+            termination_requested: AtomicBool::new(false),
             _shell_snapshot: None,
         }
     }
@@ -540,6 +488,7 @@ impl UnifiedExecProcess {
     }
 
     fn finish_termination(&self) {
+        self.termination_requested.store(true, Ordering::Release);
         self.output.cancellation_token.cancel();
         if let Some(output_task) = &self.output_task {
             let monitor_capture_active = self
@@ -807,7 +756,6 @@ impl UnifiedExecProcess {
     pub(super) async fn from_spawned(
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
-        spawn_lifecycle: SpawnLifecycleHandle,
         capture_monitor_output: bool,
     ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
@@ -816,15 +764,17 @@ impl UnifiedExecProcess {
             stderr_rx,
             mut exit_rx,
         } = spawned;
+        let output_completion = process_handle.output_completion();
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
             Some(sandbox_type),
-            Some(spawn_lifecycle),
+            OutputDrainPolicy::BoundedAfterExit,
             capture_monitor_output,
         );
         managed.output_task = Some(Self::spawn_local_output_task(
             stdout_rx,
             stderr_rx,
+            output_completion,
             managed.output_handles().clone(),
             managed.output_tx.clone(),
             Arc::clone(&managed.output_task_finished),
@@ -869,6 +819,7 @@ impl UnifiedExecProcess {
 
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
+        output_drain_policy: OutputDrainPolicy,
         capture_monitor_output: bool,
     ) -> Result<Self, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
@@ -878,12 +829,13 @@ impl UnifiedExecProcess {
         let mut managed = Self::new(
             process_handle,
             sandbox_type,
-            /*spawn_lifecycle*/ None,
+            output_drain_policy,
             capture_monitor_output,
         );
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,
+            output_drain_policy,
             output_handles,
             managed.output_tx.clone(),
             managed.state_tx.clone(),
@@ -891,6 +843,7 @@ impl UnifiedExecProcess {
             Arc::clone(&managed.output_task_finished_notify),
             Arc::clone(&managed.monitor_stop_pending),
             Arc::clone(&managed.monitor_stop_pending_notify),
+            managed.interaction_lock(),
         ));
 
         let mut state_rx = managed.state_rx.clone();
@@ -917,6 +870,7 @@ impl UnifiedExecProcess {
     #[allow(clippy::too_many_arguments)]
     fn spawn_exec_server_output_task(
         started: StartedExecProcess,
+        output_drain_policy: OutputDrainPolicy,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
@@ -924,19 +878,27 @@ impl UnifiedExecProcess {
         output_task_finished_notify: Arc<Notify>,
         monitor_stop_pending: Arc<AtomicUsize>,
         monitor_stop_pending_notify: Arc<Notify>,
+        interaction_lock: Arc<Mutex<()>>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
             output_notify,
             monitor_capture,
-            monitor_stream_output,
             output_closed,
             output_closed_notify,
             cancellation_token,
+            collection_finished,
             ..
         } = output_handles;
+        // Monitor capture must retain output until EOF even after the root exits.
+        let allow_final_drain = output_drain_policy == OutputDrainPolicy::WaitForOutputClosure
+            && monitor_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none();
         let process = started.process;
         let mut events = process.subscribe_events();
+        let mut state_rx = state_tx.subscribe();
         let output_task_guard = OutputTaskGuard {
             output_closed: Arc::clone(&output_closed),
             output_closed_notify: Arc::clone(&output_closed_notify),
@@ -947,13 +909,31 @@ impl UnifiedExecProcess {
         };
         tokio::spawn(async move {
             let mut output_task_guard = output_task_guard;
+            let drain = async {
+                collection_finished.cancelled().await;
+                let _ = state_rx.wait_for(|state| state.has_exited).await;
+                tokio::time::sleep(REMOTE_OUTPUT_DRAIN_GRACE).await;
+                // An active poll keeps its own deadline, including transport recovery.
+                interaction_lock.lock_owned().await
+            };
+            tokio::pin!(drain);
+            let mut final_drain = false;
             let mut last_seq: u64 = 0;
             let mut exit_observed = false;
             loop {
-                let event = match events.recv().await {
-                    Ok(event) => Some(event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => None,
-                    Err(broadcast::error::RecvError::Closed) => {
+                let received = tokio::select! {
+                    received = events.recv() => Some(received),
+                    guard = &mut drain, if allow_final_drain && !final_drain => {
+                        // Later polls must remain able to collect output while this read recovers.
+                        drop(guard);
+                        final_drain = true;
+                        None
+                    }
+                };
+                let event = match received {
+                    Some(Ok(event)) => Some(event),
+                    Some(Err(broadcast::error::RecvError::Lagged(_))) | None => None,
+                    Some(Err(broadcast::error::RecvError::Closed)) => {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(
                             state.failed("exec-server process event stream closed".to_string()),
@@ -980,6 +960,8 @@ impl UnifiedExecProcess {
                     || event_seq.is_some_and(|seq| seq > last_seq.saturating_add(1))
                     || missing_sandbox_denial
                 {
+                    // The final drain read waits for transport recovery and collects retained
+                    // output before closing an idle session with inherited pipes still open.
                     let response = match process
                         .read(
                             Some(last_seq),
@@ -1032,10 +1014,7 @@ impl UnifiedExecProcess {
                         let bytes = chunk.chunk.into_inner();
                         {
                             let mut guard = output_buffer.lock().await;
-                            guard.push_chunk(&bytes);
-                        }
-                        if let Some(stream_output) = &monitor_stream_output {
-                            stream_output.push_chunk(bytes.clone(), is_stdout).await;
+                            guard.push_chunk(chunk.stream, &bytes);
                         }
                         send_monitor_capture(
                             &monitor_capture,
@@ -1066,7 +1045,10 @@ impl UnifiedExecProcess {
                             state
                         });
                     }
-                    if closed {
+                    if exited && output_drain_policy == OutputDrainPolicy::BoundedAfterExit {
+                        cancellation_token.cancel();
+                    }
+                    if closed || final_drain {
                         output_task_guard.mark_completed();
                         cancellation_token.cancel();
                         break;
@@ -1087,10 +1069,7 @@ impl UnifiedExecProcess {
                         let bytes = chunk.chunk.into_inner();
                         {
                             let mut guard = output_buffer.lock().await;
-                            guard.push_chunk(&bytes);
-                        }
-                        if let Some(stream_output) = &monitor_stream_output {
-                            stream_output.push_chunk(bytes.clone(), is_stdout).await;
+                            guard.push_chunk(chunk.stream, &bytes);
                         }
                         send_monitor_capture(
                             &monitor_capture,
@@ -1118,6 +1097,9 @@ impl UnifiedExecProcess {
                         let mut state = state_tx.borrow().clone();
                         state.sandbox_denied |= sandbox_denied.unwrap_or(false);
                         let _ = state_tx.send_replace(state.exited(Some(exit_code)));
+                        if output_drain_policy == OutputDrainPolicy::BoundedAfterExit {
+                            cancellation_token.cancel();
+                        }
                     }
                     ExecProcessEvent::Closed { seq } => {
                         if seq <= last_seq {
@@ -1135,6 +1117,12 @@ impl UnifiedExecProcess {
                     }
                 }
             }
+            if final_drain {
+                tokio::spawn(async move {
+                    let _ = process.terminate().await;
+                });
+            }
+            cancellation_token.cancel();
         })
     }
 
@@ -1142,6 +1130,7 @@ impl UnifiedExecProcess {
     pub(super) fn spawn_local_output_task(
         mut stdout_rx: mpsc::Receiver<Vec<u8>>,
         mut stderr_rx: mpsc::Receiver<Vec<u8>>,
+        mut output_completion: watch::Receiver<Option<bool>>,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
         output_task_finished: Arc<AtomicBool>,
@@ -1153,7 +1142,6 @@ impl UnifiedExecProcess {
             output_buffer,
             output_notify,
             monitor_capture,
-            monitor_stream_output,
             output_closed,
             output_closed_notify,
             ..
@@ -1196,10 +1184,14 @@ impl UnifiedExecProcess {
                 };
                 {
                     let mut guard = output_buffer.lock().await;
-                    guard.push_chunk(&chunk);
-                }
-                if let Some(stream_output) = &monitor_stream_output {
-                    stream_output.push_chunk(chunk.clone(), is_stdout).await;
+                    guard.push_chunk(
+                        if is_stdout {
+                            ExecOutputStream::Stdout
+                        } else {
+                            ExecOutputStream::Stderr
+                        },
+                        &chunk,
+                    );
                 }
                 send_monitor_capture(
                     &monitor_capture,
@@ -1214,7 +1206,15 @@ impl UnifiedExecProcess {
                 let _ = output_tx.send(chunk);
                 output_notify.notify_waiters();
             }
-            output_task_guard.mark_completed();
+            // Channel closure can precede the PTY reader joins. Do not expose
+            // archive completion until their success or failure is authoritative.
+            if output_completion
+                .wait_for(Option::is_some)
+                .await
+                .is_ok_and(|outcome| *outcome == Some(true))
+            {
+                output_task_guard.mark_completed();
+            }
         })
     }
 

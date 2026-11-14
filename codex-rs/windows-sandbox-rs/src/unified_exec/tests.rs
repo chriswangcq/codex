@@ -77,10 +77,9 @@ fn sandbox_cwd() -> PathBuf {
         return PathBuf::from(workspace_root);
     }
 
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("repo root")
-        .to_path_buf()
+    codex_utils_cargo_bin::repo_root()
+        .expect("resolve repository root")
+        .join("codex-rs")
 }
 
 fn sandbox_home(name: &str) -> TempDir {
@@ -138,7 +137,7 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
 
 fn open_process_for_wait(pid: u32) -> std::io::Result<OwnedHandle> {
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
-    if handle == 0 {
+    if handle.is_null() {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { OwnedHandle::from_raw_handle(handle as _) })
@@ -776,6 +775,10 @@ fn legacy_workspace_write_delete_is_limited_to_writable_roots() {
         .expect("write delete script");
 
         let env_map = HashMap::from([
+            (
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").expect("Windows SystemRoot"),
+            ),
             ("TEMP".to_string(), temp_root.to_string_lossy().into_owned()),
             ("TMP".to_string(), tmp_root.to_string_lossy().into_owned()),
             (

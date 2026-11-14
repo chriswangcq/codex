@@ -1,3 +1,5 @@
+// Release builds exceed rustc's default query depth when laying out the async
+// MessageProcessor::handle_initialized_client_request future.
 #![recursion_limit = "256"]
 
 use clap::Parser;
@@ -41,10 +43,7 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("ERROR: {message}");
                 true
             }
-            ExitReason::UserRequested
-            | ExitReason::Archived(_)
-            | ExitReason::TurnInterrupted
-            | ExitReason::ThreadRemoved => false,
+            ExitReason::UserRequested | ExitReason::TurnInterrupted => false,
         };
 
         let color_enabled = supports_color::on(Stream::Stdout).is_some();

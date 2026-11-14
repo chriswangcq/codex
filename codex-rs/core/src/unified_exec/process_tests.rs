@@ -1,6 +1,6 @@
 use super::process::MonitorOutputChunk;
-use super::process::MonitorStreamOutput;
 use super::process::OutputBuffers;
+use super::process::OutputDrainPolicy;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
 use super::process::monitor_capture_channel;
@@ -125,9 +125,13 @@ pub(super) async fn remote_process(
         sandbox_type: sandbox_type.into(),
     };
 
-    UnifiedExecProcess::from_exec_server_started(started, /*capture_monitor_output*/ false)
-        .await
-        .expect("remote process should start")
+    UnifiedExecProcess::from_exec_server_started(
+        started,
+        OutputDrainPolicy::WaitForOutputClosure,
+        /*capture_monitor_output*/ false,
+    )
+    .await
+    .expect("remote process should start")
 }
 
 pub(crate) async fn completed_monitor_process_for_test()
@@ -159,7 +163,6 @@ pub(crate) async fn completed_monitor_process_for_test()
         UnifiedExecProcess::from_spawned(
             spawned,
             codex_sandboxing::SandboxType::None,
-            Box::new(crate::unified_exec::NoopSpawnLifecycle),
             /*capture_monitor_output*/ true,
         )
         .await
@@ -187,9 +190,81 @@ pub(crate) async fn blocking_terminate_remote_process(
         sandbox_type: Some(codex_sandboxing::SandboxType::None),
     };
 
-    UnifiedExecProcess::from_exec_server_started(started, capture_monitor_output)
+    UnifiedExecProcess::from_exec_server_started(
+        started,
+        OutputDrainPolicy::WaitForOutputClosure,
+        capture_monitor_output,
+    )
+    .await
+    .expect("remote process should start")
+}
+
+#[tokio::test(start_paused = true)]
+async fn remote_final_drain_preserves_monitor_capture_until_output_closes() {
+    for capture_monitor_output in [false, true] {
+        let (wake_tx, _wake_rx) = watch::channel(0);
+        let started = StartedExecProcess {
+            process: Arc::new(MockExecProcess {
+                process_id: "exited-with-open-output".to_string().into(),
+                write_response: WriteResponse {
+                    status: WriteStatus::StdinClosed,
+                },
+                read_responses: Mutex::new(VecDeque::from([ReadResponse {
+                    chunks: Vec::new(),
+                    next_seq: 1,
+                    exited: true,
+                    exit_code: Some(0),
+                    closed: false,
+                    failure: None,
+                    sandbox_denied: false,
+                }])),
+                terminate_error: None,
+                terminate_never: false,
+                wake_tx,
+            }),
+            sandbox_type: Some(codex_sandboxing::SandboxType::None),
+        };
+        let process = UnifiedExecProcess::from_exec_server_started(
+            started,
+            OutputDrainPolicy::WaitForOutputClosure,
+            capture_monitor_output,
+        )
         .await
-        .expect("remote process should start")
+        .expect("remote process should start");
+
+        // A closed stdin observes root exit without closing its output streams.
+        process.write(b"input").await.expect_err("stdin is closed");
+        assert!(process.has_exited());
+        process.output_handles().collection_finished.cancel();
+
+        if capture_monitor_output {
+            let mut capture = process
+                .output_handles()
+                .take_monitor_capture()
+                .expect("monitor capture should be available");
+            assert!(
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), capture.recv())
+                    .await
+                    .is_err(),
+                "the final drain grace must not close monitor capture before EOF"
+            );
+            assert!(!process.output_completed_normally());
+            assert!(!process.output_task_finished());
+        } else {
+            tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+                while !process.output_task_finished() {
+                    process
+                        .output_handles()
+                        .output_closed_notify
+                        .notified()
+                        .await;
+                }
+            })
+            .await
+            .expect("ordinary remote output should finish after the final drain grace");
+            assert!(process.output_completed_normally());
+        }
+    }
 }
 
 #[tokio::test]
@@ -332,7 +407,6 @@ async fn local_terminate_confirmed_waits_for_observed_driver_exit() {
     let process = UnifiedExecProcess::from_spawned(
         spawned,
         codex_sandboxing::SandboxType::None,
-        Box::new(crate::unified_exec::NoopSpawnLifecycle),
         /*capture_monitor_output*/ false,
     )
     .await
@@ -383,7 +457,6 @@ async fn local_terminate_confirmed_retries_when_root_exited_but_output_stayed_op
     let process = UnifiedExecProcess::from_spawned(
         spawned,
         codex_sandboxing::SandboxType::None,
-        Box::new(crate::unified_exec::NoopSpawnLifecycle),
         /*capture_monitor_output*/ true,
     )
     .await
@@ -450,7 +523,6 @@ async fn local_terminate_confirmed_times_out_without_faking_exit_and_can_retry()
     let process = UnifiedExecProcess::from_spawned(
         spawned,
         codex_sandboxing::SandboxType::None,
-        Box::new(crate::unified_exec::NoopSpawnLifecycle),
         /*capture_monitor_output*/ false,
     )
     .await
@@ -528,7 +600,6 @@ async fn terminate_confirmed_kills_descendant_after_shell_exit_and_closes_output
                 UnifiedExecProcess::from_spawned(
                     spawned,
                     codex_sandboxing::SandboxType::None,
-                    Box::new(crate::unified_exec::NoopSpawnLifecycle),
                     /*capture_monitor_output*/ true,
                 )
                 .await?,
@@ -561,7 +632,9 @@ async fn terminate_confirmed_kills_descendant_after_shell_exit_and_closes_output
             let executor_process = Arc::clone(&started.process);
             (
                 UnifiedExecProcess::from_exec_server_started(
-                    started, /*capture_monitor_output*/ true,
+                    started,
+                    OutputDrainPolicy::BoundedAfterExit,
+                    /*capture_monitor_output*/ true,
                 )
                 .await?,
                 Some(executor_process),
@@ -697,9 +770,12 @@ async fn monitor_capture_reports_retained_output_gap_from_default_local_exec_bac
         })
         .await?;
     let executor_process = Arc::clone(&started.process);
-    let process =
-        UnifiedExecProcess::from_exec_server_started(started, /*capture_monitor_output*/ true)
-            .await?;
+    let process = UnifiedExecProcess::from_exec_server_started(
+        started,
+        OutputDrainPolicy::BoundedAfterExit,
+        /*capture_monitor_output*/ true,
+    )
+    .await?;
     let mut capture = process
         .output_handles()
         .take_monitor_capture()
@@ -758,16 +834,16 @@ async fn monitor_capture_reports_retained_output_gap_from_default_local_exec_bac
 async fn monitor_capture_is_lossless_and_marks_stdout_beyond_head_tail_capacity() {
     let (capture_tx, mut capture_rx) = monitor_capture_channel(128);
     let output_buffer = Arc::new(Mutex::new(OutputBuffers::default()));
-    let stream_output = MonitorStreamOutput::new(Arc::clone(&output_buffer));
     let output = OutputHandles {
-        output_buffer,
+        output_buffer: Arc::clone(&output_buffer),
         output_notify: Arc::new(Notify::new()),
         monitor_capture: Arc::new(std::sync::Mutex::new(Some(capture_tx))),
         monitor_capture_rx: Arc::new(std::sync::Mutex::new(None)),
-        monitor_stream_output: Some(stream_output.clone()),
         output_closed: Arc::new(AtomicBool::new(false)),
         output_closed_notify: Arc::new(Notify::new()),
         cancellation_token: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
+        collection_finished: CancellationToken::new(),
     };
     let (stdout_tx, stdout_rx) = mpsc::channel(2);
     let (stderr_tx, stderr_rx) = mpsc::channel(2);
@@ -776,6 +852,7 @@ async fn monitor_capture_is_lossless_and_marks_stdout_beyond_head_tail_capacity(
     let task = UnifiedExecProcess::spawn_local_output_task(
         stdout_rx,
         stderr_rx,
+        watch::channel(Some(true)).1,
         output,
         output_tx,
         Arc::clone(&output_task_finished),
@@ -815,15 +892,75 @@ async fn monitor_capture_is_lossless_and_marks_stdout_beyond_head_tail_capacity(
     }
     assert_eq!(captured_stdout, stdout);
     assert_eq!(captured_stderr, stderr);
-    let (final_stdout, final_stderr, final_combined) = stream_output.snapshot().await;
-    assert!(final_stdout.starts_with('o'));
-    assert!(final_stdout.contains("bytes omitted"));
-    assert_eq!(final_stderr, "stderr-only");
+    let final_combined = String::from_utf8_lossy(
+        &output_buffer
+            .lock()
+            .await
+            .transcript
+            .to_bytes_with_omission_marker(),
+    )
+    .into_owned();
     assert!(final_combined.contains("bytes omitted"));
     // stdout and stderr arrive on independent channels, so their relative
     // ordering is intentionally unspecified even though neither stream may be
     // lost from the combined capture.
     assert!(final_combined.contains("stderr-only"));
+}
+
+#[tokio::test]
+async fn local_capture_waits_for_reader_completion_after_channels_close() {
+    for outcome in [Some(true), Some(false), None] {
+        let (capture_tx, mut capture_rx) = monitor_capture_channel(1);
+        let output_closed = Arc::new(AtomicBool::new(false));
+        let output_task_finished = Arc::new(AtomicBool::new(false));
+        let output = OutputHandles {
+            output_buffer: Arc::new(Mutex::new(OutputBuffers::default())),
+            output_notify: Arc::new(Notify::new()),
+            monitor_capture: Arc::new(std::sync::Mutex::new(Some(capture_tx))),
+            monitor_capture_rx: Arc::new(std::sync::Mutex::new(None)),
+            output_closed: Arc::clone(&output_closed),
+            output_closed_notify: Arc::new(Notify::new()),
+            cancellation_token: CancellationToken::new(),
+            drain_policy: OutputDrainPolicy::BoundedAfterExit,
+            collection_finished: CancellationToken::new(),
+        };
+        let (stdout_tx, stdout_rx) = mpsc::channel(1);
+        let (stderr_tx, stderr_rx) = mpsc::channel(1);
+        let (completion_tx, completion_rx) = watch::channel(None);
+        let (output_tx, _) = broadcast::channel(1);
+        drop(stdout_tx);
+        drop(stderr_tx);
+        let task = UnifiedExecProcess::spawn_local_output_task(
+            stdout_rx,
+            stderr_rx,
+            completion_rx,
+            output,
+            output_tx,
+            Arc::clone(&output_task_finished),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Notify::new()),
+        );
+
+        assert_eq!(
+            capture_rx.recv().await,
+            Some(MonitorOutputChunk::StdoutClosed)
+        );
+        assert!(!output_task_finished.load(Ordering::Acquire));
+        assert!(!output_closed.load(Ordering::Acquire));
+        assert_eq!(capture_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+        if outcome.is_some() {
+            let _ = completion_tx.send_replace(outcome);
+        }
+        drop(completion_tx);
+        task.await
+            .expect("reader outcome must finish output collection");
+
+        assert!(output_task_finished.load(Ordering::Acquire));
+        assert_eq!(output_closed.load(Ordering::Acquire), outcome == Some(true));
+        assert_eq!(capture_rx.recv().await, None);
+    }
 }
 
 #[tokio::test]
@@ -834,10 +971,11 @@ async fn aborted_local_output_task_does_not_claim_output_eof() {
         output_notify: Arc::new(Notify::new()),
         monitor_capture: Arc::new(std::sync::Mutex::new(None)),
         monitor_capture_rx: Arc::new(std::sync::Mutex::new(None)),
-        monitor_stream_output: None,
         output_closed: Arc::clone(&output_closed),
         output_closed_notify: Arc::new(Notify::new()),
         cancellation_token: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
+        collection_finished: CancellationToken::new(),
     };
     let (_stdout_tx, stdout_rx) = mpsc::channel(1);
     let (_stderr_tx, stderr_rx) = mpsc::channel(1);
@@ -846,6 +984,7 @@ async fn aborted_local_output_task_does_not_claim_output_eof() {
     let task = UnifiedExecProcess::spawn_local_output_task(
         stdout_rx,
         stderr_rx,
+        watch::channel(Some(true)).1,
         output,
         output_tx,
         Arc::clone(&output_task_finished),
@@ -870,10 +1009,11 @@ async fn monitor_stop_unblocks_full_capture_channel() {
         output_notify: Arc::new(Notify::new()),
         monitor_capture: Arc::new(std::sync::Mutex::new(Some(capture_tx))),
         monitor_capture_rx: Arc::new(std::sync::Mutex::new(None)),
-        monitor_stream_output: None,
         output_closed: Arc::clone(&output_closed),
         output_closed_notify: Arc::new(Notify::new()),
         cancellation_token: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
+        collection_finished: CancellationToken::new(),
     };
     let (stdout_tx, stdout_rx) = mpsc::channel(2);
     let (stderr_tx, stderr_rx) = mpsc::channel(1);
@@ -884,6 +1024,7 @@ async fn monitor_stop_unblocks_full_capture_channel() {
     let task = UnifiedExecProcess::spawn_local_output_task(
         stdout_rx,
         stderr_rx,
+        watch::channel(Some(true)).1,
         output,
         output_tx,
         Arc::clone(&output_task_finished),

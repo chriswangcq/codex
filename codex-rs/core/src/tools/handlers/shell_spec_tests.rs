@@ -6,17 +6,9 @@ fn windows_shell_guidance_description() -> String {
     format!("\n\n{}", windows_shell_guidance())
 }
 
-fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
-    serde_json::to_value(tool)
-        .expect("tool spec should serialize")
-        .pointer(&format!("/parameters/properties/{parameter_name}"))
-        .is_some()
-}
-
 #[test]
 fn exec_command_tool_matches_expected_spec() {
     let tool = create_exec_command_tool(CommandToolOptions {
-        allow_login_shell: true,
         exec_permission_approvals_enabled: false,
     });
 
@@ -99,22 +91,6 @@ fn exec_command_tool_matches_expected_spec() {
 }
 
 #[test]
-fn exec_command_tool_can_hide_shell_parameter() {
-    let tool = create_exec_command_tool_with_environment_id(
-        CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        },
-        /*include_environment_id*/ false,
-        /*include_shell_parameter*/ false,
-        /*include_windows_shell_guidance*/ cfg!(windows),
-    );
-
-    assert!(!has_parameter(&tool, "shell"));
-    assert!(has_parameter(&tool, "cmd"));
-}
-
-#[test]
 fn monitor_tool_matches_command_contract() {
     let tool = create_monitor_tool(/*include_environment_id*/ false);
     let serialized = serde_json::to_value(&tool).expect("monitor spec should serialize");
@@ -123,6 +99,20 @@ fn monitor_tool_matches_command_contract() {
     };
 
     assert_eq!(serialized["name"], "monitor");
+    let properties = function
+        .parameters
+        .properties
+        .as_ref()
+        .expect("monitor parameters should be an object");
+    for field in [
+        "tty",
+        "shell",
+        "workdir",
+        "sandbox_permissions",
+        "yield_time_ms",
+    ] {
+        assert!(!properties.contains_key(field));
+    }
     assert_eq!(
         serialized["parameters"]["required"],
         serde_json::json!(["command", "description"])
@@ -150,14 +140,19 @@ fn monitor_tool_matches_command_contract() {
 
 #[test]
 fn monitor_tool_exposes_environment_selector_only_when_needed() {
-    assert!(!has_parameter(
-        &create_monitor_tool(/*include_environment_id*/ false),
-        "environment_id"
-    ));
-    assert!(has_parameter(
-        &create_monitor_tool(/*include_environment_id*/ true),
-        "environment_id"
-    ));
+    for include_environment_id in [false, true] {
+        let ToolSpec::Function(function) = create_monitor_tool(include_environment_id) else {
+            panic!("monitor should be a function tool");
+        };
+        let properties = function
+            .parameters
+            .properties
+            .expect("monitor parameters should be an object");
+        assert_eq!(
+            properties.contains_key("environment_id"),
+            include_environment_id
+        );
+    }
 }
 
 #[test]

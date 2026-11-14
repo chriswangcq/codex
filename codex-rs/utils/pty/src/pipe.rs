@@ -126,21 +126,21 @@ fn kill_process(pid: u32) -> io::Result<()> {
     }
 }
 
-async fn read_output_stream<R>(mut reader: R, output_tx: mpsc::Sender<Vec<u8>>) -> bool
+async fn read_output_stream<R>(mut reader: R, output_tx: mpsc::Sender<Vec<u8>>) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; 8_192];
     loop {
         match reader.read(&mut buf).await {
-            Ok(0) => return true,
+            Ok(0) => return Ok(()),
             Ok(n) => {
-                if output_tx.send(buf[..n].to_vec()).await.is_err() {
-                    return false;
-                }
+                // A consumer may stop collecting after its output cap. Drain to
+                // EOF so the child can exit and checked termination stays truthful.
+                let _ = output_tx.send(buf[..n].to_vec()).await;
             }
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return false,
+            Err(error) => return Err(error),
         }
     }
 }
@@ -261,26 +261,6 @@ async fn spawn_process_with_stdin_mode(
         let stderr_tx = stderr_tx.clone();
         tokio::spawn(async move { read_output_stream(BufReader::new(stderr), stderr_tx).await })
     });
-    let mut reader_abort_handles = Vec::new();
-    if let Some(handle) = stdout_handle.as_ref() {
-        reader_abort_handles.push(handle.abort_handle());
-    }
-    if let Some(handle) = stderr_handle.as_ref() {
-        reader_abort_handles.push(handle.abort_handle());
-    }
-    let reader_handle = tokio::spawn(async move {
-        let mut completed = true;
-        if let Some(handle) = stdout_handle {
-            completed &= matches!(handle.await, Ok(true));
-        }
-        if let Some(handle) = stderr_handle {
-            completed &= matches!(handle.await, Ok(true));
-        }
-        assert!(
-            completed,
-            "pipe output reader task did not complete normally"
-        );
-    });
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
@@ -325,8 +305,8 @@ async fn spawn_process_with_stdin_mode(
             #[cfg(unix)]
             process_group_id,
         }),
-        reader_handle,
-        reader_abort_handles,
+        stdout_handle,
+        stderr_handle,
         writer_handle,
         wait_handle,
         exit_status,

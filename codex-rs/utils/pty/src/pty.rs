@@ -261,11 +261,11 @@ async fn spawn_process_portable(
     #[cfg(not(unix))]
     let (reader_handle, writer_handle) = {
         let mut reader = pair.master.try_clone_reader()?;
-        let raw_reader_handle = tokio::task::spawn_blocking(move || {
+        let reader_handle = tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 8_192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => return true,
+                    Ok(0) => return Ok(()),
                     Ok(n) => {
                         // A closed output receiver must not block the child's exit.
                         let _ = stdout_tx.blocking_send(buf[..n].to_vec());
@@ -275,15 +275,10 @@ async fn spawn_process_portable(
                         std::thread::sleep(Duration::from_millis(5));
                         continue;
                     }
-                    Err(error) => return pty_read_error_is_eof(&error),
+                    Err(error) if pty_read_error_is_eof(&error) => return Ok(()),
+                    Err(error) => return Err(error),
                 }
             }
-        });
-        let reader_handle: JoinHandle<()> = tokio::spawn(async move {
-            assert!(
-                matches!(raw_reader_handle.await, Ok(true)),
-                "PTY output reader task did not reach EOF normally"
-            );
         });
 
         let mut writer_rx = writer_rx;
@@ -344,8 +339,8 @@ async fn spawn_process_portable(
             #[cfg(unix)]
             process_group_id,
         }),
-        reader_handle,
-        Vec::new(),
+        Some(reader_handle),
+        /*stderr_reader*/ None,
         writer_handle,
         wait_handle,
         exit_status,
@@ -507,8 +502,8 @@ async fn spawn_process_preserving_fds(
     let handle = ProcessHandle::new(
         writer_tx,
         Box::new(RawPidTerminator { process_group_id }),
-        reader_handle,
-        Vec::new(),
+        Some(reader_handle),
+        /*stderr_reader*/ None,
         writer_handle,
         wait_handle,
         exit_status,
